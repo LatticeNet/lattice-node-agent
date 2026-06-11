@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
+	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -62,6 +65,7 @@ func main() {
 	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v", cfg.NodeID, cfg.Server, cfg.AllowExec)
 
 	runner := taskexec.Runner{AllowExec: cfg.AllowExec}
+	monitors := newMonitorManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -71,8 +75,111 @@ func main() {
 		if err := runTasks(cfg, runner); err != nil {
 			log.Printf("task poll error: %v", err)
 		}
+		if assigned, err := fetchMonitors(cfg); err != nil {
+			log.Printf("monitor poll error: %v", err)
+		} else {
+			monitors.reconcile(assigned)
+		}
 		<-ticker.C
 	}
+}
+
+// monitorManager keeps one goroutine per assigned monitor, each probing on its
+// own interval. reconcile is called every poll to start new monitors, stop
+// removed ones, and restart any whose definition changed.
+type monitorManager struct {
+	cfg    agentConfig
+	mu     sync.Mutex
+	active map[string]monitorEntry
+}
+
+type monitorEntry struct {
+	cancel context.CancelFunc
+	spec   model.Monitor
+}
+
+func newMonitorManager(cfg agentConfig) *monitorManager {
+	return &monitorManager{cfg: cfg, active: map[string]monitorEntry{}}
+}
+
+func (mm *monitorManager) reconcile(monitors []model.Monitor) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	desired := make(map[string]model.Monitor, len(monitors))
+	for _, m := range monitors {
+		desired[m.ID] = m
+	}
+	for id, entry := range mm.active {
+		if d, ok := desired[id]; !ok || monitorChanged(entry.spec, d) {
+			entry.cancel()
+			delete(mm.active, id)
+		}
+	}
+	for id, m := range desired {
+		if _, ok := mm.active[id]; ok {
+			continue
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		mm.active[id] = monitorEntry{cancel: cancel, spec: m}
+		go mm.run(ctx, m)
+	}
+}
+
+func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
+	interval := time.Duration(m.IntervalSec) * time.Second
+	if interval < time.Second {
+		interval = 30 * time.Second
+	}
+	probeAndReport(mm.cfg, m)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			probeAndReport(mm.cfg, m)
+		}
+	}
+}
+
+func monitorChanged(a, b model.Monitor) bool {
+	return a.Type != b.Type || a.Target != b.Target ||
+		a.IntervalSec != b.IntervalSec || a.TimeoutSec != b.TimeoutSec
+}
+
+func probeAndReport(cfg agentConfig, m model.Monitor) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSec+2)*time.Second)
+	defer cancel()
+	res := prober.Probe(ctx, m)
+	if err := postJSON(cfg.Server+"/api/agent/monitor-result", map[string]any{
+		"node_id": cfg.NodeID,
+		"token":   cfg.Token,
+		"result":  res,
+	}, nil); err != nil {
+		log.Printf("monitor %s report error: %v", m.ID, err)
+	}
+}
+
+func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/monitors?node_id=%s", cfg.Server, cfg.NodeID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("monitors status %d", resp.StatusCode)
+	}
+	var monitors []model.Monitor
+	if err := json.NewDecoder(resp.Body).Decode(&monitors); err != nil {
+		return nil, err
+	}
+	return monitors, nil
 }
 
 func reportMetrics(cfg agentConfig) error {
