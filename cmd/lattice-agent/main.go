@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ type agentConfig struct {
 	PublicIP    string
 	PublicIPv6  string
 	WireGuardIP string
+	WGPublicKey string
+	WGEndpoint  string
+	WGPort      int
 	SSHAlerts   bool
 }
 
@@ -51,18 +55,24 @@ func main() {
 	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
 	flag.BoolVar(&cfg.SSHAlerts, "ssh-alerts", os.Getenv("LATTICE_SSH_ALERTS") == "1", "report sshd accepted logins as events")
+	flag.StringVar(&cfg.WGPublicKey, "wg-pubkey", os.Getenv("LATTICE_WG_PUBKEY"), "WireGuard public key (for mesh planning)")
+	flag.StringVar(&cfg.WGEndpoint, "wg-endpoint", os.Getenv("LATTICE_WG_ENDPOINT"), "WireGuard public endpoint host:port (empty for dial-out-only nodes)")
+	flag.IntVar(&cfg.WGPort, "wg-port", envInt("LATTICE_WG_PORT"), "WireGuard listen port")
 	flag.Parse()
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
 	if err := postJSON(cfg.Server+"/api/agent/hello", map[string]any{
-		"node_id":      cfg.NodeID,
-		"token":        cfg.Token,
-		"version":      version,
-		"public_ip":    cfg.PublicIP,
-		"public_ipv6":  cfg.PublicIPv6,
-		"wireguard_ip": cfg.WireGuardIP,
+		"node_id":              cfg.NodeID,
+		"token":                cfg.Token,
+		"version":              version,
+		"public_ip":            cfg.PublicIP,
+		"public_ipv6":          cfg.PublicIPv6,
+		"wireguard_ip":         cfg.WireGuardIP,
+		"wireguard_public_key": cfg.WGPublicKey,
+		"wireguard_endpoint":   cfg.WGEndpoint,
+		"wireguard_port":       cfg.WGPort,
 	}, nil); err != nil {
 		log.Fatalf("hello failed: %v", err)
 	}
@@ -255,6 +265,18 @@ func postJSON(url string, payload any, out any) error {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+func envInt(key string) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func env(key, fallback string) string {
