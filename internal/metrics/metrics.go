@@ -6,11 +6,22 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
+
+// cpuSampler holds the previous /proc/stat aggregate so each Collect call can
+// compute CPU utilization over the real interval between calls, without
+// blocking inside Collect. The first call returns 0 (no prior sample).
+var cpuSampler struct {
+	sync.Mutex
+	prevTotal uint64
+	prevIdle  uint64
+	hasPrev   bool
+}
 
 func Collect() model.Metrics {
 	now := time.Now().UTC()
@@ -20,8 +31,78 @@ func Collect() model.Metrics {
 	m.DiskUsed, m.DiskTotal = readDisk("/")
 	m.NetRxBytes, m.NetTxBytes = readNetDev()
 	m.UptimeSeconds = readUptime()
-	m.CPUPercent = float64(runtime.NumGoroutine())
+	m.CPUPercent = readCPUPercent()
 	return m
+}
+
+// readCPUPercent computes busy CPU percentage from the delta of /proc/stat
+// since the previous call. Returns 0 when no prior sample exists or on error.
+func readCPUPercent() float64 {
+	total, idle, ok := readProcStat()
+	if !ok {
+		return 0
+	}
+	cpuSampler.Lock()
+	defer cpuSampler.Unlock()
+	defer func() {
+		cpuSampler.prevTotal = total
+		cpuSampler.prevIdle = idle
+		cpuSampler.hasPrev = true
+	}()
+	if !cpuSampler.hasPrev {
+		return 0
+	}
+	return cpuBusy(cpuSampler.prevTotal, cpuSampler.prevIdle, total, idle)
+}
+
+// cpuBusy computes the busy percentage between two /proc/stat snapshots. Pure
+// and side-effect free so it can be unit tested without /proc.
+func cpuBusy(prevTotal, prevIdle, total, idle uint64) float64 {
+	totalDelta := float64(total - prevTotal)
+	idleDelta := float64(idle - prevIdle)
+	if totalDelta <= 0 {
+		return 0
+	}
+	busy := (totalDelta - idleDelta) / totalDelta * 100
+	if busy < 0 {
+		return 0
+	}
+	if busy > 100 {
+		return 100
+	}
+	return busy
+}
+
+// readProcStat parses the aggregate "cpu" line of /proc/stat into total jiffies
+// and idle jiffies (idle + iowait).
+func readProcStat() (total, idle uint64, ok bool) {
+	file, err := os.Open("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)[1:]
+		var sum uint64
+		for i, f := range fields {
+			v, err := strconv.ParseUint(f, 10, 64)
+			if err != nil {
+				continue
+			}
+			sum += v
+			// Fields 3 (idle) and 4 (iowait) count as idle time.
+			if i == 3 || i == 4 {
+				idle += v
+			}
+		}
+		return sum, idle, true
+	}
+	return 0, 0, false
 }
 
 func readLoad1() float64 {

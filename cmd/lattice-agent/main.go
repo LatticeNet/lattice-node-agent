@@ -18,6 +18,11 @@ import (
 
 const version = "0.1.0"
 
+// httpClient bounds every agent request so a hung or black-holed server cannot
+// wedge the agent's poll loop indefinitely. The total timeout comfortably
+// exceeds task execution because task results are posted separately.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 type agentConfig struct {
 	Server      string
 	NodeID      string
@@ -84,7 +89,7 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -115,7 +120,12 @@ func postJSON(url string, payload any, out any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
