@@ -9,12 +9,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
+	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -35,6 +37,7 @@ type agentConfig struct {
 	PublicIP    string
 	PublicIPv6  string
 	WireGuardIP string
+	SSHAlerts   bool
 }
 
 func main() {
@@ -47,6 +50,7 @@ func main() {
 	flag.StringVar(&cfg.PublicIP, "public-ip", os.Getenv("LATTICE_PUBLIC_IP"), "public IPv4 metadata (server observes source IP if empty)")
 	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
+	flag.BoolVar(&cfg.SSHAlerts, "ssh-alerts", os.Getenv("LATTICE_SSH_ALERTS") == "1", "report sshd accepted logins as events")
 	flag.Parse()
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
@@ -63,6 +67,9 @@ func main() {
 		log.Fatalf("hello failed: %v", err)
 	}
 	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v", cfg.NodeID, cfg.Server, cfg.AllowExec)
+	if cfg.SSHAlerts {
+		go watchSSHLogins(context.Background(), cfg)
+	}
 
 	runner := taskexec.Runner{AllowExec: cfg.AllowExec}
 	monitors := newMonitorManager(cfg)
@@ -255,4 +262,63 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// watchSSHLogins streams sshd accepted-login lines from journald (preferred) or
+// auth.log and reports each as an ssh_login event. It restarts the source if it
+// ends. Requires read access to the logs (typically root).
+func watchSSHLogins(ctx context.Context, cfg agentConfig) {
+	for ctx.Err() == nil {
+		cmd := sshLogCommand(ctx)
+		if cmd == nil {
+			log.Printf("ssh-alerts: no log source available (journalctl/auth.log)")
+			return
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("ssh-alerts: stdout pipe: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if err := cmd.Start(); err != nil {
+			log.Printf("ssh-alerts: start source: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		_ = sshwatch.Stream(ctx, stdout, func(ev sshwatch.LoginEvent) { reportSSHLogin(cfg, ev) })
+		_ = cmd.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func sshLogCommand(ctx context.Context) *exec.Cmd {
+	if path, err := exec.LookPath("journalctl"); err == nil {
+		return exec.CommandContext(ctx, path, "-f", "-n", "0", "-o", "cat", "_COMM=sshd")
+	}
+	tail, err := exec.LookPath("tail")
+	if err != nil {
+		return nil
+	}
+	for _, p := range []string{"/var/log/auth.log", "/var/log/secure"} {
+		if _, err := os.Stat(p); err == nil {
+			return exec.CommandContext(ctx, tail, "-n", "0", "-F", p)
+		}
+	}
+	return nil
+}
+
+func reportSSHLogin(cfg agentConfig, ev sshwatch.LoginEvent) {
+	if err := postJSON(cfg.Server+"/api/agent/event", map[string]any{
+		"node_id": cfg.NodeID,
+		"token":   cfg.Token,
+		"kind":    "ssh_login",
+		"user":    ev.User,
+		"address": ev.Address,
+		"method":  ev.Method,
+	}, nil); err != nil {
+		log.Printf("ssh-alerts: report login: %v", err)
+	}
 }
