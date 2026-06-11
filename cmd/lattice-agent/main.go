@@ -30,6 +30,7 @@ type agentConfig struct {
 	Interval    time.Duration
 	AllowExec   bool
 	PublicIP    string
+	PublicIPv6  string
 	WireGuardIP string
 }
 
@@ -40,7 +41,8 @@ func main() {
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
 	flag.DurationVar(&cfg.Interval, "interval", 10*time.Second, "metrics interval")
 	flag.BoolVar(&cfg.AllowExec, "allow-exec", os.Getenv("LATTICE_AGENT_ALLOW_EXEC") == "1", "allow bounded task execution")
-	flag.StringVar(&cfg.PublicIP, "public-ip", os.Getenv("LATTICE_PUBLIC_IP"), "public IP metadata")
+	flag.StringVar(&cfg.PublicIP, "public-ip", os.Getenv("LATTICE_PUBLIC_IP"), "public IPv4 metadata (server observes source IP if empty)")
+	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
 	flag.Parse()
 	if cfg.NodeID == "" || cfg.Token == "" {
@@ -52,6 +54,7 @@ func main() {
 		"token":        cfg.Token,
 		"version":      version,
 		"public_ip":    cfg.PublicIP,
+		"public_ipv6":  cfg.PublicIPv6,
 		"wireguard_ip": cfg.WireGuardIP,
 	}, nil); err != nil {
 		log.Fatalf("hello failed: %v", err)
@@ -78,6 +81,7 @@ func reportMetrics(cfg agentConfig) error {
 		"token":        cfg.Token,
 		"version":      version,
 		"public_ip":    cfg.PublicIP,
+		"public_ipv6":  cfg.PublicIPv6,
 		"wireguard_ip": cfg.WireGuardIP,
 		"metrics":      metrics.Collect(),
 	}, nil)
