@@ -35,6 +35,8 @@ type agentConfig struct {
 	Token       string
 	Interval    time.Duration
 	AllowExec   bool
+	AllowRoot   bool
+	NoExec      bool
 	PublicIP    string
 	PublicIPv6  string
 	WireGuardIP string
@@ -45,12 +47,27 @@ type agentConfig struct {
 }
 
 func main() {
+	// If this process was re-executed as the task-execution rlimit shim, handle
+	// it before anything else: the shim applies resource limits and execs the
+	// target interpreter, never returning. On non-Linux this is a no-op.
+	if taskexec.MaybeRunChildShim(os.Args) {
+		return
+	}
+
 	var cfg agentConfig
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
 	flag.DurationVar(&cfg.Interval, "interval", 10*time.Second, "metrics interval")
 	flag.BoolVar(&cfg.AllowExec, "allow-exec", os.Getenv("LATTICE_AGENT_ALLOW_EXEC") == "1", "allow bounded task execution")
+	// -allow-root-exec opts in to running operator scripts while the agent is
+	// uid 0. Without it, a root agent refuses tasks rather than executing
+	// arbitrary scripts with full host privileges. Required for tasks that
+	// genuinely need root (e.g. nft/wg manipulation).
+	flag.BoolVar(&cfg.AllowRoot, "allow-root-exec", os.Getenv("LATTICE_AGENT_ALLOW_ROOT_EXEC") == "1", "permit task execution when the agent runs as root (uid 0)")
+	// -no-exec is a hard kill switch: it disables task execution entirely,
+	// overriding -allow-exec. Use it to neutralize a node without redeploying.
+	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.StringVar(&cfg.PublicIP, "public-ip", os.Getenv("LATTICE_PUBLIC_IP"), "public IPv4 metadata (server observes source IP if empty)")
 	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
@@ -61,6 +78,10 @@ func main() {
 	flag.Parse()
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
+	}
+	// The kill switch wins over the enable flag.
+	if cfg.NoExec {
+		cfg.AllowExec = false
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
@@ -74,12 +95,12 @@ func main() {
 	}, nil); err != nil {
 		log.Fatalf("hello failed: %v", err)
 	}
-	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v", cfg.NodeID, cfg.Server, cfg.AllowExec)
+	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
 	}
 
-	runner := taskexec.Runner{AllowExec: cfg.AllowExec}
+	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot}
 	monitors := newMonitorManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()

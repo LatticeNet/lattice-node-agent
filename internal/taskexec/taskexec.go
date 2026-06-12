@@ -19,8 +19,50 @@ var allowedInterpreters = map[string]string{
 	"node":    "node",
 }
 
+// Resource-limit caps applied to child task processes on Linux (see
+// taskexec_linux.go). They bound a misbehaving or hostile script so a single
+// task cannot exhaust the node. On non-Linux platforms these are advisory only
+// because applyResourceLimits is a no-op there.
+const (
+	// maxFileSizeBytes caps the size of any single file the task may write,
+	// preventing a runaway script from filling the disk.
+	maxFileSizeBytes = 8 * 1024 * 1024 // 8 MiB
+	// maxProcesses caps the number of processes/threads the task's user may
+	// spawn, blunting fork bombs.
+	maxProcesses = 64
+	// maxAddressSpaceBytes caps virtual memory (RLIMIT_AS) so the task cannot
+	// balloon memory and OOM the host. Generous enough for interpreters.
+	maxAddressSpaceBytes = 512 * 1024 * 1024 // 512 MiB
+	// maxDataBytes caps the data segment (RLIMIT_DATA) as a second memory
+	// guard alongside RLIMIT_AS.
+	maxDataBytes = 512 * 1024 * 1024 // 512 MiB
+	// cpuGraceSeconds is added to the wall-clock timeout when deriving the
+	// CPU-seconds rlimit, so a CPU-bound task is killed by SIGXCPU shortly
+	// after the context deadline rather than long before it.
+	cpuGraceSeconds = 5
+)
+
+// Runner executes allow-listed operator tasks in a bounded, hardened sandbox.
 type Runner struct {
+	// AllowExec gates execution entirely. When false, every task is refused
+	// with a clear error result (the kill switch).
 	AllowExec bool
+	// AllowRoot opts in to running tasks while the agent itself is uid 0.
+	// Without it, a root agent refuses to execute arbitrary operator scripts,
+	// since that would run them with full host privileges. Operators that
+	// genuinely need root (nft/wg manipulation) set this explicitly.
+	AllowRoot bool
+	// getUID returns the effective uid of the agent process. It is a field so
+	// tests can simulate "running as root" without actually being root. When
+	// nil it defaults to os.Geteuid.
+	getUID func() int
+}
+
+func (r Runner) effectiveUID() int {
+	if r.getUID != nil {
+		return r.getUID()
+	}
+	return os.Geteuid()
 }
 
 func (r Runner) Run(task model.Task) model.TaskResult {
@@ -36,6 +78,16 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 		result.FinishedAt = time.Now().UTC()
 		return result
 	}
+	// Refuse to run arbitrary operator scripts as root unless explicitly
+	// opted in. We deliberately do NOT drop privileges by switching uid
+	// mid-process (unsafe and racy in Go); refusing is the testable,
+	// predictable safe default.
+	if r.effectiveUID() == 0 && !r.AllowRoot {
+		result.ExitCode = -1
+		result.Error = "refusing to execute task as root; restart with -allow-root-exec=true to opt in"
+		result.FinishedAt = time.Now().UTC()
+		return result
+	}
 	interp, ok := allowedInterpreters[task.Interpreter]
 	if !ok {
 		result.ExitCode = -1
@@ -43,6 +95,17 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 		result.FinishedAt = time.Now().UTC()
 		return result
 	}
+	// Resolve to an absolute path. On Linux the rlimit shim execs the
+	// interpreter via syscall.Exec, which (unlike exec.Command) does NOT search
+	// PATH, so a bare name like "sh" would fail with ENOENT.
+	interpPath, err := exec.LookPath(interp)
+	if err != nil {
+		result.ExitCode = -1
+		result.Error = "interpreter not found: " + interp
+		result.FinishedAt = time.Now().UTC()
+		return result
+	}
+	interp = interpPath
 	timeout := time.Duration(task.TimeoutSec) * time.Second
 	if timeout <= 0 || timeout > 10*time.Minute {
 		timeout = 30 * time.Second
@@ -64,30 +127,66 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	defer os.RemoveAll(dir)
 
 	scriptPath := filepath.Join(dir, "script")
-	if err := os.WriteFile(scriptPath, []byte(task.Script), 0o700); err != nil {
+	// 0600: readable/writable only by the agent user; the interpreter reads it
+	// by path so it need not be executable.
+	if err := os.WriteFile(scriptPath, []byte(task.Script), 0o600); err != nil {
 		result.ExitCode = -1
 		result.Error = err.Error()
 		result.FinishedAt = time.Now().UTC()
 		return result
 	}
 
-	cmd := exec.CommandContext(ctx, interp, scriptPath)
+	// We manage process lifetime ourselves (process-group kill on timeout)
+	// rather than letting exec.CommandContext SIGKILL only the direct child,
+	// which would orphan grandchildren. ctx is still used to detect deadline.
+	//
+	// buildHardenedCmd constructs the command with platform isolation. On Linux
+	// it routes the interpreter through a self-exec shim that applies rlimits
+	// (inherited across exec into the whole tree) and puts the child in its own
+	// process group. On other platforms it is a plain exec of the interpreter.
+	cmd := buildHardenedCmd(interp, scriptPath, timeout)
 	cmd.Dir = dir
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "HOME=" + dir, "LATTICE_TASK_ID=" + task.ID, "LATTICE_TASK_LEASE_ID=" + task.LeaseID}
+
 	var stdout, stderr cappedBuffer
 	stdout.limit = limit
 	stderr.limit = limit
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+
+	if err := cmd.Start(); err != nil {
+		result.Stdout = stdout.String()
+		result.Stderr = stderr.String()
+		result.ExitCode = -1
+		result.Error = err.Error()
+		result.FinishedAt = time.Now().UTC()
+		return result
+	}
+
+	// Wait in a goroutine so we can race the context deadline. On timeout we
+	// kill the entire process group, reaping child-spawned descendants too.
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+
+	var timedOut bool
+	select {
+	case <-ctx.Done():
+		timedOut = true
+		killProcessGroup(cmd)
+		<-waitErr // ensure the process is reaped and Wait returns
+	case err = <-waitErr:
+	}
 
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
-	result.ExitCode = exitCode(err)
-	if ctx.Err() != nil {
+	if timedOut {
+		result.ExitCode = -1
 		result.Error = ctx.Err().Error()
-	} else if err != nil {
-		result.Error = err.Error()
+	} else {
+		result.ExitCode = exitCode(err)
+		if err != nil {
+			result.Error = err.Error()
+		}
 	}
 	result.FinishedAt = time.Now().UTC()
 	return result
