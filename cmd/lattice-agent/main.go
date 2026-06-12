@@ -63,9 +63,7 @@ func main() {
 		log.Fatal("node-id and token are required")
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
-	if err := postJSON(cfg.Server+"/api/agent/hello", map[string]any{
-		"node_id":              cfg.NodeID,
-		"token":                cfg.Token,
+	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
@@ -169,10 +167,8 @@ func probeAndReport(cfg agentConfig, m model.Monitor) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSec+2)*time.Second)
 	defer cancel()
 	res := prober.Probe(ctx, m)
-	if err := postJSON(cfg.Server+"/api/agent/monitor-result", map[string]any{
-		"node_id": cfg.NodeID,
-		"token":   cfg.Token,
-		"result":  res,
+	if err := postAgentJSON(cfg, "/api/agent/monitor-result", map[string]any{
+		"result": res,
 	}, nil); err != nil {
 		log.Printf("monitor %s report error: %v", m.ID, err)
 	}
@@ -200,9 +196,7 @@ func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
 }
 
 func reportMetrics(cfg agentConfig) error {
-	return postJSON(cfg.Server+"/api/agent/metrics", map[string]any{
-		"node_id":      cfg.NodeID,
-		"token":        cfg.Token,
+	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version":      version,
 		"public_ip":    cfg.PublicIP,
 		"public_ipv6":  cfg.PublicIPv6,
@@ -232,10 +226,8 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 	for _, task := range tasks {
 		result := runner.Run(task)
 		result.NodeID = cfg.NodeID
-		if err := postJSON(cfg.Server+"/api/agent/task-result", map[string]any{
-			"node_id": cfg.NodeID,
-			"token":   cfg.Token,
-			"result":  result,
+		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{
+			"result": result,
 		}, nil); err != nil {
 			return err
 		}
@@ -243,7 +235,15 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 	return nil
 }
 
-func postJSON(url string, payload any, out any) error {
+func postAgentJSON(cfg agentConfig, path string, payload map[string]any, out any) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["node_id"] = cfg.NodeID
+	return postJSON(cfg.Server+path, cfg.Token, payload, out)
+}
+
+func postJSON(url string, bearerToken string, payload any, out any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -253,6 +253,9 @@ func postJSON(url string, payload any, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -333,9 +336,7 @@ func sshLogCommand(ctx context.Context) *exec.Cmd {
 }
 
 func reportSSHLogin(cfg agentConfig, ev sshwatch.LoginEvent) {
-	if err := postJSON(cfg.Server+"/api/agent/event", map[string]any{
-		"node_id": cfg.NodeID,
-		"token":   cfg.Token,
+	if err := postAgentJSON(cfg, "/api/agent/event", map[string]any{
 		"kind":    "ssh_login",
 		"user":    ev.User,
 		"address": ev.Address,

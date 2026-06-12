@@ -5,6 +5,7 @@ Outbound node daemon for Lattice.
 The agent has no inbound listener. It authenticates with a per-node token,
 reports metrics, polls for queued tasks, executes bounded tasks only when
 explicitly enabled, and posts results back to the server.
+Node tokens are sent in the `Authorization: Bearer` header, not in JSON bodies.
 
 ## Run
 
@@ -25,7 +26,15 @@ where remote script execution is acceptable.
 - Default timeout: 30 seconds.
 - Maximum timeout: 10 minutes.
 - Output cap: up to 256 KiB.
+- Server-side task creation enforces the same interpreter, timeout, output, and
+  script-size limits before a task can be leased.
+- Server-side result ingestion also rejects stdout, stderr, or error text that
+  exceeds the task's output cap.
 - Temporary working directory and minimal environment.
+- Leased tasks carry a server-issued `lease_id`; the agent returns it with the
+  result and exposes it to the task as `LATTICE_TASK_LEASE_ID` for traceability.
+- Leased task payloads contain only execution fields; control-plane actor/token
+  metadata is not sent to agents.
 
 ## Development
 
@@ -33,4 +42,3 @@ where remote script execution is acceptable.
 go test ./...
 go build ./cmd/lattice-agent
 ```
-

@@ -27,6 +27,7 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	start := time.Now().UTC()
 	result := model.TaskResult{
 		TaskID:    task.ID,
+		LeaseID:   task.LeaseID,
 		StartedAt: start,
 	}
 	if !r.AllowExec {
@@ -72,7 +73,7 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 
 	cmd := exec.CommandContext(ctx, interp, scriptPath)
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "HOME=" + dir, "LATTICE_TASK_ID=" + task.ID}
+	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "HOME=" + dir, "LATTICE_TASK_ID=" + task.ID, "LATTICE_TASK_LEASE_ID=" + task.LeaseID}
 	var stdout, stderr cappedBuffer
 	stdout.limit = limit
 	stderr.limit = limit
