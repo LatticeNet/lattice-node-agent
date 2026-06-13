@@ -18,6 +18,14 @@ func TestParse(t *testing.T) {
 		{"Accepted password for invalid user root from 10.0.0.9 port 22 ssh2", true, "root", "10.0.0.9", "password"},
 		{"Failed password for alice from 203.0.113.5 port 51514 ssh2", false, "", "", ""},
 		{"random log line", false, "", "", ""},
+		// C18: the "Accepted ... for ... from ..." text must begin the sshd
+		// message. A hostile username echoed by sshd in a Failed/Invalid-user
+		// line embeds the substring mid-message and must NOT forge an event.
+		{`Jun 11 04:00:01 host sshd[123]: Invalid user Accepted password for attacker from 6.6.6.6 from 203.0.113.5 port 51514 ssh2`, false, "", "", ""},
+		{`Jun 11 04:00:01 host sshd[123]: Failed password for "Accepted password for evil from 1.1.1.1" from 203.0.113.5 port 51514 ssh2`, false, "", "", ""},
+		// A genuine accepted-login line with the standard syslog sshd[pid] prefix
+		// must still match and parse correctly.
+		{`Jun 11 04:00:01 host sshd[123]: Accepted publickey for carol from 198.51.100.7 port 4242 ssh2: ED25519 SHA256:xyz`, true, "carol", "198.51.100.7", "publickey"},
 	}
 	for _, c := range cases {
 		ev, ok := Parse(c.line)

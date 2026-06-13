@@ -30,6 +30,31 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// TestMissingInterpreters exercises the startup availability probe (D11). It
+// asserts the result is a subset of the allowlist and that a present interpreter
+// (sh, resolvable on essentially every unix CI host) is not reported missing.
+func TestMissingInterpreters(t *testing.T) {
+	missing := MissingInterpreters()
+	for _, name := range missing {
+		if _, ok := allowedInterpreters[name]; !ok {
+			t.Fatalf("MissingInterpreters returned %q which is not in the allowlist", name)
+		}
+	}
+	// /bin/sh is an absolute path in the allowlist and exists on all supported
+	// targets; it must never be reported missing.
+	for _, name := range missing {
+		if name == "sh" {
+			t.Fatalf("sh reported missing but /bin/sh should always resolve: %v", missing)
+		}
+	}
+	// Result must be sorted (stable, readable operator output).
+	for i := 1; i < len(missing); i++ {
+		if missing[i-1] > missing[i] {
+			t.Fatalf("MissingInterpreters not sorted: %v", missing)
+		}
+	}
+}
+
 func TestRunnerRequiresExplicitExecEnable(t *testing.T) {
 	r := Runner{}
 	result := r.Run(model.Task{ID: "task_1", Interpreter: "sh", Script: "echo no"})

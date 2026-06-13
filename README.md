@@ -20,6 +20,13 @@ go run ./cmd/lattice-agent \
 `-allow-exec=false` is the safe default. Use `-allow-exec=true` only on nodes
 where remote script execution is acceptable.
 
+The node token is sent in the `Authorization: Bearer` header on every request.
+The loopback `http://127.0.0.1:8088` URL above is safe because the token never
+leaves the host. For a **remote** server the agent refuses to start on a
+cleartext `http://` URL (it would leak the token) — use `https://` instead. The
+`-allow-insecure-http` flag exists only as a deliberate escape hatch and is off
+by default.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.

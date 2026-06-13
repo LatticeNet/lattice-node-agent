@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -30,20 +32,24 @@ const version = "0.1.0"
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 type agentConfig struct {
-	Server      string
-	NodeID      string
-	Token       string
-	Interval    time.Duration
-	AllowExec   bool
-	AllowRoot   bool
-	NoExec      bool
-	PublicIP    string
-	PublicIPv6  string
-	WireGuardIP string
-	WGPublicKey string
-	WGEndpoint  string
-	WGPort      int
-	SSHAlerts   bool
+	Server    string
+	NodeID    string
+	Token     string
+	Interval  time.Duration
+	AllowExec bool
+	AllowRoot bool
+	NoExec    bool
+	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
+	// http:// server URL. Default false: the agent refuses such a config because
+	// the Authorization: Bearer token would travel in cleartext.
+	AllowInsecureHTTP bool
+	PublicIP          string
+	PublicIPv6        string
+	WireGuardIP       string
+	WGPublicKey       string
+	WGEndpoint        string
+	WGPort            int
+	SSHAlerts         bool
 }
 
 func main() {
@@ -68,6 +74,11 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
+	// -allow-insecure-http is an explicit escape hatch to permit a non-loopback
+	// http:// -server. Off by default: sending the node token in the bearer
+	// header over cleartext to a remote host leaks it. Operators should use
+	// https:// instead; this flag exists only for deliberate, isolated setups.
+	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", os.Getenv("LATTICE_ALLOW_INSECURE_HTTP") == "1", "permit a non-loopback http:// server URL (leaks the node token in cleartext; use https:// instead)")
 	flag.StringVar(&cfg.PublicIP, "public-ip", os.Getenv("LATTICE_PUBLIC_IP"), "public IPv4 metadata (server observes source IP if empty)")
 	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
@@ -84,6 +95,18 @@ func main() {
 		cfg.AllowExec = false
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
+	// Fail closed if the node token would be sent over cleartext http:// to a
+	// non-loopback host. Loopback http:// is fine; anything else must use https://
+	// unless the operator explicitly opted in with -allow-insecure-http.
+	if err := checkServerTransport(cfg.Server, cfg.AllowInsecureHTTP); err != nil {
+		log.Fatalf("refusing to start: %v", err)
+	}
+	// Probe interpreter availability once at startup so operators learn early
+	// which allowlisted interpreters are missing, rather than only discovering it
+	// when a task fails. Non-fatal; task-time resolution is unchanged.
+	if missing := taskexec.MissingInterpreters(); len(missing) > 0 {
+		log.Printf("warning: allowlisted interpreters not found on PATH: %s (tasks using them will fail until installed)", strings.Join(missing, ", "))
+	}
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
 		"public_ip":            cfg.PublicIP,
@@ -308,6 +331,46 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// checkServerTransport enforces that the node token is never sent in cleartext
+// to a remote host. It returns an error when rawURL uses http:// to a
+// non-loopback host and allowInsecure is false. https:// is always allowed;
+// loopback http:// is allowed (token never leaves the host); a non-loopback
+// http:// target is refused unless explicitly overridden. It is a pure function
+// (no I/O) so it is unit-testable.
+func checkServerTransport(rawURL string, allowInsecure bool) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid -server URL %q: %w", rawURL, err)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil // loopback cleartext never leaves the machine
+		}
+		if allowInsecure {
+			log.Printf("warning: -server uses cleartext http:// to non-loopback host %q; the node token is sent in the clear (overridden by -allow-insecure-http)", u.Hostname())
+			return nil
+		}
+		return fmt.Errorf("server %q uses cleartext http:// to a non-loopback host; the node token would leak. Use https:// (or pass -allow-insecure-http to override)", rawURL)
+	default:
+		return fmt.Errorf("server %q has unsupported scheme %q; use https:// (or http:// for loopback only)", rawURL, u.Scheme)
+	}
+}
+
+// isLoopbackHost reports whether host (a URL hostname, no port) refers to the
+// local machine: the literal "localhost", or any IP in 127.0.0.0/8 or ::1.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // watchSSHLogins streams sshd accepted-login lines from journald (preferred) or

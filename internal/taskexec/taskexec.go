@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -30,17 +31,46 @@ const (
 	// maxProcesses caps the number of processes/threads the task's user may
 	// spawn, blunting fork bombs.
 	maxProcesses = 64
-	// maxAddressSpaceBytes caps virtual memory (RLIMIT_AS) so the task cannot
-	// balloon memory and OOM the host. Generous enough for interpreters.
-	maxAddressSpaceBytes = 512 * 1024 * 1024 // 512 MiB
-	// maxDataBytes caps the data segment (RLIMIT_DATA) as a second memory
-	// guard alongside RLIMIT_AS.
+	// maxAddressSpaceBytes caps total VIRTUAL address space (RLIMIT_AS). This is
+	// a coarse backstop, NOT a resident-memory limit: RLIMIT_AS counts every
+	// mmap'd region (including large PROT_NONE reservations the runtime never
+	// touches). Modern runtimes reserve multiple GiB of virtual space up front —
+	// V8 (node) and current glibc/python3 in particular — so a tight cap here
+	// causes spurious mmap/ENOMEM failures rather than bounding real memory use.
+	// We therefore set it high enough not to break the allowlisted interpreters
+	// while still catching pathological virtual-space blowups, and rely on
+	// RLIMIT_DATA (below) as the meaningful data-segment guard. The real
+	// resident-memory guard is a cgroup v2 memory.max on the task's process,
+	// which is a deferred improvement (not implemented here).
+	maxAddressSpaceBytes = 8 * 1024 * 1024 * 1024 // 8 GiB (virtual-space backstop only)
+	// maxDataBytes caps the data segment (RLIMIT_DATA). This is the meaningful
+	// per-task memory guard: unlike RLIMIT_AS it bounds the heap/brk and
+	// anonymous mappings that actually back allocations, without tripping on the
+	// large virtual reservations interpreters make at startup.
 	maxDataBytes = 512 * 1024 * 1024 // 512 MiB
 	// cpuGraceSeconds is added to the wall-clock timeout when deriving the
 	// CPU-seconds rlimit, so a CPU-bound task is killed by SIGXCPU shortly
 	// after the context deadline rather than long before it.
 	cpuGraceSeconds = 5
 )
+
+// MissingInterpreters returns the sorted list of allowlisted interpreter names
+// that cannot currently be resolved on PATH. It performs the same exec.LookPath
+// resolution used at task time, but as a one-shot startup probe so operators
+// learn early which interpreters are absent. It does not change task-time
+// behavior: interpreters are still resolved per task, so an interpreter
+// installed after startup will work, and one removed after startup will fail at
+// task time regardless of this probe.
+func MissingInterpreters() []string {
+	var missing []string
+	for name, target := range allowedInterpreters {
+		if _, err := exec.LookPath(target); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
 
 // Runner executes allow-listed operator tasks in a bounded, hardened sandbox.
 type Runner struct {

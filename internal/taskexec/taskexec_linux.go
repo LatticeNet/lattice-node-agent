@@ -70,7 +70,17 @@ func MaybeRunChildShim(argv []string) bool {
 func applyResourceLimits(cpuSecs uint64) {
 	setRlimit(syscall.RLIMIT_CPU, cpuSecs, cpuSecs+1)
 	setRlimit(syscall.RLIMIT_FSIZE, maxFileSizeBytes, maxFileSizeBytes)
+	// RLIMIT_NPROC on Linux limits the number of processes/threads for the
+	// process's REAL UID across the WHOLE SYSTEM, not per-task. The cap is
+	// therefore shared with the agent's own threads and every other concurrent
+	// task running under the same uid, so it blunts fork bombs but does not give
+	// true per-task isolation (one task can consume the budget and starve
+	// others, and the count includes unrelated processes of that uid). Real
+	// per-task process isolation requires a PID namespace plus a cgroup
+	// pids.max scoped to the task — a deferred improvement, not implemented here.
 	setRlimit(rlimitNProc, maxProcesses, maxProcesses)
+	// RLIMIT_AS is a coarse virtual-space backstop only (see maxAddressSpaceBytes);
+	// RLIMIT_DATA below is the meaningful data-segment memory guard.
 	setRlimit(syscall.RLIMIT_AS, maxAddressSpaceBytes, maxAddressSpaceBytes)
 	setRlimit(syscall.RLIMIT_DATA, maxDataBytes, maxDataBytes)
 }
