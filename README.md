@@ -3,9 +3,15 @@
 Outbound node daemon for Lattice.
 
 The agent has no inbound listener. It authenticates with a per-node token,
-reports metrics, polls for queued tasks, executes bounded tasks only when
-explicitly enabled, and posts results back to the server.
+reports metrics and slow-changing HostFacts inventory telemetry, polls for
+queued tasks, executes bounded tasks only when explicitly enabled, and posts
+results back to the server.
 Node tokens are sent in the `Authorization: Bearer` header, not in JSON bodies.
+
+HostFacts are best-effort advisory facts (OS, arch, CPU cores/model,
+memory/swap, platform, kernel, hostname, boot time, virtualization hint). They
+are collected with stdlib and local platform files such as `/proc` and
+`/etc/os-release`; missing fields are left empty and never block the agent.
 
 ## Run
 

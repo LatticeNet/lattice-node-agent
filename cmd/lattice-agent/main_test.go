@@ -33,6 +33,9 @@ func TestReportMetricsUsesBearerAuthAndOmitsBodyToken(t *testing.T) {
 		if _, ok := body["token"]; ok {
 			return testResponse(http.StatusBadRequest, "body token leaked"), nil
 		}
+		if _, ok := body["host_facts"].(map[string]any); !ok {
+			return testResponse(http.StatusBadRequest, "missing host_facts"), nil
+		}
 		return testResponse(http.StatusOK, `{"ok":true}`), nil
 	})}
 

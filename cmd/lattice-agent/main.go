@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
@@ -115,6 +116,7 @@ func main() {
 		"wireguard_public_key": cfg.WGPublicKey,
 		"wireguard_endpoint":   cfg.WGEndpoint,
 		"wireguard_port":       cfg.WGPort,
+		"host_facts":           hostfacts.Collect(),
 	}, nil); err != nil {
 		log.Fatalf("hello failed: %v", err)
 	}
@@ -246,6 +248,7 @@ func reportMetrics(cfg agentConfig) error {
 		"public_ipv6":  cfg.PublicIPv6,
 		"wireguard_ip": cfg.WireGuardIP,
 		"metrics":      metrics.Collect(),
+		"host_facts":   hostfacts.Collect(),
 	}, nil)
 }
 
