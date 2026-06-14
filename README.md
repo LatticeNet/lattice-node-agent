@@ -53,14 +53,18 @@ lattice-agent --update-nft-domain-set \
   -host lattice.example.com \
   -family inet \
   -table lattice_policy \
-  -set lattice_control4
+  -set lattice_control4 \
+  -set6 lattice_control6
 ```
 
-This mode resolves the hostname with Go's resolver, filters to IPv4, sorts and
-deduplicates results, then updates the existing nft named set using direct
-`nft` argv calls. It does not require or send the node token. It is intended for
-server-rendered, rollback-protected apply scripts; empty/no-IPv4 resolution or
-invalid nft identifiers exit non-zero so the task can roll back.
+This mode resolves the hostname with Go's resolver, splits answers into IPv4
+and IPv6 sets, sorts/deduplicates each family, then updates the existing nft
+named sets using direct `nft` argv calls. `-set` may be used alone for the
+legacy IPv4-only path; `-set` + `-set6` updates both control-plane sets and
+requires at least one A or AAAA answer. It does not require or send the node
+token. It is intended for server-rendered, rollback-protected apply scripts;
+empty resolution or invalid nft identifiers exit non-zero so the task can roll
+back.
 
 ## Execution Limits
 

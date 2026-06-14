@@ -65,6 +65,7 @@ type agentConfig struct {
 	NFTFamily         string
 	NFTTable          string
 	NFTSet            string
+	NFTSet6           string
 }
 
 func main() {
@@ -90,11 +91,12 @@ func main() {
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
-	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update an existing nft IPv4 named set, then exit")
+	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update existing nft control-plane named sets, then exit")
 	flag.StringVar(&cfg.NFTDomainHost, "host", "", "hostname for -update-nft-domain-set")
-	flag.StringVar(&cfg.NFTFamily, "family", "inet", "nft family for -update-nft-domain-set (inet or ip)")
+	flag.StringVar(&cfg.NFTFamily, "family", "inet", "nft family for -update-nft-domain-set (inet, ip, or ip6)")
 	flag.StringVar(&cfg.NFTTable, "table", "", "nft table for -update-nft-domain-set")
-	flag.StringVar(&cfg.NFTSet, "set", "", "nft set for -update-nft-domain-set")
+	flag.StringVar(&cfg.NFTSet, "set", "", "IPv4 nft set for -update-nft-domain-set")
+	flag.StringVar(&cfg.NFTSet6, "set6", "", "IPv6 nft set for -update-nft-domain-set")
 	// -allow-insecure-http is an explicit escape hatch to permit a non-loopback
 	// http:// -server. Off by default: sending the node token in the bearer
 	// header over cleartext to a remote host leaks it. Operators should use
@@ -114,11 +116,11 @@ func main() {
 	}
 	if cfg.UpdateNFTDomainSet {
 		if err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
-			Host: cfg.NFTDomainHost, Family: cfg.NFTFamily, Table: cfg.NFTTable, Set: cfg.NFTSet,
-		}, lookupIPv4Addrs, runNFTCommand); err != nil {
+			Host: cfg.NFTDomainHost, Family: cfg.NFTFamily, Table: cfg.NFTTable, Set: cfg.NFTSet, Set6: cfg.NFTSet6,
+		}, lookupIPAddrs, runNFTCommand); err != nil {
 			log.Fatalf("nft domain set update failed: %v", err)
 		}
-		log.Printf("nft domain set updated: family=%s table=%s set=%s host=%s", cfg.NFTFamily, cfg.NFTTable, cfg.NFTSet, cfg.NFTDomainHost)
+		log.Printf("nft domain set updated: family=%s table=%s set=%s set6=%s host=%s", cfg.NFTFamily, cfg.NFTTable, cfg.NFTSet, cfg.NFTSet6, cfg.NFTDomainHost)
 		return
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
@@ -382,6 +384,7 @@ type nftDomainSetConfig struct {
 	Family string
 	Table  string
 	Set    string
+	Set6   string
 }
 
 type nftDomainResolver func(context.Context, string) ([]string, error)
@@ -404,14 +407,33 @@ func updateNFTDomainSet(ctx context.Context, cfg nftDomainSetConfig, resolver nf
 	if err != nil {
 		return err
 	}
-	addrs = uniqueSortedIPv4(addrs)
-	if len(addrs) == 0 {
-		return fmt.Errorf("no IPv4 A records resolved for %s", host)
+	ipv4 := uniqueSortedIPs(addrs, 4)
+	ipv6 := uniqueSortedIPs(addrs, 6)
+	switch {
+	case cfg.Set != "" && cfg.Set6 != "":
+		if len(ipv4)+len(ipv6) == 0 {
+			return fmt.Errorf("no A or AAAA records resolved for %s", host)
+		}
+	case cfg.Set != "":
+		if len(ipv4) == 0 {
+			return fmt.Errorf("no IPv4 A records resolved for %s", host)
+		}
+	case cfg.Set6 != "":
+		if len(ipv6) == 0 {
+			return fmt.Errorf("no IPv6 AAAA records resolved for %s", host)
+		}
 	}
-	if err := runner(ctx, "flush", "set", cfg.Family, cfg.Table, cfg.Set); err != nil {
-		return err
+	if cfg.Set != "" {
+		if err := updateNFTSet(ctx, runner, cfg.Family, cfg.Table, cfg.Set, ipv4); err != nil {
+			return err
+		}
 	}
-	return runner(ctx, "add", "element", cfg.Family, cfg.Table, cfg.Set, "{ "+strings.Join(addrs, ", ")+" }")
+	if cfg.Set6 != "" {
+		if err := updateNFTSet(ctx, runner, cfg.Family, cfg.Table, cfg.Set6, ipv6); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func normalizeNFTDomainHost(host string) (string, error) {
@@ -429,42 +451,78 @@ func normalizeNFTDomainHost(host string) (string, error) {
 
 func validateNFTSetTarget(cfg nftDomainSetConfig) error {
 	switch cfg.Family {
-	case "inet", "ip":
+	case "inet", "ip", "ip6":
 	default:
 		return fmt.Errorf("unsupported nft family %q", cfg.Family)
+	}
+	if cfg.Set == "" && cfg.Set6 == "" {
+		return fmt.Errorf("at least one nft set is required")
+	}
+	if cfg.Family == "ip" && cfg.Set6 != "" {
+		return fmt.Errorf("IPv6 set requires nft family inet or ip6")
+	}
+	if cfg.Family == "ip6" && cfg.Set != "" {
+		return fmt.Errorf("IPv4 set requires nft family inet or ip")
 	}
 	if !nftIdentRe.MatchString(cfg.Table) {
 		return fmt.Errorf("invalid nft table %q", cfg.Table)
 	}
-	if !nftIdentRe.MatchString(cfg.Set) {
+	if cfg.Set != "" && !nftIdentRe.MatchString(cfg.Set) {
 		return fmt.Errorf("invalid nft set %q", cfg.Set)
+	}
+	if cfg.Set6 != "" && !nftIdentRe.MatchString(cfg.Set6) {
+		return fmt.Errorf("invalid nft set %q", cfg.Set6)
 	}
 	return nil
 }
 
-func lookupIPv4Addrs(ctx context.Context, host string) ([]string, error) {
+func lookupIPAddrs(ctx context.Context, host string) ([]string, error) {
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		if v4 := ip.IP.To4(); v4 != nil {
-			out = append(out, v4.String())
+		if parsed := ip.IP; parsed != nil {
+			out = append(out, parsed.String())
 		}
 	}
 	return out, nil
 }
 
-func uniqueSortedIPv4(values []string) []string {
+func updateNFTSet(ctx context.Context, runner nftCommandRunner, family, table, set string, addrs []string) error {
+	if err := runner(ctx, "flush", "set", family, table, set); err != nil {
+		return err
+	}
+	if len(addrs) == 0 {
+		return nil
+	}
+	return runner(ctx, "add", "element", family, table, set, "{ "+strings.Join(addrs, ", ")+" }")
+}
+
+func uniqueSortedIPs(values []string, version int) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		ip := net.ParseIP(strings.TrimSpace(value))
-		if ip == nil || ip.To4() == nil {
+		if ip == nil {
 			continue
 		}
-		canonical := ip.To4().String()
+		var canonical string
+		switch version {
+		case 4:
+			if ip.To4() == nil {
+				continue
+			}
+			canonical = ip.To4().String()
+		case 6:
+			if ip.To4() != nil || ip.To16() == nil {
+				continue
+			}
+			canonical = ip.To16().String()
+		default:
+			continue
+		}
 		if _, ok := seen[canonical]; ok {
 			continue
 		}
@@ -472,7 +530,10 @@ func uniqueSortedIPv4(values []string) []string {
 		out = append(out, canonical)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return bytes.Compare(net.ParseIP(out[i]).To4(), net.ParseIP(out[j]).To4()) < 0
+		if version == 4 {
+			return bytes.Compare(net.ParseIP(out[i]).To4(), net.ParseIP(out[j]).To4()) < 0
+		}
+		return bytes.Compare(net.ParseIP(out[i]).To16(), net.ParseIP(out[j]).To16()) < 0
 	})
 	return out
 }

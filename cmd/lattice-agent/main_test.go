@@ -117,12 +117,12 @@ func TestSelfcheckControlPlaneRejectsNonOK(t *testing.T) {
 func TestNFTDomainSetUpdateBuildsDeterministicArgv(t *testing.T) {
 	var commands [][]string
 	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
-		Host: "LATTICE.Example.COM.", Family: "inet", Table: "lattice_policy", Set: "lattice_control4",
+		Host: "LATTICE.Example.COM.", Family: "inet", Table: "lattice_policy", Set: "lattice_control4", Set6: "lattice_control6",
 	}, func(ctx context.Context, host string) ([]string, error) {
 		if host != "lattice.example.com" {
 			t.Fatalf("host not normalized before resolution: %q", host)
 		}
-		return []string{"203.0.113.10", "2001:db8::1", "198.51.100.2", "203.0.113.10"}, nil
+		return []string{"203.0.113.10", "2001:db8::1", "198.51.100.2", "2001:db8::2", "203.0.113.10"}, nil
 	}, func(ctx context.Context, args ...string) error {
 		commands = append(commands, append([]string(nil), args...))
 		return nil
@@ -133,13 +133,38 @@ func TestNFTDomainSetUpdateBuildsDeterministicArgv(t *testing.T) {
 	want := [][]string{
 		{"flush", "set", "inet", "lattice_policy", "lattice_control4"},
 		{"add", "element", "inet", "lattice_policy", "lattice_control4", "{ 198.51.100.2, 203.0.113.10 }"},
+		{"flush", "set", "inet", "lattice_policy", "lattice_control6"},
+		{"add", "element", "inet", "lattice_policy", "lattice_control6", "{ 2001:db8::1, 2001:db8::2 }"},
 	}
 	if !reflect.DeepEqual(commands, want) {
 		t.Fatalf("unexpected nft argv:\n got: %#v\nwant: %#v", commands, want)
 	}
 }
 
-func TestNFTDomainSetUpdateRejectsNoIPv4(t *testing.T) {
+func TestNFTDomainSetUpdateAllowsMissingIPv6WhenIPv4Exists(t *testing.T) {
+	var commands [][]string
+	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
+		Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice_control4", Set6: "lattice_control6",
+	}, func(ctx context.Context, host string) ([]string, error) {
+		return []string{"203.0.113.10"}, nil
+	}, func(ctx context.Context, args ...string) error {
+		commands = append(commands, append([]string(nil), args...))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"flush", "set", "inet", "lattice_policy", "lattice_control4"},
+		{"add", "element", "inet", "lattice_policy", "lattice_control4", "{ 203.0.113.10 }"},
+		{"flush", "set", "inet", "lattice_policy", "lattice_control6"},
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("unexpected nft argv:\n got: %#v\nwant: %#v", commands, want)
+	}
+}
+
+func TestNFTDomainSetUpdateRejectsNoIPv4ForLegacySetOnly(t *testing.T) {
 	called := false
 	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
 		Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice_control4",
@@ -154,12 +179,28 @@ func TestNFTDomainSetUpdateRejectsNoIPv4(t *testing.T) {
 	}
 }
 
+func TestNFTDomainSetUpdateRejectsNoRequestedRecords(t *testing.T) {
+	called := false
+	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
+		Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice_control4", Set6: "lattice_control6",
+	}, func(ctx context.Context, host string) ([]string, error) {
+		return []string{"not-an-ip"}, nil
+	}, func(ctx context.Context, args ...string) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("expected no-record failure before nft commands, err=%v called=%v", err, called)
+	}
+}
+
 func TestNFTDomainSetUpdateRejectsUnsafeIdentifiers(t *testing.T) {
 	cases := []nftDomainSetConfig{
 		{Host: "bad host", Family: "inet", Table: "lattice_policy", Set: "lattice_control4"},
 		{Host: "lattice.example.com", Family: "inet;reboot", Table: "lattice_policy", Set: "lattice_control4"},
 		{Host: "lattice.example.com", Family: "inet", Table: "lattice-policy", Set: "lattice_control4"},
 		{Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice/control4"},
+		{Host: "lattice.example.com", Family: "ip", Table: "lattice_policy", Set: "lattice_control4", Set6: "lattice_control6"},
 	}
 	for _, cfg := range cases {
 		err := updateNFTDomainSet(context.Background(), cfg, func(ctx context.Context, host string) ([]string, error) {
