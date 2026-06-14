@@ -5,7 +5,8 @@ Outbound node daemon for Lattice.
 The agent has no inbound listener. It authenticates with a per-node token,
 reports metrics and slow-changing HostFacts inventory telemetry, polls for
 queued tasks, executes bounded tasks only when explicitly enabled, and posts
-results back to the server.
+results back to the server. It can also report proxy-core traffic counters from
+a bounded local JSON snapshot file for the server-owned usage rollup.
 Node tokens are sent in the `Authorization: Bearer` header, not in JSON bodies.
 For rollback-protected firewall apply tasks, the binary also supports
 `--selfcheck-controlplane`, a one-shot unauthenticated `/api/health` reachability
@@ -65,6 +66,37 @@ requires at least one A or AAAA answer. It does not require or send the node
 token. It is intended for server-rendered, rollback-protected apply scripts;
 empty resolution or invalid nft identifiers exit non-zero so the task can roll
 back.
+
+Proxy usage reporting bridge:
+
+```sh
+lattice-agent \
+  -server https://lattice.example.com \
+  -node-id gmami-jp1 \
+  -token '<node-token>' \
+  -proxy-usage-file /run/lattice/proxy-usage.json
+```
+
+The file is read once per agent loop and posted to `/api/agent/proxy-usage`.
+The agent overrides any `node_id` in the file with its configured node id,
+defaults `at` when omitted, rejects empty user ids, rejects negative counters,
+and refuses files over 1 MiB. The server performs monotonic diffing,
+per-profile user eligibility filtering, quota status updates, and audit.
+
+Minimal file shape:
+
+```json
+{
+  "core_uptime_sec": 12345,
+  "user_bytes": {
+    "alice": 1048576,
+    "bob": 2097152
+  }
+}
+```
+
+This is an interim stable contract for sidecar collectors and future direct
+sing-box/xray collectors; it is not a general log or metrics ingestion channel.
 
 ## Execution Limits
 

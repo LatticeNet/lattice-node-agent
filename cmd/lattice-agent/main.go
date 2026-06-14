@@ -22,6 +22,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
+	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -66,6 +67,7 @@ type agentConfig struct {
 	NFTTable          string
 	NFTSet            string
 	NFTSet6           string
+	ProxyUsageFile    string
 }
 
 func main() {
@@ -109,6 +111,7 @@ func main() {
 	flag.StringVar(&cfg.WGPublicKey, "wg-pubkey", os.Getenv("LATTICE_WG_PUBKEY"), "WireGuard public key (for mesh planning)")
 	flag.StringVar(&cfg.WGEndpoint, "wg-endpoint", os.Getenv("LATTICE_WG_ENDPOINT"), "WireGuard public endpoint host:port (empty for dial-out-only nodes)")
 	flag.IntVar(&cfg.WGPort, "wg-port", envInt("LATTICE_WG_PORT"), "WireGuard listen port")
+	flag.StringVar(&cfg.ProxyUsageFile, "proxy-usage-file", os.Getenv("LATTICE_PROXY_USAGE_FILE"), "optional JSON proxy usage snapshot file to report each interval")
 	flag.Parse()
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
@@ -170,6 +173,9 @@ func main() {
 	for {
 		if err := reportMetrics(cfg); err != nil {
 			log.Printf("metrics error: %v", err)
+		}
+		if err := reportProxyUsage(cfg); err != nil {
+			log.Printf("proxy usage error: %v", err)
 		}
 		if err := runTasks(cfg, runner); err != nil {
 			log.Printf("task poll error: %v", err)
@@ -287,6 +293,19 @@ func reportMetrics(cfg agentConfig) error {
 		"wireguard_ip": cfg.WireGuardIP,
 		"metrics":      metrics.Collect(),
 		"host_facts":   hostfacts.Collect(),
+	}, nil)
+}
+
+func reportProxyUsage(cfg agentConfig) error {
+	if strings.TrimSpace(cfg.ProxyUsageFile) == "" {
+		return nil
+	}
+	snapshot, err := proxyusage.LoadFile(cfg.ProxyUsageFile, cfg.NodeID)
+	if err != nil {
+		return err
+	}
+	return postAgentJSON(cfg, "/api/agent/proxy-usage", map[string]any{
+		"snapshot": snapshot,
 	}, nil)
 }
 

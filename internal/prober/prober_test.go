@@ -14,7 +14,7 @@ import (
 func TestProbeTCPSuccess(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("local listener unavailable in this environment: %v", err)
 	}
 	defer ln.Close()
 	go func() {
@@ -50,9 +50,9 @@ func TestProbeTCPFailure(t *testing.T) {
 }
 
 func TestProbeHTTP(t *testing.T) {
-	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	ok := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	defer ok.Close()
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	bad := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
 	defer bad.Close()
 
 	if res := Probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: ok.URL, TimeoutSec: 2}); !res.Success {
@@ -62,6 +62,18 @@ func TestProbeHTTP(t *testing.T) {
 	if res.Success || !strings.Contains(res.Error, "503") {
 		t.Fatalf("expected http 503 failure, got success=%v err=%q", res.Success, res.Error)
 	}
+}
+
+func newLocalHTTPTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable in this environment: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.Start()
+	return srv
 }
 
 func TestProbeUnsupportedType(t *testing.T) {
