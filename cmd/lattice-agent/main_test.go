@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -82,6 +84,113 @@ func TestCheckServerTransport(t *testing.T) {
 				t.Fatalf("checkServerTransport(%q, allowInsecure=%v) err=%v, wantErr=%v", c.url, c.allowInsecure, err, c.wantErr)
 			}
 		})
+	}
+}
+
+func TestValidateProxyUsageConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     agentConfig
+		wantErr bool
+	}{
+		{
+			name:    "none ok",
+			cfg:     agentConfig{},
+			wantErr: false,
+		},
+		{
+			name:    "file ok",
+			cfg:     agentConfig{ProxyUsageFile: "/run/lattice/proxy-usage.json"},
+			wantErr: false,
+		},
+		{
+			name:    "loopback url ok",
+			cfg:     agentConfig{ProxyUsageURL: "http://127.0.0.1:9090/stats"},
+			wantErr: false,
+		},
+		{
+			name:    "file and url conflict",
+			cfg:     agentConfig{ProxyUsageFile: "/run/lattice/proxy-usage.json", ProxyUsageURL: "http://127.0.0.1:9090/stats"},
+			wantErr: true,
+		},
+		{
+			name:    "remote url refused",
+			cfg:     agentConfig{ProxyUsageURL: "http://example.com/stats"},
+			wantErr: true,
+		},
+		{
+			name:    "secret without url refused",
+			cfg:     agentConfig{ProxyUsageSecret: "local-secret"},
+			wantErr: true,
+		},
+		{
+			name:    "secret file without url refused",
+			cfg:     agentConfig{ProxyUsageSecretFile: "/run/lattice/proxy-usage.secret"},
+			wantErr: true,
+		},
+		{
+			name:    "secret and secret file conflict",
+			cfg:     agentConfig{ProxyUsageURL: "http://127.0.0.1:9090/stats", ProxyUsageSecret: "local-secret", ProxyUsageSecretFile: "/run/lattice/proxy-usage.secret"},
+			wantErr: true,
+		},
+		{
+			name:    "negative timeout refused",
+			cfg:     agentConfig{ProxyUsageURL: "http://127.0.0.1:9090/stats", ProxyUsageTimeout: -time.Second},
+			wantErr: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateProxyUsageConfig(c.cfg)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("validateProxyUsageConfig() err=%v wantErr=%v", err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestResolveProxyUsageSecret(t *testing.T) {
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "proxy-usage.secret")
+	if err := os.WriteFile(secretFile, []byte(" local-secret \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := agentConfig{ProxyUsageSecretFile: secretFile}
+	if err := resolveProxyUsageSecret(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProxyUsageSecret != "local-secret" {
+		t.Fatalf("unexpected secret %q", cfg.ProxyUsageSecret)
+	}
+	if cfg.ProxyUsageSecretFile != "" {
+		t.Fatalf("resolved secret file path must be cleared before validation, got %q", cfg.ProxyUsageSecretFile)
+	}
+	cfg.ProxyUsageURL = "http://127.0.0.1:9090/stats"
+	if err := validateProxyUsageConfig(cfg); err != nil {
+		t.Fatalf("resolved secret-file config should validate: %v", err)
+	}
+}
+
+func TestResolveProxyUsageSecretRejectsBadFiles(t *testing.T) {
+	dir := t.TempDir()
+	emptyFile := filepath.Join(dir, "empty.secret")
+	if err := os.WriteFile(emptyFile, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	largeFile := filepath.Join(dir, "large.secret")
+	if err := os.WriteFile(largeFile, bytes.Repeat([]byte("x"), 4097), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []agentConfig{
+		{ProxyUsageSecret: "already-set", ProxyUsageSecretFile: emptyFile},
+		{ProxyUsageSecretFile: emptyFile},
+		{ProxyUsageSecretFile: largeFile},
+		{ProxyUsageSecretFile: filepath.Join(dir, "missing.secret")},
+	}
+	for _, cfg := range cases {
+		if err := resolveProxyUsageSecret(&cfg); err == nil {
+			t.Fatalf("resolveProxyUsageSecret(%+v) expected error", cfg)
+		}
 	}
 }
 

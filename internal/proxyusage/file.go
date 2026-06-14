@@ -35,20 +35,5 @@ func LoadFile(path, nodeID string) (model.ProxyUsageSnapshot, error) {
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return model.ProxyUsageSnapshot{}, err
 	}
-	snapshot.NodeID = strings.TrimSpace(nodeID)
-	if snapshot.At.IsZero() {
-		snapshot.At = time.Now().UTC()
-	}
-	if snapshot.UserBytes == nil {
-		snapshot.UserBytes = map[string]int64{}
-	}
-	for userID, value := range snapshot.UserBytes {
-		if strings.TrimSpace(userID) == "" {
-			return model.ProxyUsageSnapshot{}, fmt.Errorf("proxy usage user id cannot be empty")
-		}
-		if value < 0 {
-			return model.ProxyUsageSnapshot{}, fmt.Errorf("proxy usage for %s cannot be negative", userID)
-		}
-	}
-	return snapshot, nil
+	return NormalizeSnapshot(snapshot, nodeID, time.Now().UTC())
 }

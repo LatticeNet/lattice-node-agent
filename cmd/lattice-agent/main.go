@@ -54,20 +54,24 @@ type agentConfig struct {
 	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
 	// http:// server URL. Default false: the agent refuses such a config because
 	// the Authorization: Bearer token would travel in cleartext.
-	AllowInsecureHTTP bool
-	PublicIP          string
-	PublicIPv6        string
-	WireGuardIP       string
-	WGPublicKey       string
-	WGEndpoint        string
-	WGPort            int
-	SSHAlerts         bool
-	NFTDomainHost     string
-	NFTFamily         string
-	NFTTable          string
-	NFTSet            string
-	NFTSet6           string
-	ProxyUsageFile    string
+	AllowInsecureHTTP    bool
+	PublicIP             string
+	PublicIPv6           string
+	WireGuardIP          string
+	WGPublicKey          string
+	WGEndpoint           string
+	WGPort               int
+	SSHAlerts            bool
+	NFTDomainHost        string
+	NFTFamily            string
+	NFTTable             string
+	NFTSet               string
+	NFTSet6              string
+	ProxyUsageFile       string
+	ProxyUsageURL        string
+	ProxyUsageSecret     string
+	ProxyUsageSecretFile string
+	ProxyUsageTimeout    time.Duration
 }
 
 func main() {
@@ -112,6 +116,10 @@ func main() {
 	flag.StringVar(&cfg.WGEndpoint, "wg-endpoint", os.Getenv("LATTICE_WG_ENDPOINT"), "WireGuard public endpoint host:port (empty for dial-out-only nodes)")
 	flag.IntVar(&cfg.WGPort, "wg-port", envInt("LATTICE_WG_PORT"), "WireGuard listen port")
 	flag.StringVar(&cfg.ProxyUsageFile, "proxy-usage-file", os.Getenv("LATTICE_PROXY_USAGE_FILE"), "optional JSON proxy usage snapshot file to report each interval")
+	flag.StringVar(&cfg.ProxyUsageURL, "proxy-usage-url", os.Getenv("LATTICE_PROXY_USAGE_URL"), "optional loopback HTTP JSON proxy usage source to report each interval")
+	flag.StringVar(&cfg.ProxyUsageSecret, "proxy-usage-secret", os.Getenv("LATTICE_PROXY_USAGE_SECRET"), "optional bearer secret for -proxy-usage-url (prefer -proxy-usage-secret-file for services)")
+	flag.StringVar(&cfg.ProxyUsageSecretFile, "proxy-usage-secret-file", os.Getenv("LATTICE_PROXY_USAGE_SECRET_FILE"), "optional file containing bearer secret for -proxy-usage-url")
+	flag.DurationVar(&cfg.ProxyUsageTimeout, "proxy-usage-timeout", envDuration("LATTICE_PROXY_USAGE_TIMEOUT", 3*time.Second), "timeout for -proxy-usage-url")
 	flag.Parse()
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
@@ -139,6 +147,12 @@ func main() {
 		}
 		log.Printf("control-plane selfcheck ok: %s/api/health", cfg.Server)
 		return
+	}
+	if err := resolveProxyUsageSecret(&cfg); err != nil {
+		log.Fatalf("invalid proxy usage secret config: %v", err)
+	}
+	if err := validateProxyUsageConfig(cfg); err != nil {
+		log.Fatalf("invalid proxy usage config: %v", err)
 	}
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
@@ -297,16 +311,84 @@ func reportMetrics(cfg agentConfig) error {
 }
 
 func reportProxyUsage(cfg agentConfig) error {
-	if strings.TrimSpace(cfg.ProxyUsageFile) == "" {
+	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
+	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
+	if !hasFile && !hasURL {
 		return nil
 	}
-	snapshot, err := proxyusage.LoadFile(cfg.ProxyUsageFile, cfg.NodeID)
+	if hasFile && hasURL {
+		return fmt.Errorf("configure either proxy-usage-file or proxy-usage-url, not both")
+	}
+	var (
+		snapshot model.ProxyUsageSnapshot
+		err      error
+	)
+	if hasFile {
+		snapshot, err = proxyusage.LoadFile(cfg.ProxyUsageFile, cfg.NodeID)
+	} else {
+		snapshot, err = proxyusage.LoadHTTP(context.Background(), proxyusage.HTTPSource{
+			URL:     cfg.ProxyUsageURL,
+			Secret:  cfg.ProxyUsageSecret,
+			Timeout: cfg.ProxyUsageTimeout,
+		}, cfg.NodeID)
+	}
 	if err != nil {
 		return err
 	}
 	return postAgentJSON(cfg, "/api/agent/proxy-usage", map[string]any{
 		"snapshot": snapshot,
 	}, nil)
+}
+
+func validateProxyUsageConfig(cfg agentConfig) error {
+	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
+	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
+	hasSecretFile := strings.TrimSpace(cfg.ProxyUsageSecretFile) != ""
+	if hasFile && hasURL {
+		return fmt.Errorf("configure either proxy-usage-file or proxy-usage-url, not both")
+	}
+	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" && hasSecretFile {
+		return fmt.Errorf("configure either proxy-usage-secret or proxy-usage-secret-file, not both")
+	}
+	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" && !hasURL {
+		return fmt.Errorf("proxy-usage-secret requires proxy-usage-url")
+	}
+	if hasSecretFile && !hasURL {
+		return fmt.Errorf("proxy-usage-secret-file requires proxy-usage-url")
+	}
+	if hasURL {
+		if _, err := proxyusage.ValidateLocalHTTPURL(cfg.ProxyUsageURL); err != nil {
+			return err
+		}
+	}
+	if cfg.ProxyUsageTimeout < 0 {
+		return fmt.Errorf("proxy-usage-timeout cannot be negative")
+	}
+	return nil
+}
+
+func resolveProxyUsageSecret(cfg *agentConfig) error {
+	file := strings.TrimSpace(cfg.ProxyUsageSecretFile)
+	if file == "" {
+		return nil
+	}
+	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" {
+		return fmt.Errorf("configure either proxy-usage-secret or proxy-usage-secret-file, not both")
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	if len(data) > 4096 {
+		return fmt.Errorf("proxy usage secret file exceeds 4096 bytes")
+	}
+	secret := strings.TrimSpace(string(data))
+	if secret == "" {
+		return fmt.Errorf("proxy usage secret file is empty")
+	}
+	cfg.ProxyUsageSecret = secret
+	cfg.ProxyUsageSecretFile = ""
+	return nil
 }
 
 func runTasks(cfg agentConfig, runner taskexec.Runner) error {
@@ -580,6 +662,18 @@ func envInt(key string) int {
 		return 0
 	}
 	return n
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 func env(key, fallback string) string {

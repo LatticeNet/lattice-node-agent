@@ -6,7 +6,8 @@ The agent has no inbound listener. It authenticates with a per-node token,
 reports metrics and slow-changing HostFacts inventory telemetry, polls for
 queued tasks, executes bounded tasks only when explicitly enabled, and posts
 results back to the server. It can also report proxy-core traffic counters from
-a bounded local JSON snapshot file for the server-owned usage rollup.
+a bounded local JSON snapshot file or a loopback-only HTTP JSON source for the
+server-owned usage rollup.
 Node tokens are sent in the `Authorization: Bearer` header, not in JSON bodies.
 For rollback-protected firewall apply tasks, the binary also supports
 `--selfcheck-controlplane`, a one-shot unauthenticated `/api/health` reachability
@@ -67,7 +68,7 @@ token. It is intended for server-rendered, rollback-protected apply scripts;
 empty resolution or invalid nft identifiers exit non-zero so the task can roll
 back.
 
-Proxy usage reporting bridge:
+Proxy usage reporting bridge (file source):
 
 ```sh
 lattice-agent \
@@ -97,6 +98,45 @@ Minimal file shape:
 
 This is an interim stable contract for sidecar collectors and future direct
 sing-box/xray collectors; it is not a general log or metrics ingestion channel.
+
+Proxy usage reporting bridge (loopback HTTP JSON source):
+
+```sh
+lattice-agent \
+  -server https://lattice.example.com \
+  -node-id gmami-jp1 \
+  -token '<node-token>' \
+  -proxy-usage-url http://127.0.0.1:19090/stats \
+  -proxy-usage-secret-file /etc/lattice/proxy-usage.secret
+```
+
+`-proxy-usage-url` is mutually exclusive with `-proxy-usage-file`. The URL must
+use `http://` or `https://` and a loopback host (`127.0.0.0/8`, `::1`, or
+`localhost`); remote hosts and URL userinfo are refused before any request is
+sent. The optional local bearer secret is sent as `Authorization: Bearer` to
+that local source only. For persistent services, prefer
+`-proxy-usage-secret-file` / `LATTICE_PROXY_USAGE_SECRET_FILE` over
+`-proxy-usage-secret` so the secret is not exposed in process arguments or shell
+history. Responses are capped at 1 MiB and fetched with `-proxy-usage-timeout`
+(default `3s`).
+
+The HTTP source accepts the same Lattice snapshot shape as the file source, an
+envelope `{"snapshot": ...}`, or V2Ray-style stats output:
+
+```json
+{
+  "stat": [
+    {"name": "user>>>alice>>>traffic>>>uplink", "value": 1048576},
+    {"name": "user>>>alice>>>traffic>>>downlink", "value": 2097152}
+  ]
+}
+```
+
+The agent sums uplink/downlink per user and posts the normalized
+`ProxyUsageSnapshot` to `/api/agent/proxy-usage`. This keeps the server's
+monotonic diffing, eligibility filtering, quota state, and audit as the
+authoritative layer. Direct sing-box/xray gRPC adapters can reuse this parser
+later without changing the server ingest contract.
 
 ## Execution Limits
 
