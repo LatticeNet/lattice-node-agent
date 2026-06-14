@@ -40,6 +40,10 @@ type agentConfig struct {
 	AllowExec bool
 	AllowRoot bool
 	NoExec    bool
+	// SelfcheckControlPlane runs a one-shot, unauthenticated reachability check
+	// against /api/health and exits. It is used by rollback-protected firewall
+	// apply tasks so the task shell never needs a node bearer token.
+	SelfcheckControlPlane bool
 	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
 	// http:// server URL. Default false: the agent refuses such a config because
 	// the Authorization: Bearer token would travel in cleartext.
@@ -75,6 +79,7 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
+	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
 	// -allow-insecure-http is an explicit escape hatch to permit a non-loopback
 	// http:// -server. Off by default: sending the node token in the bearer
 	// header over cleartext to a remote host leaks it. Operators should use
@@ -88,9 +93,6 @@ func main() {
 	flag.StringVar(&cfg.WGEndpoint, "wg-endpoint", os.Getenv("LATTICE_WG_ENDPOINT"), "WireGuard public endpoint host:port (empty for dial-out-only nodes)")
 	flag.IntVar(&cfg.WGPort, "wg-port", envInt("LATTICE_WG_PORT"), "WireGuard listen port")
 	flag.Parse()
-	if cfg.NodeID == "" || cfg.Token == "" {
-		log.Fatal("node-id and token are required")
-	}
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
@@ -101,6 +103,16 @@ func main() {
 	// unless the operator explicitly opted in with -allow-insecure-http.
 	if err := checkServerTransport(cfg.Server, cfg.AllowInsecureHTTP); err != nil {
 		log.Fatalf("refusing to start: %v", err)
+	}
+	if cfg.SelfcheckControlPlane {
+		if err := selfcheckControlPlane(cfg.Server); err != nil {
+			log.Fatalf("control-plane selfcheck failed: %v", err)
+		}
+		log.Printf("control-plane selfcheck ok: %s/api/health", cfg.Server)
+		return
+	}
+	if cfg.NodeID == "" || cfg.Token == "" {
+		log.Fatal("node-id and token are required")
 	}
 	// Probe interpreter availability once at startup so operators learn early
 	// which allowlisted interpreters are missing, rather than only discovering it
@@ -313,6 +325,30 @@ func postJSON(url string, bearerToken string, payload any, out any) error {
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
+}
+
+func selfcheckControlPlane(server string) error {
+	return selfcheckControlPlaneWithClient(server, httpClient)
+}
+
+func selfcheckControlPlaneWithClient(server string, client *http.Client) error {
+	server = strings.TrimRight(server, "/")
+	if server == "" {
+		return fmt.Errorf("server URL is required")
+	}
+	req, err := http.NewRequest(http.MethodGet, server+"/api/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %s", resp.Status)
 	}
 	return nil
 }

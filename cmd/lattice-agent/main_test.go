@@ -82,6 +82,35 @@ func TestCheckServerTransport(t *testing.T) {
 	}
 }
 
+func TestSelfcheckControlPlaneUsesHealthWithoutBearer(t *testing.T) {
+	calls := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Method != http.MethodGet || r.URL.Path != "/api/health" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		if r.Header.Get("Authorization") != "" {
+			return testResponse(http.StatusBadRequest, "unexpected auth"), nil
+		}
+		return testResponse(http.StatusOK, `{"status":"ok"}`), nil
+	})}
+	if err := selfcheckControlPlaneWithClient("https://lattice.test/", client); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one health request, got %d", calls)
+	}
+}
+
+func TestSelfcheckControlPlaneRejectsNonOK(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return testResponse(http.StatusServiceUnavailable, "down"), nil
+	})}
+	if err := selfcheckControlPlaneWithClient("https://lattice.test", client); err == nil {
+		t.Fatal("expected non-200 selfcheck to fail")
+	}
+}
+
 // TestIsLoopbackHost covers the pure helper directly for the loopback decision.
 func TestIsLoopbackHost(t *testing.T) {
 	loopback := []string{"localhost", "127.0.0.1", "127.0.0.53", "::1"}

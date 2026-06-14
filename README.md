@@ -7,6 +7,9 @@ reports metrics and slow-changing HostFacts inventory telemetry, polls for
 queued tasks, executes bounded tasks only when explicitly enabled, and posts
 results back to the server.
 Node tokens are sent in the `Authorization: Bearer` header, not in JSON bodies.
+For rollback-protected firewall apply tasks, the binary also supports
+`--selfcheck-controlplane`, a one-shot unauthenticated `/api/health` reachability
+check used after nft commit; this mode does not require or send the node token.
 
 HostFacts are best-effort advisory facts (OS, arch, CPU cores/model,
 memory/swap, platform, kernel, hostname, boot time, virtualization hint). They
@@ -32,6 +35,16 @@ leaves the host. For a **remote** server the agent refuses to start on a
 cleartext `http://` URL (it would leak the token) — use `https://` instead. The
 `-allow-insecure-http` flag exists only as a deliberate escape hatch and is off
 by default.
+
+Firewall apply selfcheck:
+
+```sh
+lattice-agent --selfcheck-controlplane -server https://203.0.113.99
+```
+
+The selfcheck exits 0 only when `GET /api/health` returns HTTP 200. It reuses
+the same transport safety guard as normal startup, so remote cleartext `http://`
+is refused unless deliberately allowed.
 
 ## Execution Limits
 
