@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +46,10 @@ type agentConfig struct {
 	// against /api/health and exits. It is used by rollback-protected firewall
 	// apply tasks so the task shell never needs a node bearer token.
 	SelfcheckControlPlane bool
+	// UpdateNFTDomainSet runs a one-shot hostname -> nft named-set update and
+	// exits. It is used by rollback-protected firewall apply tasks before the
+	// control-plane selfcheck; it does not require or send the node token.
+	UpdateNFTDomainSet bool
 	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
 	// http:// server URL. Default false: the agent refuses such a config because
 	// the Authorization: Bearer token would travel in cleartext.
@@ -55,6 +61,10 @@ type agentConfig struct {
 	WGEndpoint        string
 	WGPort            int
 	SSHAlerts         bool
+	NFTDomainHost     string
+	NFTFamily         string
+	NFTTable          string
+	NFTSet            string
 }
 
 func main() {
@@ -80,6 +90,11 @@ func main() {
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
+	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update an existing nft IPv4 named set, then exit")
+	flag.StringVar(&cfg.NFTDomainHost, "host", "", "hostname for -update-nft-domain-set")
+	flag.StringVar(&cfg.NFTFamily, "family", "inet", "nft family for -update-nft-domain-set (inet or ip)")
+	flag.StringVar(&cfg.NFTTable, "table", "", "nft table for -update-nft-domain-set")
+	flag.StringVar(&cfg.NFTSet, "set", "", "nft set for -update-nft-domain-set")
 	// -allow-insecure-http is an explicit escape hatch to permit a non-loopback
 	// http:// -server. Off by default: sending the node token in the bearer
 	// header over cleartext to a remote host leaks it. Operators should use
@@ -96,6 +111,15 @@ func main() {
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
+	}
+	if cfg.UpdateNFTDomainSet {
+		if err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
+			Host: cfg.NFTDomainHost, Family: cfg.NFTFamily, Table: cfg.NFTTable, Set: cfg.NFTSet,
+		}, lookupIPv4Addrs, runNFTCommand); err != nil {
+			log.Fatalf("nft domain set update failed: %v", err)
+		}
+		log.Printf("nft domain set updated: family=%s table=%s set=%s host=%s", cfg.NFTFamily, cfg.NFTTable, cfg.NFTSet, cfg.NFTDomainHost)
+		return
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
 	// Fail closed if the node token would be sent over cleartext http:// to a
@@ -349,6 +373,119 @@ func selfcheckControlPlaneWithClient(server string, client *http.Client) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned %s", resp.Status)
+	}
+	return nil
+}
+
+type nftDomainSetConfig struct {
+	Host   string
+	Family string
+	Table  string
+	Set    string
+}
+
+type nftDomainResolver func(context.Context, string) ([]string, error)
+type nftCommandRunner func(context.Context, ...string) error
+
+var (
+	nftIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	dnsHostRe  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
+)
+
+func updateNFTDomainSet(ctx context.Context, cfg nftDomainSetConfig, resolver nftDomainResolver, runner nftCommandRunner) error {
+	host, err := normalizeNFTDomainHost(cfg.Host)
+	if err != nil {
+		return err
+	}
+	if err := validateNFTSetTarget(cfg); err != nil {
+		return err
+	}
+	addrs, err := resolver(ctx, host)
+	if err != nil {
+		return err
+	}
+	addrs = uniqueSortedIPv4(addrs)
+	if len(addrs) == 0 {
+		return fmt.Errorf("no IPv4 A records resolved for %s", host)
+	}
+	if err := runner(ctx, "flush", "set", cfg.Family, cfg.Table, cfg.Set); err != nil {
+		return err
+	}
+	return runner(ctx, "add", "element", cfg.Family, cfg.Table, cfg.Set, "{ "+strings.Join(addrs, ", ")+" }")
+}
+
+func normalizeNFTDomainHost(host string) (string, error) {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" || len(host) > 253 || !dnsHostRe.MatchString(host) {
+		return "", fmt.Errorf("invalid hostname %q", host)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) > 63 {
+			return "", fmt.Errorf("invalid hostname %q: label too long", host)
+		}
+	}
+	return host, nil
+}
+
+func validateNFTSetTarget(cfg nftDomainSetConfig) error {
+	switch cfg.Family {
+	case "inet", "ip":
+	default:
+		return fmt.Errorf("unsupported nft family %q", cfg.Family)
+	}
+	if !nftIdentRe.MatchString(cfg.Table) {
+		return fmt.Errorf("invalid nft table %q", cfg.Table)
+	}
+	if !nftIdentRe.MatchString(cfg.Set) {
+		return fmt.Errorf("invalid nft set %q", cfg.Set)
+	}
+	return nil
+}
+
+func lookupIPv4Addrs(ctx context.Context, host string) ([]string, error) {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if v4 := ip.IP.To4(); v4 != nil {
+			out = append(out, v4.String())
+		}
+	}
+	return out, nil
+}
+
+func uniqueSortedIPv4(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		ip := net.ParseIP(strings.TrimSpace(value))
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		canonical := ip.To4().String()
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		out = append(out, canonical)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(net.ParseIP(out[i]).To4(), net.ParseIP(out[j]).To4()) < 0
+	})
+	return out
+}
+
+func runNFTCommand(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "nft", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return fmt.Errorf("nft %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
 }

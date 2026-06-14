@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -108,6 +111,86 @@ func TestSelfcheckControlPlaneRejectsNonOK(t *testing.T) {
 	})}
 	if err := selfcheckControlPlaneWithClient("https://lattice.test", client); err == nil {
 		t.Fatal("expected non-200 selfcheck to fail")
+	}
+}
+
+func TestNFTDomainSetUpdateBuildsDeterministicArgv(t *testing.T) {
+	var commands [][]string
+	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
+		Host: "LATTICE.Example.COM.", Family: "inet", Table: "lattice_policy", Set: "lattice_control4",
+	}, func(ctx context.Context, host string) ([]string, error) {
+		if host != "lattice.example.com" {
+			t.Fatalf("host not normalized before resolution: %q", host)
+		}
+		return []string{"203.0.113.10", "2001:db8::1", "198.51.100.2", "203.0.113.10"}, nil
+	}, func(ctx context.Context, args ...string) error {
+		commands = append(commands, append([]string(nil), args...))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"flush", "set", "inet", "lattice_policy", "lattice_control4"},
+		{"add", "element", "inet", "lattice_policy", "lattice_control4", "{ 198.51.100.2, 203.0.113.10 }"},
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("unexpected nft argv:\n got: %#v\nwant: %#v", commands, want)
+	}
+}
+
+func TestNFTDomainSetUpdateRejectsNoIPv4(t *testing.T) {
+	called := false
+	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
+		Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice_control4",
+	}, func(ctx context.Context, host string) ([]string, error) {
+		return []string{"2001:db8::1"}, nil
+	}, func(ctx context.Context, args ...string) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("expected no-IPv4 failure before nft commands, err=%v called=%v", err, called)
+	}
+}
+
+func TestNFTDomainSetUpdateRejectsUnsafeIdentifiers(t *testing.T) {
+	cases := []nftDomainSetConfig{
+		{Host: "bad host", Family: "inet", Table: "lattice_policy", Set: "lattice_control4"},
+		{Host: "lattice.example.com", Family: "inet;reboot", Table: "lattice_policy", Set: "lattice_control4"},
+		{Host: "lattice.example.com", Family: "inet", Table: "lattice-policy", Set: "lattice_control4"},
+		{Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice/control4"},
+	}
+	for _, cfg := range cases {
+		err := updateNFTDomainSet(context.Background(), cfg, func(ctx context.Context, host string) ([]string, error) {
+			t.Fatalf("resolver should not run for invalid config: %+v", cfg)
+			return nil, nil
+		}, func(ctx context.Context, args ...string) error {
+			t.Fatalf("nft should not run for invalid config: %+v", cfg)
+			return nil
+		})
+		if err == nil {
+			t.Fatalf("expected invalid config to fail: %+v", cfg)
+		}
+	}
+}
+
+func TestNFTDomainSetUpdateStopsOnFlushFailure(t *testing.T) {
+	errBoom := errors.New("boom")
+	calls := 0
+	err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
+		Host: "lattice.example.com", Family: "inet", Table: "lattice_policy", Set: "lattice_control4",
+	}, func(ctx context.Context, host string) ([]string, error) {
+		return []string{"203.0.113.10"}, nil
+	}, func(ctx context.Context, args ...string) error {
+		calls++
+		if calls == 1 {
+			return errBoom
+		}
+		return nil
+	})
+	if !errors.Is(err, errBoom) || calls != 1 {
+		t.Fatalf("expected flush failure to stop before add, err=%v calls=%d", err, calls)
 	}
 }
 

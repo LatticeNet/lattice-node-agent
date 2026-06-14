@@ -46,6 +46,22 @@ The selfcheck exits 0 only when `GET /api/health` returns HTTP 200. It reuses
 the same transport safety guard as normal startup, so remote cleartext `http://`
 is refused unless deliberately allowed.
 
+Firewall apply domain-set update:
+
+```sh
+lattice-agent --update-nft-domain-set \
+  -host lattice.example.com \
+  -family inet \
+  -table lattice_policy \
+  -set lattice_control4
+```
+
+This mode resolves the hostname with Go's resolver, filters to IPv4, sorts and
+deduplicates results, then updates the existing nft named set using direct
+`nft` argv calls. It does not require or send the node token. It is intended for
+server-rendered, rollback-protected apply scripts; empty/no-IPv4 resolution or
+invalid nft identifiers exit non-zero so the task can roll back.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.
