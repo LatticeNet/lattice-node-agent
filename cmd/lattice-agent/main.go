@@ -323,9 +323,11 @@ func reportProxyUsage(cfg agentConfig) error {
 		snapshot model.ProxyUsageSnapshot
 		err      error
 	)
+	source := "file"
 	if hasFile {
 		snapshot, err = proxyusage.LoadFile(cfg.ProxyUsageFile, cfg.NodeID)
 	} else {
+		source = "http"
 		snapshot, err = proxyusage.LoadHTTP(context.Background(), proxyusage.HTTPSource{
 			URL:     cfg.ProxyUsageURL,
 			Secret:  cfg.ProxyUsageSecret,
@@ -333,11 +335,54 @@ func reportProxyUsage(cfg agentConfig) error {
 		}, cfg.NodeID)
 	}
 	if err != nil {
+		if postErr := reportProxyUsageCollectorHealth(cfg, source, model.ProxyUsageCollectorStatusError, err); postErr != nil {
+			return fmt.Errorf("%w; collector health report failed: %v", err, postErr)
+		}
 		return err
+	}
+	checkedAt := time.Now().UTC()
+	snapshot.CollectorSource = source
+	snapshot.CollectorStatus = model.ProxyUsageCollectorStatusOK
+	snapshot.CollectorCheckedAt = checkedAt
+	return postAgentJSON(cfg, "/api/agent/proxy-usage", map[string]any{
+		"snapshot": snapshot,
+	}, nil)
+}
+
+func reportProxyUsageCollectorHealth(cfg agentConfig, source, status string, cause error) error {
+	now := time.Now().UTC()
+	snapshot := model.ProxyUsageSnapshot{
+		NodeID:             cfg.NodeID,
+		At:                 now,
+		CollectorSource:    source,
+		CollectorStatus:    status,
+		CollectorCheckedAt: now,
+	}
+	if cause != nil {
+		snapshot.CollectorError = boundedProxyUsageError(cause)
 	}
 	return postAgentJSON(cfg, "/api/agent/proxy-usage", map[string]any{
 		"snapshot": snapshot,
 	}, nil)
+}
+
+func boundedProxyUsageError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	msg = strings.Map(func(r rune) rune {
+		if r < 32 && r != '\t' {
+			return -1
+		}
+		return r
+	}, msg)
+	const maxRunes = 512
+	runes := []rune(msg)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes])
+	}
+	return string(runes)
 }
 
 func validateProxyUsageConfig(cfg agentConfig) error {

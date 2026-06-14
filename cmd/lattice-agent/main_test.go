@@ -12,6 +12,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -52,6 +54,89 @@ func TestReportMetricsUsesBearerAuthAndOmitsBodyToken(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReportProxyUsageIncludesCollectorHealthOnSuccess(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	dir := t.TempDir()
+	usageFile := filepath.Join(dir, "usage.json")
+	if err := os.WriteFile(usageFile, []byte(`{"core_uptime_sec":10,"user_bytes":{"alice":123}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		NodeID   string                   `json:"node_id"`
+		Snapshot model.ProxyUsageSnapshot `json:"snapshot"`
+	}
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/agent/proxy-usage" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return testResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	if err := reportProxyUsage(agentConfig{
+		Server:         "http://lattice.test",
+		NodeID:         "node-a",
+		Token:          "node-secret",
+		ProxyUsageFile: usageFile,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if body.NodeID != "node-a" || body.Snapshot.NodeID != "node-a" {
+		t.Fatalf("node id not pinned in body: %+v", body)
+	}
+	if body.Snapshot.CollectorSource != "file" || body.Snapshot.CollectorStatus != model.ProxyUsageCollectorStatusOK {
+		t.Fatalf("collector health missing from success snapshot: %+v", body.Snapshot)
+	}
+	if body.Snapshot.CollectorError != "" || body.Snapshot.CollectorCheckedAt.IsZero() {
+		t.Fatalf("unexpected success collector fields: %+v", body.Snapshot)
+	}
+}
+
+func TestReportProxyUsageReportsCollectorError(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	calls := 0
+	var body struct {
+		NodeID   string                   `json:"node_id"`
+		Snapshot model.ProxyUsageSnapshot `json:"snapshot"`
+	}
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.Path != "/api/agent/proxy-usage" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return testResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	err := reportProxyUsage(agentConfig{
+		Server:         "http://lattice.test",
+		NodeID:         "node-a",
+		Token:          "node-secret",
+		ProxyUsageFile: filepath.Join(t.TempDir(), "missing.json"),
+	})
+	if err == nil {
+		t.Fatal("expected local collector error to remain visible")
+	}
+	if calls != 1 {
+		t.Fatalf("expected one collector health report, got %d", calls)
+	}
+	if body.Snapshot.CollectorSource != "file" || body.Snapshot.CollectorStatus != model.ProxyUsageCollectorStatusError {
+		t.Fatalf("collector error health missing: %+v", body.Snapshot)
+	}
+	if body.Snapshot.CollectorError == "" || body.Snapshot.CollectorCheckedAt.IsZero() {
+		t.Fatalf("collector error details missing: %+v", body.Snapshot)
+	}
+	if len(body.Snapshot.UserBytes) != 0 {
+		t.Fatalf("error health report must not include usage counters: %+v", body.Snapshot.UserBytes)
 	}
 }
 
