@@ -78,11 +78,65 @@ func applyResourceLimits(cpuSecs uint64) {
 	// others, and the count includes unrelated processes of that uid). Real
 	// per-task process isolation requires a PID namespace plus a cgroup
 	// pids.max scoped to the task — a deferred improvement, not implemented here.
-	setRlimit(rlimitNProc, maxProcesses, maxProcesses)
+	nproc := nprocLimit()
+	setRlimit(rlimitNProc, nproc, nproc)
 	// RLIMIT_AS is a coarse virtual-space backstop only (see maxAddressSpaceBytes);
 	// RLIMIT_DATA below is the meaningful data-segment memory guard.
 	setRlimit(syscall.RLIMIT_AS, maxAddressSpaceBytes, maxAddressSpaceBytes)
 	setRlimit(syscall.RLIMIT_DATA, maxDataBytes, maxDataBytes)
+}
+
+func nprocLimit() uint64 {
+	current, err := currentUIDThreadCount()
+	if err != nil || current == 0 {
+		return maxProcessHeadroom
+	}
+	if current > ^uint64(0)-maxProcessHeadroom {
+		return ^uint64(0)
+	}
+	return current + maxProcessHeadroom
+}
+
+func currentUIDThreadCount() (uint64, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	uid := uint32(os.Getuid())
+	var count uint64
+	for _, entry := range entries {
+		if !entry.IsDir() || !isProcPID(entry.Name()) {
+			continue
+		}
+		procPath := "/proc/" + entry.Name()
+		info, err := os.Stat(procPath)
+		if err != nil {
+			continue
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != uid {
+			continue
+		}
+		tasks, err := os.ReadDir(procPath + "/task")
+		if err != nil {
+			count++
+			continue
+		}
+		count += uint64(len(tasks))
+	}
+	return count, nil
+}
+
+func isProcPID(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func setRlimit(resource int, cur, max uint64) {

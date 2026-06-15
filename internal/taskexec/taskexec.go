@@ -28,9 +28,12 @@ const (
 	// maxFileSizeBytes caps the size of any single file the task may write,
 	// preventing a runaway script from filling the disk.
 	maxFileSizeBytes = 8 * 1024 * 1024 // 8 MiB
-	// maxProcesses caps the number of processes/threads the task's user may
-	// spawn, blunting fork bombs.
-	maxProcesses = 64
+	// maxProcessHeadroom is the extra number of processes/threads a task may
+	// add above the agent user's current Linux-wide usage. RLIMIT_NPROC is
+	// scoped to the real UID rather than the task process tree, so using a fixed
+	// absolute cap can prevent the interpreter from forking at all on busy CI or
+	// shared hosts.
+	maxProcessHeadroom = 64
 	// maxAddressSpaceBytes caps total VIRTUAL address space (RLIMIT_AS). This is
 	// a coarse backstop, NOT a resident-memory limit: RLIMIT_AS counts every
 	// mmap'd region (including large PROT_NONE reservations the runtime never
