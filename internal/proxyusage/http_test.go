@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -134,6 +135,24 @@ func TestLoadHTTPRejectsRemoteBeforeCallingTransport(t *testing.T) {
 	_, err := LoadHTTP(context.Background(), HTTPSource{URL: "http://example.com/stats", Client: client}, "node-a")
 	if err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("expected loopback validation error, got %v", err)
+	}
+}
+
+func TestLoadHTTPRefusesRedirects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/stats" {
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"user_bytes":{"alice":1}}`))
+	}))
+	defer srv.Close()
+	// No Client provided, so LoadHTTP builds the hardened production client.
+	// httptest binds 127.0.0.1, so the loopback check passes and the redirect
+	// policy is what must reject the request.
+	_, err := LoadHTTP(context.Background(), HTTPSource{URL: srv.URL + "/stats"}, "node-a")
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("expected redirect refusal, got %v", err)
 	}
 }
 

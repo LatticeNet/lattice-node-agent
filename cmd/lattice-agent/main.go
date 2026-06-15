@@ -54,24 +54,27 @@ type agentConfig struct {
 	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
 	// http:// server URL. Default false: the agent refuses such a config because
 	// the Authorization: Bearer token would travel in cleartext.
-	AllowInsecureHTTP    bool
-	PublicIP             string
-	PublicIPv6           string
-	WireGuardIP          string
-	WGPublicKey          string
-	WGEndpoint           string
-	WGPort               int
-	SSHAlerts            bool
-	NFTDomainHost        string
-	NFTFamily            string
-	NFTTable             string
-	NFTSet               string
-	NFTSet6              string
-	ProxyUsageFile       string
-	ProxyUsageURL        string
-	ProxyUsageSecret     string
-	ProxyUsageSecretFile string
-	ProxyUsageTimeout    time.Duration
+	AllowInsecureHTTP     bool
+	PublicIP              string
+	PublicIPv6            string
+	WireGuardIP           string
+	WGPublicKey           string
+	WGEndpoint            string
+	WGPort                int
+	SSHAlerts             bool
+	NFTDomainHost         string
+	NFTFamily             string
+	NFTTable              string
+	NFTSet                string
+	NFTSet6               string
+	ProxyUsageFile        string
+	ProxyUsageURL         string
+	ProxyUsageSecret      string
+	ProxyUsageSecretFile  string
+	ProxyUsageTimeout     time.Duration
+	ProxyUsageXrayAPI     string
+	ProxyUsageXrayBin     string
+	ProxyUsageXrayPattern string
 }
 
 func main() {
@@ -119,7 +122,10 @@ func main() {
 	flag.StringVar(&cfg.ProxyUsageURL, "proxy-usage-url", os.Getenv("LATTICE_PROXY_USAGE_URL"), "optional loopback HTTP JSON proxy usage source to report each interval")
 	flag.StringVar(&cfg.ProxyUsageSecret, "proxy-usage-secret", os.Getenv("LATTICE_PROXY_USAGE_SECRET"), "optional bearer secret for -proxy-usage-url (prefer -proxy-usage-secret-file for services)")
 	flag.StringVar(&cfg.ProxyUsageSecretFile, "proxy-usage-secret-file", os.Getenv("LATTICE_PROXY_USAGE_SECRET_FILE"), "optional file containing bearer secret for -proxy-usage-url")
-	flag.DurationVar(&cfg.ProxyUsageTimeout, "proxy-usage-timeout", envDuration("LATTICE_PROXY_USAGE_TIMEOUT", 3*time.Second), "timeout for -proxy-usage-url")
+	flag.DurationVar(&cfg.ProxyUsageTimeout, "proxy-usage-timeout", envDuration("LATTICE_PROXY_USAGE_TIMEOUT", 3*time.Second), "timeout for -proxy-usage-url and -proxy-usage-xray-api")
+	flag.StringVar(&cfg.ProxyUsageXrayAPI, "proxy-usage-xray-api", os.Getenv("LATTICE_PROXY_USAGE_XRAY_API"), "optional loopback host:port of the xray API inbound; the agent runs `xray api statsquery` against it each interval (no new dependency; see ADR-003)")
+	flag.StringVar(&cfg.ProxyUsageXrayBin, "proxy-usage-xray-bin", os.Getenv("LATTICE_PROXY_USAGE_XRAY_BIN"), "xray binary for -proxy-usage-xray-api (default \"xray\" resolved on PATH)")
+	flag.StringVar(&cfg.ProxyUsageXrayPattern, "proxy-usage-xray-pattern", os.Getenv("LATTICE_PROXY_USAGE_XRAY_PATTERN"), "optional stat-name filter for -proxy-usage-xray-api (default \"user>>>\")")
 	flag.Parse()
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
@@ -313,24 +319,41 @@ func reportMetrics(cfg agentConfig) error {
 func reportProxyUsage(cfg agentConfig) error {
 	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
 	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
-	if !hasFile && !hasURL {
+	hasXray := strings.TrimSpace(cfg.ProxyUsageXrayAPI) != ""
+	configured := 0
+	for _, on := range []bool{hasFile, hasURL, hasXray} {
+		if on {
+			configured++
+		}
+	}
+	if configured == 0 {
 		return nil
 	}
-	if hasFile && hasURL {
-		return fmt.Errorf("configure either proxy-usage-file or proxy-usage-url, not both")
+	if configured > 1 {
+		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, or proxy-usage-xray-api")
 	}
 	var (
 		snapshot model.ProxyUsageSnapshot
 		err      error
+		source   string
 	)
-	source := "file"
-	if hasFile {
+	switch {
+	case hasFile:
+		source = "file"
 		snapshot, err = proxyusage.LoadFile(cfg.ProxyUsageFile, cfg.NodeID)
-	} else {
+	case hasURL:
 		source = "http"
 		snapshot, err = proxyusage.LoadHTTP(context.Background(), proxyusage.HTTPSource{
 			URL:     cfg.ProxyUsageURL,
 			Secret:  cfg.ProxyUsageSecret,
+			Timeout: cfg.ProxyUsageTimeout,
+		}, cfg.NodeID)
+	default:
+		source = "xray-cli"
+		snapshot, err = proxyusage.LoadXrayCLI(context.Background(), proxyusage.XrayCLISource{
+			Binary:  cfg.ProxyUsageXrayBin,
+			APIAddr: cfg.ProxyUsageXrayAPI,
+			Pattern: cfg.ProxyUsageXrayPattern,
 			Timeout: cfg.ProxyUsageTimeout,
 		}, cfg.NodeID)
 	}
@@ -388,9 +411,16 @@ func boundedProxyUsageError(err error) string {
 func validateProxyUsageConfig(cfg agentConfig) error {
 	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
 	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
+	hasXray := strings.TrimSpace(cfg.ProxyUsageXrayAPI) != ""
 	hasSecretFile := strings.TrimSpace(cfg.ProxyUsageSecretFile) != ""
-	if hasFile && hasURL {
-		return fmt.Errorf("configure either proxy-usage-file or proxy-usage-url, not both")
+	configured := 0
+	for _, on := range []bool{hasFile, hasURL, hasXray} {
+		if on {
+			configured++
+		}
+	}
+	if configured > 1 {
+		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, or proxy-usage-xray-api")
 	}
 	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" && hasSecretFile {
 		return fmt.Errorf("configure either proxy-usage-secret or proxy-usage-secret-file, not both")
@@ -403,6 +433,21 @@ func validateProxyUsageConfig(cfg agentConfig) error {
 	}
 	if hasURL {
 		if _, err := proxyusage.ValidateLocalHTTPURL(cfg.ProxyUsageURL); err != nil {
+			return err
+		}
+	}
+	if cfg.ProxyUsageXrayBin != "" && !hasXray {
+		return fmt.Errorf("proxy-usage-xray-bin requires proxy-usage-xray-api")
+	}
+	if cfg.ProxyUsageXrayPattern != "" && !hasXray {
+		return fmt.Errorf("proxy-usage-xray-pattern requires proxy-usage-xray-api")
+	}
+	if hasXray {
+		if err := proxyusage.ValidateXrayCLISource(proxyusage.XrayCLISource{
+			Binary:  cfg.ProxyUsageXrayBin,
+			APIAddr: cfg.ProxyUsageXrayAPI,
+			Pattern: cfg.ProxyUsageXrayPattern,
+		}); err != nil {
 			return err
 		}
 	}

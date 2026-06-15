@@ -223,6 +223,31 @@ func TestValidateProxyUsageConfig(t *testing.T) {
 			cfg:     agentConfig{ProxyUsageURL: "http://127.0.0.1:9090/stats", ProxyUsageTimeout: -time.Second},
 			wantErr: true,
 		},
+		{
+			name:    "xray api loopback ok",
+			cfg:     agentConfig{ProxyUsageXrayAPI: "127.0.0.1:10085"},
+			wantErr: false,
+		},
+		{
+			name:    "xray api remote refused",
+			cfg:     agentConfig{ProxyUsageXrayAPI: "10.0.0.1:10085"},
+			wantErr: true,
+		},
+		{
+			name:    "xray and url conflict",
+			cfg:     agentConfig{ProxyUsageXrayAPI: "127.0.0.1:10085", ProxyUsageURL: "http://127.0.0.1:9090/stats"},
+			wantErr: true,
+		},
+		{
+			name:    "xray bin without api refused",
+			cfg:     agentConfig{ProxyUsageXrayBin: "/usr/local/bin/xray"},
+			wantErr: true,
+		},
+		{
+			name:    "xray unsafe binary refused",
+			cfg:     agentConfig{ProxyUsageXrayAPI: "127.0.0.1:10085", ProxyUsageXrayBin: "xray; reboot"},
+			wantErr: true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -64,7 +64,15 @@ func LoadHTTP(ctx context.Context, source HTTPSource, nodeID string) (model.Prox
 
 	client := source.Client
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{
+			Timeout: timeout,
+			// Refuse redirects: a compromised local core must not be able to
+			// 30x-bounce the agent to an off-loopback or internal target. The
+			// loopback check only validates the initial URL.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return fmt.Errorf("proxy usage source must not redirect")
+			},
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
