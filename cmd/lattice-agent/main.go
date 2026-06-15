@@ -75,6 +75,7 @@ type agentConfig struct {
 	ProxyUsageXrayAPI     string
 	ProxyUsageXrayBin     string
 	ProxyUsageXrayPattern string
+	LogStateDir           string
 }
 
 func main() {
@@ -126,6 +127,7 @@ func main() {
 	flag.StringVar(&cfg.ProxyUsageXrayAPI, "proxy-usage-xray-api", os.Getenv("LATTICE_PROXY_USAGE_XRAY_API"), "optional loopback host:port of the xray API inbound; the agent runs `xray api statsquery` against it each interval (no new dependency; see ADR-003)")
 	flag.StringVar(&cfg.ProxyUsageXrayBin, "proxy-usage-xray-bin", os.Getenv("LATTICE_PROXY_USAGE_XRAY_BIN"), "xray binary for -proxy-usage-xray-api (default \"xray\" resolved on PATH)")
 	flag.StringVar(&cfg.ProxyUsageXrayPattern, "proxy-usage-xray-pattern", os.Getenv("LATTICE_PROXY_USAGE_XRAY_PATTERN"), "optional stat-name filter for -proxy-usage-xray-api (default \"user>>>\")")
+	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
 	flag.Parse()
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
@@ -188,6 +190,7 @@ func main() {
 
 	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot}
 	monitors := newMonitorManager(cfg)
+	logTailers := newLogTailManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -204,6 +207,11 @@ func main() {
 			log.Printf("monitor poll error: %v", err)
 		} else {
 			monitors.reconcile(assigned)
+		}
+		if sources, err := fetchLogSources(cfg); err != nil {
+			log.Printf("log source poll error: %v", err)
+		} else {
+			logTailers.reconcile(sources)
 		}
 		<-ticker.C
 	}
