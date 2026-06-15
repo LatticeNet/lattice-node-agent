@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -139,20 +140,26 @@ func TestLoadHTTPRejectsRemoteBeforeCallingTransport(t *testing.T) {
 }
 
 func TestLoadHTTPRefusesRedirects(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable in this environment: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/stats" {
 			http.Redirect(w, r, "/elsewhere", http.StatusFound)
 			return
 		}
 		_, _ = w.Write([]byte(`{"user_bytes":{"alice":1}}`))
 	}))
+	srv.Listener = ln
+	srv.Start()
 	defer srv.Close()
 	// No Client provided, so LoadHTTP builds the hardened production client.
 	// httptest binds 127.0.0.1, so the loopback check passes and the redirect
 	// policy is what must reject the request.
-	_, err := LoadHTTP(context.Background(), HTTPSource{URL: srv.URL + "/stats"}, "node-a")
-	if err == nil || !strings.Contains(err.Error(), "redirect") {
-		t.Fatalf("expected redirect refusal, got %v", err)
+	_, loadErr := LoadHTTP(context.Background(), HTTPSource{URL: srv.URL + "/stats"}, "node-a")
+	if loadErr == nil || !strings.Contains(loadErr.Error(), "redirect") {
+		t.Fatalf("expected redirect refusal, got %v", loadErr)
 	}
 }
 
