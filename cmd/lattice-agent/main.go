@@ -87,6 +87,7 @@ func main() {
 	}
 
 	var cfg agentConfig
+	var printVersion bool
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
@@ -128,7 +129,12 @@ func main() {
 	flag.StringVar(&cfg.ProxyUsageXrayBin, "proxy-usage-xray-bin", os.Getenv("LATTICE_PROXY_USAGE_XRAY_BIN"), "xray binary for -proxy-usage-xray-api (default \"xray\" resolved on PATH)")
 	flag.StringVar(&cfg.ProxyUsageXrayPattern, "proxy-usage-xray-pattern", os.Getenv("LATTICE_PROXY_USAGE_XRAY_PATTERN"), "optional stat-name filter for -proxy-usage-xray-api (default \"user>>>\")")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
+	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.Parse()
+	if printVersion {
+		fmt.Println(version)
+		return
+	}
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
