@@ -22,6 +22,12 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
 
+func TestVersionMatchesCurrentRelease(t *testing.T) {
+	if version != "0.2.0" {
+		t.Fatalf("version = %q, want 0.2.0", version)
+	}
+}
+
 func TestReportMetricsUsesBearerAuthAndOmitsBodyToken(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
