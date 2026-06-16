@@ -37,18 +37,19 @@ jobs:
               ;;
           esac
       - name: checkout lattice-node-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: lattice-node-agent
       - name: checkout lattice-sdk
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: LatticeNet/lattice-sdk
           path: lattice-sdk
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26.x"
           check-latest: true
+          cache: false
       - name: create workspace
         run: |
           go work init ./lattice-sdk ./lattice-node-agent
@@ -70,11 +71,11 @@ jobs:
           (cd dist && sha256sum "$ARTIFACT" > "$ARTIFACT.sha256")
           echo "binary_path=lattice-node-agent/dist/$ARTIFACT" >> "$GITHUB_OUTPUT"
       - name: attest binary
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.build.outputs.binary_path }}
       - name: upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -98,9 +99,9 @@ jobs:
               ;;
           esac
       - name: checkout lattice-node-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: download binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
