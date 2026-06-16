@@ -1,0 +1,127 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact: lattice-agent-linux-amd64
+          - goos: linux
+            goarch: arm64
+            artifact: lattice-agent-linux-arm64
+    steps:
+      - name: validate release ref
+        run: |
+          case "$GITHUB_REF_NAME" in
+            v*) ;;
+            *)
+              echo "::error::release workflow must run from a v* tag"
+              exit 1
+              ;;
+          esac
+      - name: checkout lattice-node-agent
+        uses: actions/checkout@v4
+        with:
+          path: lattice-node-agent
+      - name: checkout lattice-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: LatticeNet/lattice-sdk
+          path: lattice-sdk
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+      - name: create workspace
+        run: |
+          go work init ./lattice-sdk ./lattice-node-agent
+          go work edit -replace=github.com/LatticeNet/lattice-sdk@v0.2.0=./lattice-sdk
+      - name: build binary
+        id: build
+        working-directory: lattice-node-agent
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/$ARTIFACT" ./cmd/lattice-agent
+          if [ "$GOOS/$GOARCH" = "linux/amd64" ]; then
+            test "$(dist/$ARTIFACT -version)" = "$VERSION"
+          fi
+          (cd dist && sha256sum "$ARTIFACT" > "$ARTIFACT.sha256")
+          echo "binary_path=lattice-node-agent/dist/$ARTIFACT" >> "$GITHUB_OUTPUT"
+      - name: attest binary
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.build.outputs.binary_path }}
+      - name: upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            lattice-node-agent/dist/${{ matrix.artifact }}
+            lattice-node-agent/dist/${{ matrix.artifact }}.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: validate release ref
+        run: |
+          case "$GITHUB_REF_NAME" in
+            v*) ;;
+            *)
+              echo "::error::release workflow must run from a v* tag"
+              exit 1
+              ;;
+          esac
+      - name: download binaries
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: create checksum manifest
+        run: |
+          cd dist
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES="lattice-node-agent $GITHUB_REF_NAME
+
+          Artifacts:
+          - lattice-agent-linux-amd64
+          - lattice-agent-linux-arm64
+          - SHA256SUMS
+
+          Use the matching binary URL and SHA-256 digest in Lattice agent update policies. The binary reports version $VERSION through -version."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "lattice-node-agent $GITHUB_REF_NAME" --notes "$NOTES"
+          fi

@@ -29,6 +29,9 @@ jobs:
       - name: gofmt
         working-directory: lattice-node-agent
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: release workflow contract
+        working-directory: lattice-node-agent
+        run: sh scripts/check-release-workflow.sh
       - name: vet
         working-directory: lattice-node-agent
         run: go vet ./...

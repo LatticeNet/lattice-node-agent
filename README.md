@@ -160,3 +160,30 @@ later without changing the server ingest contract.
 go test ./...
 go build ./cmd/lattice-agent
 ```
+
+## Releases
+
+Push a `v*` tag to publish Linux binaries:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The release workflow builds:
+
+```txt
+lattice-agent-linux-amd64
+lattice-agent-linux-arm64
+SHA256SUMS
+```
+
+The tag version is injected into the binary with `-X main.version=...`, so:
+
+```sh
+lattice-agent -version
+```
+
+must match the server update policy target version. Use the matching artifact
+URL and SHA-256 digest from `SHA256SUMS` when configuring server-controlled
+agent updates.
