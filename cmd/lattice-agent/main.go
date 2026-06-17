@@ -50,6 +50,7 @@ type agentConfig struct {
 	AllowExec          bool
 	AllowRoot          bool
 	NoExec             bool
+	AllowTerminal      bool
 	Debug              bool
 	LocalDebug         bool
 	ServerDebug        bool
@@ -115,6 +116,7 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
+	flag.BoolVar(&cfg.AllowTerminal, "allow-terminal", os.Getenv("LATTICE_AGENT_ALLOW_TERMINAL") == "1", "allow audited interactive terminal sessions (high risk; runs as the agent user)")
 	flag.BoolVar(&cfg.LocalDebug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
 	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update existing nft control-plane named sets, then exit")
@@ -157,6 +159,7 @@ func main() {
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
+		cfg.AllowTerminal = false
 	}
 	if cfg.UpdateNFTDomainSet {
 		if err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
@@ -190,7 +193,11 @@ func main() {
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
 	}
-	debugf(cfg, "debug enabled: node=%s server=%s interval=%s allow_exec=%v allow_root_exec=%v ssh_alerts=%v", cfg.NodeID, cfg.Server, cfg.Interval, cfg.AllowExec, cfg.AllowRoot, cfg.SSHAlerts)
+	if cfg.AllowTerminal && os.Geteuid() == 0 && !cfg.AllowRoot {
+		log.Printf("warning: terminal sessions disabled because agent is running as root without -allow-root-exec")
+		cfg.AllowTerminal = false
+	}
+	debugf(cfg, "debug enabled: node=%s server=%s interval=%s allow_exec=%v allow_root_exec=%v allow_terminal=%v ssh_alerts=%v", cfg.NodeID, cfg.Server, cfg.Interval, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.SSHAlerts)
 	// Probe interpreter availability once at startup so operators learn early
 	// which allowlisted interpreters are missing, rather than only discovering it
 	// when a task fails. Non-fatal; task-time resolution is unchanged.
@@ -214,9 +221,12 @@ func main() {
 	} else {
 		applyAgentConfig(&cfg, agentCfg)
 	}
-	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.Debug)
+	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v allow_terminal=%v debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
+	}
+	if cfg.AllowTerminal {
+		go runTerminalLoop(context.Background(), cfg)
 	}
 
 	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot}

@@ -7,7 +7,9 @@ reports metrics and slow-changing HostFacts inventory telemetry, polls for
 queued tasks, executes bounded tasks only when explicitly enabled, and posts
 results back to the server. It can also report proxy-core traffic counters from
 a bounded local JSON snapshot file or a loopback-only HTTP JSON source for the
-server-owned usage rollup.
+server-owned usage rollup. Interactive browser terminal sessions are supported
+only when explicitly enabled; they are outbound, agent-side PTY sessions, not an
+inbound SSH service.
 Node tokens are sent in the `Authorization: Bearer` header, not in JSON bodies.
 For rollback-protected firewall apply tasks, the binary also supports
 `--selfcheck-controlplane`, a one-shot unauthenticated `/api/health` reachability
@@ -63,6 +65,27 @@ enabled on the node while preventing central collection.
 Current topology is hub-and-spoke: every agent points directly at the primary
 `lattice-server`. `role` and `tags` are metadata for filtering/planning; there is
 no production group-leader or relay-agent mode yet.
+
+Interactive terminal sessions:
+
+```sh
+go run ./cmd/lattice-agent \
+  -server https://lattice.example.com \
+  -node-id demo-node \
+  -token '<enrollment-token>' \
+  -allow-terminal=true
+```
+
+`LATTICE_AGENT_ALLOW_TERMINAL=1` enables the same mode for systemd
+environments. Terminal mode is off by default and is separate from reviewed
+batch tasks: it opens a short-lived PTY on the node, polls the server for input,
+and posts output back to the dashboard. The agent still has no inbound listener,
+does not accept SSH connections, and does not store SSH credentials. Dashboard
+access requires the operator scope `terminal:open`.
+
+If the agent process runs as root, terminal mode is refused unless
+`-allow-root-exec=true` is also set. Prefer running the agent as a dedicated
+least-privilege service user when browser terminal access is needed.
 
 Firewall apply selfcheck:
 

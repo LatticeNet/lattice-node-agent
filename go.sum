@@ -1,2 +1,4 @@
-github.com/LatticeNet/lattice-sdk v0.2.1 h1:/gXk/F+szchoFKo4XZR0/c/WVTIS9gAYXl9VlM8jeIM=
-github.com/LatticeNet/lattice-sdk v0.2.1/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
+github.com/LatticeNet/lattice-sdk v0.2.3 h1:HeqasZn+Z6AHg5PpWCQAFQ9iB5rBQeDYUsctz0301xA=
+github.com/LatticeNet/lattice-sdk v0.2.3/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
+github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
+github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
