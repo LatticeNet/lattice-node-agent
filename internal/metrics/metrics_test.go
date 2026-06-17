@@ -23,6 +23,28 @@ func TestCPUBusy(t *testing.T) {
 	}
 }
 
+func TestCPULoadFallback(t *testing.T) {
+	cases := []struct {
+		name     string
+		load1    float64
+		cpuCount int
+		want     float64
+	}{
+		{"zero load", 0, 4, 0},
+		{"single core half busy", 0.5, 1, 50},
+		{"four cores", 1, 4, 25},
+		{"clamps high load", 16, 4, 100},
+		{"bad cpu count", 1, 0, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := cpuLoadFallback(c.load1, c.cpuCount); got != c.want {
+				t.Fatalf("cpuLoadFallback=%v want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestCollectDoesNotPanic(t *testing.T) {
 	m := Collect()
 	if m.CPUPercent < 0 || m.CPUPercent > 100 {

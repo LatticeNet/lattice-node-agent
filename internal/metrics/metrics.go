@@ -31,16 +31,17 @@ func Collect() model.Metrics {
 	m.DiskUsed, m.DiskTotal = readDisk("/")
 	m.NetRxBytes, m.NetTxBytes = readNetDev()
 	m.UptimeSeconds = readUptime()
-	m.CPUPercent = readCPUPercent()
+	m.CPUPercent = readCPUPercent(m.Load1, runtime.NumCPU())
 	return m
 }
 
 // readCPUPercent computes busy CPU percentage from the delta of /proc/stat
-// since the previous call. Returns 0 when no prior sample exists or on error.
-func readCPUPercent() float64 {
+// since the previous call. The first call falls back to load-average per core
+// so newly enrolled nodes show CPU telemetry before the second metrics cycle.
+func readCPUPercent(load1 float64, cpuCount int) float64 {
 	total, idle, ok := readProcStat()
 	if !ok {
-		return 0
+		return cpuLoadFallback(load1, cpuCount)
 	}
 	cpuSampler.Lock()
 	defer cpuSampler.Unlock()
@@ -50,9 +51,16 @@ func readCPUPercent() float64 {
 		cpuSampler.hasPrev = true
 	}()
 	if !cpuSampler.hasPrev {
-		return 0
+		return cpuLoadFallback(load1, cpuCount)
 	}
 	return cpuBusy(cpuSampler.prevTotal, cpuSampler.prevIdle, total, idle)
+}
+
+func cpuLoadFallback(load1 float64, cpuCount int) float64 {
+	if load1 <= 0 || cpuCount <= 0 {
+		return 0
+	}
+	return clampPercent(load1 / float64(cpuCount) * 100)
 }
 
 // cpuBusy computes the busy percentage between two /proc/stat snapshots. Pure
@@ -63,14 +71,17 @@ func cpuBusy(prevTotal, prevIdle, total, idle uint64) float64 {
 	if totalDelta <= 0 {
 		return 0
 	}
-	busy := (totalDelta - idleDelta) / totalDelta * 100
-	if busy < 0 {
+	return clampPercent((totalDelta - idleDelta) / totalDelta * 100)
+}
+
+func clampPercent(v float64) float64 {
+	if v < 0 {
 		return 0
 	}
-	if busy > 100 {
+	if v > 100 {
 		return 100
 	}
-	return busy
+	return v
 }
 
 // readProcStat parses the aggregate "cpu" line of /proc/stat into total jiffies

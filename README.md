@@ -38,6 +38,25 @@ cleartext `http://` URL (it would leak the token) — use `https://` instead. Th
 `-allow-insecure-http` flag exists only as a deliberate escape hatch and is off
 by default.
 
+Debug diagnostics:
+
+```sh
+go run ./cmd/lattice-agent \
+  -server https://lattice.example.com \
+  -node-id demo-node \
+  -token '<enrollment-token>' \
+  -debug
+```
+
+`LATTICE_AGENT_DEBUG=1` enables the same mode for systemd environments. Debug
+logs include poll progress, request paths, payload key names, metrics summaries,
+monitor counts, task IDs, and task exit status. They do not print the node token,
+task script body, proxy usage secret, or client secret values.
+
+Current topology is hub-and-spoke: every agent points directly at the primary
+`lattice-server`. `role` and `tags` are metadata for filtering/planning; there is
+no production group-leader or relay-agent mode yet.
+
 Firewall apply selfcheck:
 
 ```sh

@@ -43,6 +43,7 @@ type agentConfig struct {
 	AllowExec bool
 	AllowRoot bool
 	NoExec    bool
+	Debug     bool
 	// SelfcheckControlPlane runs a one-shot, unauthenticated reachability check
 	// against /api/health and exits. It is used by rollback-protected firewall
 	// apply tasks so the task shell never needs a node bearer token.
@@ -101,6 +102,7 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
+	flag.BoolVar(&cfg.Debug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
 	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update existing nft control-plane named sets, then exit")
 	flag.StringVar(&cfg.NFTDomainHost, "host", "", "hostname for -update-nft-domain-set")
@@ -171,6 +173,7 @@ func main() {
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
 	}
+	debugf(cfg, "debug enabled: node=%s server=%s interval=%s allow_exec=%v allow_root_exec=%v ssh_alerts=%v", cfg.NodeID, cfg.Server, cfg.Interval, cfg.AllowExec, cfg.AllowRoot, cfg.SSHAlerts)
 	// Probe interpreter availability once at startup so operators learn early
 	// which allowlisted interpreters are missing, rather than only discovering it
 	// when a task fails. Non-fatal; task-time resolution is unchanged.
@@ -189,7 +192,7 @@ func main() {
 	}, nil); err != nil {
 		log.Fatalf("hello failed: %v", err)
 	}
-	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot)
+	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
 	}
@@ -219,6 +222,7 @@ func main() {
 		} else {
 			logTailers.reconcile(sources)
 		}
+		debugf(cfg, "poll cycle complete")
 		<-ticker.C
 	}
 }
@@ -291,6 +295,7 @@ func probeAndReport(cfg agentConfig, m model.Monitor) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSec+2)*time.Second)
 	defer cancel()
 	res := prober.Probe(ctx, m)
+	debugf(cfg, "monitor probe complete: monitor=%s success=%v latency_ms=%.1f error=%t", m.ID, res.Success, res.LatencyMs, res.Error != "")
 	if err := postAgentJSON(cfg, "/api/agent/monitor-result", map[string]any{
 		"result": res,
 	}, nil); err != nil {
@@ -316,17 +321,21 @@ func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&monitors); err != nil {
 		return nil, err
 	}
+	debugf(cfg, "monitor assignments fetched: count=%d", len(monitors))
 	return monitors, nil
 }
 
 func reportMetrics(cfg agentConfig) error {
+	m := metrics.Collect()
+	facts := hostfacts.Collect()
+	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version":      version,
 		"public_ip":    cfg.PublicIP,
 		"public_ipv6":  cfg.PublicIPv6,
 		"wireguard_ip": cfg.WireGuardIP,
-		"metrics":      metrics.Collect(),
-		"host_facts":   hostfacts.Collect(),
+		"metrics":      m,
+		"host_facts":   facts,
 	}, nil)
 }
 
@@ -513,9 +522,12 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return err
 	}
+	debugf(cfg, "tasks fetched: count=%d", len(tasks))
 	for _, task := range tasks {
+		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
 		result := runner.Run(task)
 		result.NodeID = cfg.NodeID
+		debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
 		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{
 			"result": result,
 		}, nil); err != nil {
@@ -530,7 +542,29 @@ func postAgentJSON(cfg agentConfig, path string, payload map[string]any, out any
 		payload = map[string]any{}
 	}
 	payload["node_id"] = cfg.NodeID
-	return postJSON(cfg.Server+path, cfg.Token, payload, out)
+	debugf(cfg, "agent post start: path=%s keys=%s", path, strings.Join(payloadKeys(payload), ","))
+	if err := postJSON(cfg.Server+path, cfg.Token, payload, out); err != nil {
+		debugf(cfg, "agent post failed: path=%s err=%v", path, err)
+		return err
+	}
+	debugf(cfg, "agent post ok: path=%s", path)
+	return nil
+}
+
+func payloadKeys(payload map[string]any) []string {
+	keys := make([]string, 0, len(payload))
+	for key := range payload {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func debugf(cfg agentConfig, format string, args ...any) {
+	if !cfg.Debug {
+		return
+	}
+	log.Printf("debug: "+format, args...)
 }
 
 func postJSON(url string, bearerToken string, payload any, out any) error {
