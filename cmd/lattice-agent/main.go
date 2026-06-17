@@ -29,7 +29,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.2.1"
+var version = "0.2.2"
 
 // httpClient bounds every agent request so a hung or black-holed server cannot
 // wedge the agent's poll loop indefinitely. The total timeout comfortably
