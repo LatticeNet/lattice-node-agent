@@ -42,6 +42,18 @@ func newLogTailManager(cfg agentConfig) *logTailManager {
 	return &logTailManager{cfg: cfg, active: map[string]*logTailEntry{}}
 }
 
+func (m *logTailManager) setConfig(cfg agentConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cfg
+}
+
+func (m *logTailManager) snapshotConfig() agentConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg
+}
+
 func (m *logTailManager) reconcile(sources []model.LogSource) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -126,7 +138,7 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 				Lines:      pending[:n],
 				CapturedAt: time.Now().UTC(),
 			}
-			status, err := shipLogBatch(m.cfg, batch)
+			status, err := shipLogBatch(m.snapshotConfig(), batch)
 			if err != nil || status != http.StatusOK {
 				// Hold position; retry on the next tick. The checkpoint is not
 				// advanced, so a restart re-reads from the last shipped offset.

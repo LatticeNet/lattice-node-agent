@@ -53,6 +53,13 @@ logs include poll progress, request paths, payload key names, metrics summaries,
 monitor counts, task IDs, and task exit status. They do not print the node token,
 task script body, proxy usage secret, or client secret values.
 
+The server can also enable debug mode per node for `lattice-agent 0.2.1+`
+through `/api/nodes/debug` or the dashboard node detail panel.
+Server-controlled debug writes to the node's normal service logs and, by
+default, also uploads the same debug lines to the server Logs store under
+`agent-debug://<node_id>`. Set `collect=false` on the server policy to keep debug
+enabled on the node while preventing central collection.
+
 Current topology is hub-and-spoke: every agent points directly at the primary
 `lattice-server`. `role` and `tags` are metadata for filtering/planning; there is
 no production group-leader or relay-agent mode yet.

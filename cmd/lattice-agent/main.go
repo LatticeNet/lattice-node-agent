@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -28,22 +29,34 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.2.0"
+var version = "0.2.1"
 
 // httpClient bounds every agent request so a hung or black-holed server cannot
 // wedge the agent's poll loop indefinitely. The total timeout comfortably
 // exceeds task execution because task results are posted separately.
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
+const (
+	defaultDebugMaxLineBytes  = 4096
+	defaultDebugMaxBatchLines = 100
+	debugSinkMaxLines         = 1000
+)
+
 type agentConfig struct {
-	Server    string
-	NodeID    string
-	Token     string
-	Interval  time.Duration
-	AllowExec bool
-	AllowRoot bool
-	NoExec    bool
-	Debug     bool
+	Server             string
+	NodeID             string
+	Token              string
+	Interval           time.Duration
+	AllowExec          bool
+	AllowRoot          bool
+	NoExec             bool
+	Debug              bool
+	LocalDebug         bool
+	ServerDebug        bool
+	DebugCollect       bool
+	DebugMaxLineBytes  int
+	DebugMaxBatchLines int
+	DebugSink          *debugSink
 	// SelfcheckControlPlane runs a one-shot, unauthenticated reachability check
 	// against /api/health and exits. It is used by rollback-protected firewall
 	// apply tasks so the task shell never needs a node bearer token.
@@ -102,7 +115,7 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
-	flag.BoolVar(&cfg.Debug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
+	flag.BoolVar(&cfg.LocalDebug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
 	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update existing nft control-plane named sets, then exit")
 	flag.StringVar(&cfg.NFTDomainHost, "host", "", "hostname for -update-nft-domain-set")
@@ -137,6 +150,10 @@ func main() {
 		fmt.Println(version)
 		return
 	}
+	cfg.Debug = cfg.LocalDebug
+	cfg.DebugMaxLineBytes = defaultDebugMaxLineBytes
+	cfg.DebugMaxBatchLines = defaultDebugMaxBatchLines
+	cfg.DebugSink = newDebugSink(debugSinkMaxLines)
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
@@ -192,6 +209,11 @@ func main() {
 	}, nil); err != nil {
 		log.Fatalf("hello failed: %v", err)
 	}
+	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
+		debugf(cfg, "agent config fetch failed: %v", err)
+	} else {
+		applyAgentConfig(&cfg, agentCfg)
+	}
 	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
@@ -203,6 +225,13 @@ func main() {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
+		if agentCfg, err := fetchAgentConfig(cfg); err != nil {
+			debugf(cfg, "agent config fetch failed: %v", err)
+		} else {
+			applyAgentConfig(&cfg, agentCfg)
+			monitors.setConfig(cfg)
+			logTailers.setConfig(cfg)
+		}
 		if err := reportMetrics(cfg); err != nil {
 			log.Printf("metrics error: %v", err)
 		}
@@ -223,6 +252,9 @@ func main() {
 			logTailers.reconcile(sources)
 		}
 		debugf(cfg, "poll cycle complete")
+		if err := flushDebugEvents(cfg); err != nil {
+			log.Printf("debug event report error: %v", err)
+		}
 		<-ticker.C
 	}
 }
@@ -243,6 +275,18 @@ type monitorEntry struct {
 
 func newMonitorManager(cfg agentConfig) *monitorManager {
 	return &monitorManager{cfg: cfg, active: map[string]monitorEntry{}}
+}
+
+func (mm *monitorManager) setConfig(cfg agentConfig) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	mm.cfg = cfg
+}
+
+func (mm *monitorManager) snapshotConfig() agentConfig {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	return mm.cfg
 }
 
 func (mm *monitorManager) reconcile(monitors []model.Monitor) {
@@ -273,7 +317,7 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 	if interval < time.Second {
 		interval = 30 * time.Second
 	}
-	probeAndReport(mm.cfg, m)
+	probeAndReport(mm.snapshotConfig(), m)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -281,7 +325,7 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			probeAndReport(mm.cfg, m)
+			probeAndReport(mm.snapshotConfig(), m)
 		}
 	}
 }
@@ -323,6 +367,53 @@ func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
 	}
 	debugf(cfg, "monitor assignments fetched: count=%d", len(monitors))
 	return monitors, nil
+}
+
+func fetchAgentConfig(cfg agentConfig) (model.AgentConfig, error) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/config?node_id=%s", cfg.Server, url.QueryEscape(cfg.NodeID)), nil)
+	if err != nil {
+		return model.AgentConfig{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return model.AgentConfig{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return model.AgentConfig{}, fmt.Errorf("agent config status %d", resp.StatusCode)
+	}
+	var out model.AgentConfig
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return model.AgentConfig{}, err
+	}
+	return out, nil
+}
+
+func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
+	oldDebug := cfg.Debug
+	oldCollect := cfg.DebugCollect
+	oldMaxLine := cfg.DebugMaxLineBytes
+	oldMaxBatch := cfg.DebugMaxBatchLines
+
+	cfg.ServerDebug = remote.Debug.Enabled
+	cfg.DebugCollect = remote.Debug.Enabled && remote.Debug.Collect
+	cfg.Debug = cfg.LocalDebug || cfg.ServerDebug
+	cfg.DebugMaxLineBytes = remote.Debug.MaxLineBytes
+	if cfg.DebugMaxLineBytes <= 0 {
+		cfg.DebugMaxLineBytes = defaultDebugMaxLineBytes
+	}
+	cfg.DebugMaxBatchLines = remote.Debug.MaxBatchLines
+	if cfg.DebugMaxBatchLines <= 0 {
+		cfg.DebugMaxBatchLines = defaultDebugMaxBatchLines
+	}
+	if !cfg.DebugCollect && cfg.DebugSink != nil {
+		cfg.DebugSink.clear()
+	}
+	if cfg.Debug != oldDebug || cfg.DebugCollect != oldCollect || cfg.DebugMaxLineBytes != oldMaxLine || cfg.DebugMaxBatchLines != oldMaxBatch {
+		log.Printf("lattice-agent debug policy updated: local=%v server=%v collect=%v max_line_bytes=%d max_batch_lines=%d",
+			cfg.LocalDebug, cfg.ServerDebug, cfg.DebugCollect, cfg.DebugMaxLineBytes, cfg.DebugMaxBatchLines)
+	}
 }
 
 func reportMetrics(cfg agentConfig) error {
@@ -564,7 +655,132 @@ func debugf(cfg agentConfig, format string, args ...any) {
 	if !cfg.Debug {
 		return
 	}
-	log.Printf("debug: "+format, args...)
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("debug: %s", msg)
+	if cfg.DebugCollect && cfg.DebugSink != nil {
+		cfg.DebugSink.append(msg, cfg.DebugMaxLineBytes)
+	}
+}
+
+type debugSink struct {
+	mu       sync.Mutex
+	maxLines int
+	lines    []string
+}
+
+func newDebugSink(maxLines int) *debugSink {
+	if maxLines <= 0 {
+		maxLines = debugSinkMaxLines
+	}
+	return &debugSink{maxLines: maxLines}
+}
+
+func (s *debugSink) append(line string, maxBytes int) {
+	if s == nil {
+		return
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultDebugMaxLineBytes
+	}
+	if len(line) > maxBytes {
+		line = line[:maxBytes] + "...truncated"
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lines = append(s.lines, line)
+	if over := len(s.lines) - s.maxLines; over > 0 {
+		s.lines = s.lines[over:]
+	}
+}
+
+func (s *debugSink) drain(maxLines int) []string {
+	if s == nil {
+		return nil
+	}
+	if maxLines <= 0 {
+		maxLines = defaultDebugMaxBatchLines
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.lines) == 0 {
+		return nil
+	}
+	n := len(s.lines)
+	if n > maxLines {
+		n = maxLines
+	}
+	out := append([]string(nil), s.lines[:n]...)
+	s.lines = append([]string(nil), s.lines[n:]...)
+	return out
+}
+
+func (s *debugSink) prepend(lines []string) {
+	if s == nil || len(lines) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	combined := append(append([]string(nil), lines...), s.lines...)
+	if over := len(combined) - s.maxLines; over > 0 {
+		combined = combined[over:]
+	}
+	s.lines = combined
+}
+
+func (s *debugSink) clear() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lines = nil
+}
+
+func flushDebugEvents(cfg agentConfig) error {
+	if !cfg.DebugCollect || cfg.DebugSink == nil {
+		return nil
+	}
+	lines := cfg.DebugSink.drain(cfg.DebugMaxBatchLines)
+	if len(lines) == 0 {
+		return nil
+	}
+	batch := model.AgentDebugBatch{
+		NodeID:     cfg.NodeID,
+		Lines:      lines,
+		CapturedAt: time.Now().UTC(),
+	}
+	if err := postAgentDebugBatch(cfg, batch); err != nil {
+		cfg.DebugSink.prepend(lines)
+		return err
+	}
+	return nil
+}
+
+func postAgentDebugBatch(cfg agentConfig, batch model.AgentDebugBatch) error {
+	data, err := json.Marshal(map[string]any{"node_id": cfg.NodeID, "batch": batch})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, cfg.Server+"/api/agent/debug-events", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("server returned %s", resp.Status)
+	}
+	return nil
 }
 
 func postJSON(url string, bearerToken string, payload any, out any) error {

@@ -23,8 +23,90 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.2.0" {
-		t.Fatalf("version = %q, want 0.2.0", version)
+	if version != "0.2.1" {
+		t.Fatalf("version = %q, want 0.2.1", version)
+	}
+}
+
+func TestApplyAgentConfigControlsDebugCollection(t *testing.T) {
+	sink := newDebugSink(10)
+	cfg := agentConfig{DebugSink: sink}
+	applyAgentConfig(&cfg, model.AgentConfig{Debug: model.AgentDebugConfig{
+		Enabled:       true,
+		Collect:       true,
+		MaxLineBytes:  12,
+		MaxBatchLines: 2,
+	}})
+	if !cfg.Debug || !cfg.ServerDebug || !cfg.DebugCollect {
+		t.Fatalf("expected server debug with collection enabled: %+v", cfg)
+	}
+	if cfg.DebugMaxLineBytes != 12 || cfg.DebugMaxBatchLines != 2 {
+		t.Fatalf("debug caps not applied: line=%d batch=%d", cfg.DebugMaxLineBytes, cfg.DebugMaxBatchLines)
+	}
+	debugf(cfg, "diagnostic %s", "message")
+	lines := sink.drain(10)
+	if len(lines) != 1 || lines[0] != "diagnostic m...truncated" {
+		t.Fatalf("debug line not collected/truncated as expected: %q", lines)
+	}
+
+	applyAgentConfig(&cfg, model.AgentConfig{Debug: model.AgentDebugConfig{
+		Enabled: true,
+		Collect: false,
+	}})
+	if !cfg.Debug || cfg.DebugCollect {
+		t.Fatalf("expected local debug without collection: %+v", cfg)
+	}
+	debugf(cfg, "local only")
+	if got := sink.drain(10); len(got) != 0 {
+		t.Fatalf("collect=false should not retain debug lines, got %q", got)
+	}
+}
+
+func TestFlushDebugEventsPostsBufferedLines(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	sink := newDebugSink(10)
+	cfg := agentConfig{
+		Server:             "http://lattice.test",
+		NodeID:             "node-a",
+		Token:              "node-secret",
+		Debug:              true,
+		DebugCollect:       true,
+		DebugMaxLineBytes:  defaultDebugMaxLineBytes,
+		DebugMaxBatchLines: defaultDebugMaxBatchLines,
+		DebugSink:          sink,
+	}
+	debugf(cfg, "poll cycle complete")
+	debugf(cfg, "agent post ok: path=/api/agent/metrics")
+
+	var body struct {
+		NodeID string                `json:"node_id"`
+		Batch  model.AgentDebugBatch `json:"batch"`
+	}
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/agent/debug-events" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		if r.Header.Get("Authorization") != "Bearer node-secret" {
+			return testResponse(http.StatusBadRequest, "missing bearer"), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return testResponse(http.StatusOK, `{"ok":true,"accepted":2}`), nil
+	})}
+	if err := flushDebugEvents(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if body.NodeID != "node-a" || body.Batch.NodeID != "node-a" {
+		t.Fatalf("node id not pinned in debug batch: %+v", body)
+	}
+	if len(body.Batch.Lines) != 2 || body.Batch.Lines[0] != "poll cycle complete" {
+		t.Fatalf("unexpected debug batch: %+v", body.Batch.Lines)
+	}
+	if got := sink.drain(10); len(got) != 0 {
+		t.Fatalf("flush should drain sent lines, got %q", got)
 	}
 }
 
