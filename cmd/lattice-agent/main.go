@@ -43,14 +43,19 @@ const (
 )
 
 type agentConfig struct {
-	Server             string
-	NodeID             string
-	Token              string
-	Interval           time.Duration
-	AllowExec          bool
-	AllowRoot          bool
-	NoExec             bool
-	AllowTerminal      bool
+	Server        string
+	NodeID        string
+	Token         string
+	Interval      time.Duration
+	AllowExec     bool
+	AllowRoot     bool
+	NoExec        bool
+	AllowTerminal bool
+	// TerminalTransport selects how an accepted terminal session moves bytes:
+	// "poll" (default, legacy HTTP store-and-forward) or "stream" (agent-dialed
+	// WebSocket bridge). Normalized after flag parsing; unknown values fall back
+	// to "poll".
+	TerminalTransport  string
 	Debug              bool
 	LocalDebug         bool
 	ServerDebug        bool
@@ -117,6 +122,7 @@ func main() {
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.BoolVar(&cfg.AllowTerminal, "allow-terminal", os.Getenv("LATTICE_AGENT_ALLOW_TERMINAL") == "1", "allow audited interactive terminal sessions (high risk; runs as the agent user)")
+	flag.StringVar(&cfg.TerminalTransport, "terminal-transport", env("LATTICE_TERMINAL_TRANSPORT", terminalTransportPoll), "terminal transport when -allow-terminal is set: \"poll\" (default) or \"stream\" (agent-dialed WebSocket)")
 	flag.BoolVar(&cfg.LocalDebug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
 	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update existing nft control-plane named sets, then exit")
@@ -171,6 +177,10 @@ func main() {
 		return
 	}
 	cfg.Server = strings.TrimRight(cfg.Server, "/")
+	cfg.TerminalTransport = strings.ToLower(strings.TrimSpace(cfg.TerminalTransport))
+	if cfg.TerminalTransport != terminalTransportStream {
+		cfg.TerminalTransport = terminalTransportPoll
+	}
 	// Fail closed if the node token would be sent over cleartext http:// to a
 	// non-loopback host. Loopback http:// is fine; anything else must use https://
 	// unless the operator explicitly opted in with -allow-insecure-http.
@@ -221,7 +231,7 @@ func main() {
 	} else {
 		applyAgentConfig(&cfg, agentCfg)
 	}
-	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v allow_terminal=%v debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.Debug)
+	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
 	}
