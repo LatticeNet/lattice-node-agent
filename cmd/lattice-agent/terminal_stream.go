@@ -211,9 +211,12 @@ func (r *terminalRunner) runStream(ctx context.Context) {
 		"LATTICE_TERMINAL_SESSION_ID="+r.session.ID,
 		"LATTICE_NODE_ID="+r.cfg.NodeID,
 	)
-	// Run the shell in its own process group so teardown SIGKILLs the whole tree
-	// (e.g. vim/top grandchildren), not just the shell. No-op where unsupported.
-	terminalSetPGID(cmd)
+	// Do NOT set Setpgid here. creack/pty's StartWithSize already sets Setsid,
+	// which makes the shell a session+group leader (pgrp == pid) — that is the
+	// process group teardown later SIGKILLs via Getpgid + Kill(-pgid). Setting
+	// Setpgid as well makes the child's setpgid() fail right after its setsid()
+	// (a session leader cannot move its own pgrp), so fork/exec returns EPERM
+	// ("operation not permitted") and no shell ever starts.
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)})
 	if err != nil {
 		debugf(r.cfg, "terminal stream pty start failed: session=%s err=%v", r.session.ID, err)
