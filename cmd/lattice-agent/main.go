@@ -434,6 +434,18 @@ func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
 		log.Printf("lattice-agent debug policy updated: local=%v server=%v collect=%v max_line_bytes=%d max_batch_lines=%d",
 			cfg.LocalDebug, cfg.ServerDebug, cfg.DebugCollect, cfg.DebugMaxLineBytes, cfg.DebugMaxBatchLines)
 	}
+
+	// Phase 3 rollout lever: a server-pushed per-node transport override takes
+	// effect for terminal sessions opened after this poll. Empty clears it (the
+	// startup -terminal-transport value wins). Logged on change so a canary flip
+	// is visible in the agent log.
+	override := strings.ToLower(strings.TrimSpace(remote.TerminalTransport))
+	oldEffective := effectiveTerminalTransport(cfg.TerminalTransport)
+	setTerminalTransportOverride(override)
+	if newEffective := effectiveTerminalTransport(cfg.TerminalTransport); newEffective != oldEffective {
+		log.Printf("lattice-agent terminal transport updated: effective=%s (server override=%q, startup=%s)",
+			newEffective, override, cfg.TerminalTransport)
+	}
 }
 
 func reportMetrics(cfg agentConfig) error {
