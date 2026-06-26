@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
+	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
@@ -77,6 +78,12 @@ type agentConfig struct {
 	AllowInsecureHTTP     bool
 	PublicIP              string
 	PublicIPv6            string
+	IPMode                string
+	IPResolvers           string
+	staticPublicIP        string
+	staticPublicIPv6      string
+	InternalIP            string
+	InternalIPv6          string
 	WireGuardIP           string
 	WGPublicKey           string
 	WGEndpoint            string
@@ -138,6 +145,8 @@ func main() {
 	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", os.Getenv("LATTICE_ALLOW_INSECURE_HTTP") == "1", "permit a non-loopback http:// server URL (leaks the node token in cleartext; use https:// instead)")
 	flag.StringVar(&cfg.PublicIP, "public-ip", os.Getenv("LATTICE_PUBLIC_IP"), "public IPv4 metadata (server observes source IP if empty)")
 	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
+	flag.StringVar(&cfg.IPMode, "ip-mode", env("LATTICE_IP_MODE", "auto"), "public IP discovery: auto (static override else resolver) | static | resolver")
+	flag.StringVar(&cfg.IPResolvers, "ip-resolvers", os.Getenv("LATTICE_IP_RESOLVERS"), "comma-separated IP-echo resolver URLs (overrides built-in defaults)")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
 	flag.BoolVar(&cfg.SSHAlerts, "ssh-alerts", os.Getenv("LATTICE_SSH_ALERTS") == "1", "report sshd accepted logins as events")
 	flag.StringVar(&cfg.WGPublicKey, "wg-pubkey", os.Getenv("LATTICE_WG_PUBKEY"), "WireGuard public key (for mesh planning)")
@@ -162,6 +171,10 @@ func main() {
 	cfg.DebugMaxLineBytes = defaultDebugMaxLineBytes
 	cfg.DebugMaxBatchLines = defaultDebugMaxBatchLines
 	cfg.DebugSink = newDebugSink(debugSinkMaxLines)
+	// Preserve the operator's static -public-ip flags; "auto"/"resolver" modes
+	// may overwrite the effective cfg.PublicIP with a discovered value.
+	cfg.staticPublicIP = cfg.PublicIP
+	cfg.staticPublicIPv6 = cfg.PublicIPv6
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
@@ -214,10 +227,13 @@ func main() {
 	if missing := taskexec.MissingInterpreters(); len(missing) > 0 {
 		log.Printf("warning: allowlisted interpreters not found on PATH: %s (tasks using them will fail until installed)", strings.Join(missing, ", "))
 	}
+	refreshIPs(&cfg)
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
+		"internal_ip":          cfg.InternalIP,
+		"internal_ipv6":        cfg.InternalIPv6,
 		"wireguard_ip":         cfg.WireGuardIP,
 		"wireguard_public_key": cfg.WGPublicKey,
 		"wireguard_endpoint":   cfg.WGEndpoint,
@@ -252,6 +268,7 @@ func main() {
 			monitors.setConfig(cfg)
 			logTailers.setConfig(cfg)
 		}
+		refreshIPs(&cfg)
 		if err := reportMetrics(cfg); err != nil {
 			log.Printf("metrics error: %v", err)
 		}
@@ -453,13 +470,74 @@ func reportMetrics(cfg agentConfig) error {
 	facts := hostfacts.Collect()
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
-		"version":      version,
-		"public_ip":    cfg.PublicIP,
-		"public_ipv6":  cfg.PublicIPv6,
-		"wireguard_ip": cfg.WireGuardIP,
-		"metrics":      m,
-		"host_facts":   facts,
+		"version":       version,
+		"public_ip":     cfg.PublicIP,
+		"public_ipv6":   cfg.PublicIPv6,
+		"internal_ip":   cfg.InternalIP,
+		"internal_ipv6": cfg.InternalIPv6,
+		"wireguard_ip":  cfg.WireGuardIP,
+		"metrics":       m,
+		"host_facts":    facts,
 	}, nil)
+}
+
+// lastPublicProbe throttles outbound IP-echo requests so the agent does not hit
+// resolvers on every metrics tick.
+var lastPublicProbe time.Time
+
+// refreshIPs updates the effective public IPs (per -ip-mode) and the internal
+// LAN IPs on cfg. Internal IPs are refreshed every call (local, cheap); public
+// resolver probes are throttled to ~2 minutes and keep their last good value.
+func refreshIPs(cfg *agentConfig) {
+	cfg.InternalIP, cfg.InternalIPv6 = ipdiscover.InternalIPs()
+	mode := strings.ToLower(strings.TrimSpace(cfg.IPMode))
+	if mode == "static" {
+		cfg.PublicIP, cfg.PublicIPv6 = cfg.staticPublicIP, cfg.staticPublicIPv6
+		return
+	}
+	if !lastPublicProbe.IsZero() && time.Since(lastPublicProbe) < 2*time.Minute &&
+		(cfg.PublicIP != "" || cfg.PublicIPv6 != "") {
+		return
+	}
+	lastPublicProbe = time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	probeV4 := ipdiscover.PublicIP(ctx, resolverList(cfg.IPResolvers, true), true)
+	probeV6 := ipdiscover.PublicIP(ctx, resolverList(cfg.IPResolvers, false), false)
+	if mode == "resolver" {
+		cfg.PublicIP, cfg.PublicIPv6 = probeV4, probeV6
+		return
+	}
+	// "auto" (default): a static override wins; otherwise use the resolver result.
+	cfg.PublicIP = firstNonEmpty(cfg.staticPublicIP, probeV4)
+	cfg.PublicIPv6 = firstNonEmpty(cfg.staticPublicIPv6, probeV6)
+}
+
+func resolverList(custom string, v4 bool) []string {
+	if list := splitComma(custom); len(list) > 0 {
+		return list
+	}
+	if v4 {
+		return ipdiscover.DefaultResolversV4
+	}
+	return ipdiscover.DefaultResolversV6
+}
+
+func splitComma(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 func reportProxyUsage(cfg agentConfig) error {
