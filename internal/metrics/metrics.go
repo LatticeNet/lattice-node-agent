@@ -23,16 +23,63 @@ var cpuSampler struct {
 	hasPrev   bool
 }
 
+// netSampler holds the previous cumulative rx/tx byte counters and the time they
+// were read, so each Collect can derive a per-second rate over the real interval
+// between calls. The first call (no prior sample) returns 0.
+var netSampler struct {
+	sync.Mutex
+	prevRx   uint64
+	prevTx   uint64
+	prevTime time.Time
+	hasPrev  bool
+}
+
 func Collect() model.Metrics {
 	now := time.Now().UTC()
 	m := model.Metrics{CollectedAt: now}
-	m.Load1 = readLoad1()
+	m.Load1, m.Load5, m.Load15 = readLoadAvg()
 	m.MemoryUsed, m.MemoryTotal = readMemory()
 	m.DiskUsed, m.DiskTotal = readDisk("/")
 	m.NetRxBytes, m.NetTxBytes = readNetDev()
+	m.NetRxSpeed, m.NetTxSpeed = netSpeed(m.NetRxBytes, m.NetTxBytes, now)
 	m.UptimeSeconds = readUptime()
 	m.CPUPercent = readCPUPercent(m.Load1, runtime.NumCPU())
 	return m
+}
+
+// netSpeed derives per-second rx/tx byte rates from the delta of the cumulative
+// counters since the previous Collect, mutating netSampler. The first call and
+// any counter reset report 0. The arithmetic lives in the pure netRate helper.
+func netSpeed(rx, tx uint64, now time.Time) (rxPerSec, txPerSec float64) {
+	netSampler.Lock()
+	defer netSampler.Unlock()
+	defer func() {
+		netSampler.prevRx = rx
+		netSampler.prevTx = tx
+		netSampler.prevTime = now
+		netSampler.hasPrev = true
+	}()
+	if !netSampler.hasPrev {
+		return 0, 0
+	}
+	return netRate(netSampler.prevRx, netSampler.prevTx, rx, tx, now.Sub(netSampler.prevTime).Seconds())
+}
+
+// netRate computes per-second byte rates over elapsedSec. Pure and side-effect
+// free so it can be unit tested without /proc. A non-positive interval or a
+// counter that went backwards (interface restart / 64-bit wrap) yields 0 for
+// that direction rather than a bogus spike.
+func netRate(prevRx, prevTx, rx, tx uint64, elapsedSec float64) (rxPerSec, txPerSec float64) {
+	if elapsedSec <= 0 {
+		return 0, 0
+	}
+	if rx >= prevRx {
+		rxPerSec = float64(rx-prevRx) / elapsedSec
+	}
+	if tx >= prevTx {
+		txPerSec = float64(tx-prevTx) / elapsedSec
+	}
+	return rxPerSec, txPerSec
 }
 
 // readCPUPercent computes busy CPU percentage from the delta of /proc/stat
@@ -116,17 +163,24 @@ func readProcStat() (total, idle uint64, ok bool) {
 	return 0, 0, false
 }
 
-func readLoad1() float64 {
+// readLoadAvg returns the 1/5/15-minute load averages from /proc/loadavg. Any
+// field that is missing or unparseable yields 0 for that average.
+func readLoadAvg() (l1, l5, l15 float64) {
 	data, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
-		return 0
+		return 0, 0, 0
 	}
 	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return 0
+	if len(fields) >= 1 {
+		l1, _ = strconv.ParseFloat(fields[0], 64)
 	}
-	v, _ := strconv.ParseFloat(fields[0], 64)
-	return v
+	if len(fields) >= 2 {
+		l5, _ = strconv.ParseFloat(fields[1], 64)
+	}
+	if len(fields) >= 3 {
+		l15, _ = strconv.ParseFloat(fields[2], 64)
+	}
+	return l1, l5, l15
 }
 
 func readMemory() (used, total uint64) {
