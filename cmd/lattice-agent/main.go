@@ -75,13 +75,19 @@ type agentConfig struct {
 	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
 	// http:// server URL. Default false: the agent refuses such a config because
 	// the Authorization: Bearer token would travel in cleartext.
-	AllowInsecureHTTP     bool
-	PublicIP              string
-	PublicIPv6            string
-	IPMode                string
-	IPResolvers           string
-	staticPublicIP        string
-	staticPublicIPv6      string
+	AllowInsecureHTTP bool
+	PublicIP          string
+	PublicIPv6        string
+	IPMode            string
+	IPResolvers       string
+	staticPublicIP    string
+	staticPublicIPv6  string
+	// startup* preserve the launch-time IP flags so a server-pushed NodeIPConfig
+	// override can be cleared back to them.
+	startupIPMode         string
+	startupIPResolvers    string
+	startupStaticPubV4    string
+	startupStaticPubV6    string
 	InternalIP            string
 	InternalIPv6          string
 	WireGuardIP           string
@@ -175,6 +181,11 @@ func main() {
 	// may overwrite the effective cfg.PublicIP with a discovered value.
 	cfg.staticPublicIP = cfg.PublicIP
 	cfg.staticPublicIPv6 = cfg.PublicIPv6
+	// Snapshot the launch-time IP flags so a server-pushed override is revertible.
+	cfg.startupIPMode = cfg.IPMode
+	cfg.startupIPResolvers = cfg.IPResolvers
+	cfg.startupStaticPubV4 = cfg.staticPublicIP
+	cfg.startupStaticPubV6 = cfg.staticPublicIPv6
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
@@ -462,6 +473,36 @@ func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
 	if newEffective := effectiveTerminalTransport(cfg.TerminalTransport); newEffective != oldEffective {
 		log.Printf("lattice-agent terminal transport updated: effective=%s (server override=%q, startup=%s)",
 			newEffective, override, cfg.TerminalTransport)
+	}
+
+	applyIPConfigOverride(cfg, remote.IPConfig)
+}
+
+// applyIPConfigOverride lets a server-pushed NodeIPConfig take precedence over
+// the agent's startup IP flags. A nil config or empty Mode clears the override,
+// reverting to the launch-time flags. On any change it resets the public-probe
+// throttle so the new setting takes effect on the next refreshIPs, and logs the
+// transition so a server-side flip is visible in the agent log.
+func applyIPConfigOverride(cfg *agentConfig, ipc *model.NodeIPConfig) {
+	oldMode, oldResolvers := cfg.IPMode, cfg.IPResolvers
+	oldV4, oldV6 := cfg.staticPublicIP, cfg.staticPublicIPv6
+	if ipc != nil && strings.TrimSpace(ipc.Mode) != "" {
+		cfg.IPMode = strings.ToLower(strings.TrimSpace(ipc.Mode))
+		cfg.staticPublicIP = strings.TrimSpace(ipc.StaticIPv4)
+		cfg.staticPublicIPv6 = strings.TrimSpace(ipc.StaticIPv6)
+		cfg.IPResolvers = strings.Join(ipc.Resolvers, ",")
+	} else {
+		cfg.IPMode = cfg.startupIPMode
+		cfg.staticPublicIP = cfg.startupStaticPubV4
+		cfg.staticPublicIPv6 = cfg.startupStaticPubV6
+		cfg.IPResolvers = cfg.startupIPResolvers
+	}
+	if cfg.IPMode != oldMode || cfg.IPResolvers != oldResolvers ||
+		cfg.staticPublicIP != oldV4 || cfg.staticPublicIPv6 != oldV6 {
+		lastPublicProbe = time.Time{} // re-probe promptly on the next refreshIPs
+		log.Printf("lattice-agent IP config updated: mode=%s static_v4=%q static_v6=%q resolvers=%q (server override=%v)",
+			cfg.IPMode, cfg.staticPublicIP, cfg.staticPublicIPv6, cfg.IPResolvers,
+			ipc != nil && strings.TrimSpace(ipc.Mode) != "")
 	}
 }
 
