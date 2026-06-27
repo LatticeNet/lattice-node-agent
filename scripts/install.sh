@@ -40,6 +40,7 @@ esac
 
 need curl
 need install
+need sha256sum
 need systemctl
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -58,6 +59,7 @@ if [ "$(id -u)" -ne 0 ]; then
       LATTICE_AGENT_ALLOW_TERMINAL="${LATTICE_AGENT_ALLOW_TERMINAL:-}" \
       LATTICE_IP_MODE="${LATTICE_IP_MODE:-}" \
       LATTICE_IP_RESOLVERS="${LATTICE_IP_RESOLVERS:-}" \
+      LATTICE_IP_SCRIPT="${LATTICE_IP_SCRIPT:-}" \
       LATTICE_PUBLIC_IP="${LATTICE_PUBLIC_IP:-}" \
       LATTICE_PUBLIC_IP6="${LATTICE_PUBLIC_IP6:-}" \
       sh "$0"
@@ -68,15 +70,21 @@ fi
 artifact="lattice-agent-${os}-${arch}"
 if [ "$version" = "latest" ]; then
   url="https://github.com/${repo}/releases/latest/download/${artifact}"
+  sums_url="https://github.com/${repo}/releases/latest/download/SHA256SUMS"
 else
   url="https://github.com/${repo}/releases/download/${version}/${artifact}"
+  sums_url="https://github.com/${repo}/releases/download/${version}/SHA256SUMS"
 fi
 
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+tmp="$tmp_dir/$artifact"
+sums="$tmp_dir/SHA256SUMS"
 
 echo "Downloading $artifact from $url"
 curl -fsSL "$url" -o "$tmp"
+curl -fsSL "$sums_url" -o "$sums"
+(cd "$tmp_dir" && grep " $artifact\$" SHA256SUMS | sha256sum -c -)
 install -m 0755 "$tmp" "$bin_path"
 
 umask 077
@@ -89,6 +97,7 @@ LATTICE_AGENT_ALLOW_ROOT_EXEC=$(quote_env "${LATTICE_AGENT_ALLOW_ROOT_EXEC:-0}")
 LATTICE_AGENT_ALLOW_TERMINAL=$(quote_env "${LATTICE_AGENT_ALLOW_TERMINAL:-0}")
 LATTICE_IP_MODE=$(quote_env "${LATTICE_IP_MODE:-auto}")
 LATTICE_IP_RESOLVERS=$(quote_env "${LATTICE_IP_RESOLVERS:-}")
+LATTICE_IP_SCRIPT=$(quote_env "${LATTICE_IP_SCRIPT:-}")
 LATTICE_PUBLIC_IP=$(quote_env "${LATTICE_PUBLIC_IP:-}")
 LATTICE_PUBLIC_IP6=$(quote_env "${LATTICE_PUBLIC_IP6:-}")
 EOF
