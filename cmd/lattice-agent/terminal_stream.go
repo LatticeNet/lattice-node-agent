@@ -22,9 +22,9 @@ import (
 
 const (
 	// Stream transport tunables.
-	terminalStreamChunk       = 32 * 1024        // PTY->WS copy buffer (fewer syscalls than the 4 KiB poll chunk)
-	terminalStreamReadLimit   = 64 * 1024        // bound a single inbound frame; the server caps browser input at 16 KiB
-	terminalStreamDialTimeout = 15 * time.Second // WebSocket handshake timeout
+	terminalStreamChunk        = 32 * 1024        // PTY->WS copy buffer (fewer syscalls than the 4 KiB poll chunk)
+	terminalStreamReadLimit    = 64 * 1024        // bound a single inbound frame; the server caps browser input at 16 KiB
+	terminalStreamDialTimeout  = 15 * time.Second // WebSocket handshake timeout
 	terminalStreamPingInterval = 10 * time.Second // keepalive ping cadence (keeps the conn hot through CF idle)
 	terminalStreamPongWait     = 30 * time.Second // read deadline; reset on each pong, must exceed ping interval
 	// terminalStreamWriteWait bounds a single frame write. It is per-frame (≤32 KiB),
@@ -37,7 +37,7 @@ const (
 	// Reconnect / replay tunables. The agent keeps the PTY alive across a transient
 	// WebSocket drop and redials, replaying recent output so the browser resumes
 	// seamlessly.
-	terminalStreamRingBytes     = 512 * 1024            // per-session replay ring (recent output)
+	terminalStreamRingBytes     = 512 * 1024             // per-session replay ring (recent output)
 	terminalStreamRedialMin     = 500 * time.Millisecond // initial redial backoff
 	terminalStreamRedialMax     = 8 * time.Second        // capped redial backoff
 	terminalStreamDetachCeiling = 90 * time.Second       // give up redialing after this much continuous disconnection

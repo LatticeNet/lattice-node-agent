@@ -45,10 +45,10 @@ func TestParseIP(t *testing.T) {
 func TestSelectInternal(t *testing.T) {
 	ip := func(s string) net.IP { return net.ParseIP(s) }
 	ifaces := []ifaceAddrs{
-		{name: "docker0", addrs: []net.IP{ip("172.18.0.1")}},          // skipped (virtual)
-		{name: "veth123", addrs: []net.IP{ip("172.20.0.2")}},          // skipped (virtual)
+		{name: "docker0", addrs: []net.IP{ip("172.18.0.1")}},           // skipped (virtual)
+		{name: "veth123", addrs: []net.IP{ip("172.20.0.2")}},           // skipped (virtual)
 		{name: "eth0", addrs: []net.IP{ip("fe80::1"), ip("10.0.0.5")}}, // link-local v6 skipped; 10.0.0.5 chosen
-		{name: "eth1", addrs: []net.IP{ip("2001:db8::5")}},            // v6 chosen
+		{name: "eth1", addrs: []net.IP{ip("2001:db8::5")}},             // v6 chosen
 	}
 	v4, v6 := selectInternal(ifaces)
 	if v4 != "10.0.0.5" {
