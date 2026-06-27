@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -82,12 +84,14 @@ type agentConfig struct {
 	IPResolvers       string
 	staticPublicIP    string
 	staticPublicIPv6  string
+	ipScript          string
 	// startup* preserve the launch-time IP flags so a server-pushed NodeIPConfig
 	// override can be cleared back to them.
 	startupIPMode         string
 	startupIPResolvers    string
 	startupStaticPubV4    string
 	startupStaticPubV6    string
+	startupIPScript       string
 	InternalIP            string
 	InternalIPv6          string
 	WireGuardIP           string
@@ -153,6 +157,7 @@ func main() {
 	flag.StringVar(&cfg.PublicIPv6, "public-ip6", os.Getenv("LATTICE_PUBLIC_IP6"), "public IPv6 metadata")
 	flag.StringVar(&cfg.IPMode, "ip-mode", env("LATTICE_IP_MODE", "auto"), "public IP discovery: auto (static override else resolver) | static | resolver")
 	flag.StringVar(&cfg.IPResolvers, "ip-resolvers", os.Getenv("LATTICE_IP_RESOLVERS"), "comma-separated IP-echo resolver URLs (overrides built-in defaults)")
+	flag.StringVar(&cfg.ipScript, "ip-script", os.Getenv("LATTICE_IP_SCRIPT"), "custom public-IP discovery script for -ip-mode=script (requires -allow-exec, and -allow-root-exec when running as root)")
 	flag.StringVar(&cfg.WireGuardIP, "wg-ip", os.Getenv("LATTICE_WG_IP"), "WireGuard IP metadata")
 	flag.BoolVar(&cfg.SSHAlerts, "ssh-alerts", os.Getenv("LATTICE_SSH_ALERTS") == "1", "report sshd accepted logins as events")
 	flag.StringVar(&cfg.WGPublicKey, "wg-pubkey", os.Getenv("LATTICE_WG_PUBKEY"), "WireGuard public key (for mesh planning)")
@@ -186,6 +191,7 @@ func main() {
 	cfg.startupIPResolvers = cfg.IPResolvers
 	cfg.startupStaticPubV4 = cfg.staticPublicIP
 	cfg.startupStaticPubV6 = cfg.staticPublicIPv6
+	cfg.startupIPScript = cfg.ipScript
 	// The kill switch wins over the enable flag.
 	if cfg.NoExec {
 		cfg.AllowExec = false
@@ -486,22 +492,27 @@ func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
 func applyIPConfigOverride(cfg *agentConfig, ipc *model.NodeIPConfig) {
 	oldMode, oldResolvers := cfg.IPMode, cfg.IPResolvers
 	oldV4, oldV6 := cfg.staticPublicIP, cfg.staticPublicIPv6
+	oldScript := cfg.ipScript
 	if ipc != nil && strings.TrimSpace(ipc.Mode) != "" {
 		cfg.IPMode = strings.ToLower(strings.TrimSpace(ipc.Mode))
 		cfg.staticPublicIP = strings.TrimSpace(ipc.StaticIPv4)
 		cfg.staticPublicIPv6 = strings.TrimSpace(ipc.StaticIPv6)
 		cfg.IPResolvers = strings.Join(ipc.Resolvers, ",")
+		cfg.ipScript = ipc.Script
 	} else {
 		cfg.IPMode = cfg.startupIPMode
 		cfg.staticPublicIP = cfg.startupStaticPubV4
 		cfg.staticPublicIPv6 = cfg.startupStaticPubV6
 		cfg.IPResolvers = cfg.startupIPResolvers
+		cfg.ipScript = cfg.startupIPScript
 	}
 	if cfg.IPMode != oldMode || cfg.IPResolvers != oldResolvers ||
-		cfg.staticPublicIP != oldV4 || cfg.staticPublicIPv6 != oldV6 {
+		cfg.staticPublicIP != oldV4 || cfg.staticPublicIPv6 != oldV6 ||
+		cfg.ipScript != oldScript {
 		lastPublicProbe = time.Time{} // re-probe promptly on the next refreshIPs
-		log.Printf("lattice-agent IP config updated: mode=%s static_v4=%q static_v6=%q resolvers=%q (server override=%v)",
+		log.Printf("lattice-agent IP config updated: mode=%s static_v4=%q static_v6=%q resolvers=%q script=%v (server override=%v)",
 			cfg.IPMode, cfg.staticPublicIP, cfg.staticPublicIPv6, cfg.IPResolvers,
+			strings.TrimSpace(cfg.ipScript) != "",
 			ipc != nil && strings.TrimSpace(ipc.Mode) != "")
 	}
 }
@@ -536,11 +547,19 @@ func refreshIPs(cfg *agentConfig) {
 		cfg.PublicIP, cfg.PublicIPv6 = cfg.staticPublicIP, cfg.staticPublicIPv6
 		return
 	}
-	if !lastPublicProbe.IsZero() && time.Since(lastPublicProbe) < 2*time.Minute &&
-		(cfg.PublicIP != "" || cfg.PublicIPv6 != "") {
+	if !lastPublicProbe.IsZero() && time.Since(lastPublicProbe) < 2*time.Minute {
 		return
 	}
 	lastPublicProbe = time.Now()
+	if mode == "script" {
+		v4, v6, err := runIPDiscoveryScript(cfg)
+		if err != nil {
+			log.Printf("lattice-agent IP script discovery failed: %v", err)
+			return
+		}
+		cfg.PublicIP, cfg.PublicIPv6 = v4, v6
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	probeV4 := ipdiscover.PublicIP(ctx, resolverList(cfg.IPResolvers, true), true)
@@ -552,6 +571,102 @@ func refreshIPs(cfg *agentConfig) {
 	// "auto" (default): a static override wins; otherwise use the resolver result.
 	cfg.PublicIP = firstNonEmpty(cfg.staticPublicIP, probeV4)
 	cfg.PublicIPv6 = firstNonEmpty(cfg.staticPublicIPv6, probeV6)
+}
+
+func runIPDiscoveryScript(cfg *agentConfig) (string, string, error) {
+	script := strings.TrimSpace(cfg.ipScript)
+	if script == "" {
+		return "", "", fmt.Errorf("script mode has no script configured")
+	}
+	result := taskexec.Runner{
+		AllowExec: cfg.AllowExec && !cfg.NoExec,
+		AllowRoot: cfg.AllowRoot,
+	}.Run(model.Task{
+		ID:          "ip-discovery",
+		Interpreter: ipDiscoveryInterpreter(script),
+		Script:      script,
+		TimeoutSec:  8,
+		OutputLimit: 4096,
+	})
+	if result.ExitCode != 0 || result.Error != "" {
+		msg := strings.TrimSpace(result.Error)
+		if msg == "" {
+			msg = strings.TrimSpace(result.Stderr)
+		}
+		if msg == "" {
+			msg = fmt.Sprintf("exit code %d", result.ExitCode)
+		}
+		return "", "", errors.New(msg)
+	}
+	v4, v6 := parseIPDiscoveryOutput(result.Stdout)
+	if v4 == "" && v6 == "" {
+		return "", "", fmt.Errorf("script did not return a public IPv4 or IPv6 address")
+	}
+	return v4, v6, nil
+}
+
+func ipDiscoveryInterpreter(script string) string {
+	firstLine, _, _ := strings.Cut(script, "\n")
+	if strings.Contains(firstLine, "bash") {
+		return "bash"
+	}
+	return "sh"
+}
+
+func parseIPDiscoveryOutput(output string) (string, string) {
+	var v4, v6 string
+	for _, field := range strings.Fields(output) {
+		candidate := strings.Trim(field, " \t\r\n,;")
+		ip := net.ParseIP(candidate)
+		if !isPublicIP(ip) {
+			continue
+		}
+		if ip.To4() != nil {
+			if v4 == "" {
+				v4 = ip.String()
+			}
+		} else if v6 == "" {
+			v6 = ip.String()
+		}
+		if v4 != "" && v6 != "" {
+			break
+		}
+	}
+	return v4, v6
+}
+
+func isPublicIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(ip.String())
+	if err != nil {
+		return false
+	}
+	if !ip.IsGlobalUnicast() ||
+		ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return false
+	}
+	for _, prefix := range blockedPublicIPPrefixes {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+var blockedPublicIPPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
 }
 
 func resolverList(custom string, v4 bool) []string {
