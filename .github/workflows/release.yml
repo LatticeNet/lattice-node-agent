@@ -26,6 +26,12 @@ jobs:
           - goos: linux
             goarch: arm64
             artifact: lattice-agent-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            artifact: lattice-agent-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            artifact: lattice-agent-darwin-arm64
     steps:
       - name: validate release ref
         run: |
@@ -120,6 +126,8 @@ jobs:
           Artifacts:
           - lattice-agent-linux-amd64
           - lattice-agent-linux-arm64
+          - lattice-agent-darwin-amd64
+          - lattice-agent-darwin-arm64
           - SHA256SUMS
 
           Use the matching binary URL and SHA-256 digest in Lattice agent update policies. The binary reports version $VERSION through -version."
