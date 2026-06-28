@@ -27,6 +27,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
+	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -112,6 +113,8 @@ type agentConfig struct {
 	ProxyUsageXrayAPI     string
 	ProxyUsageXrayBin     string
 	ProxyUsageXrayPattern string
+	SingBoxDiscover       bool
+	SingBoxBin            string
 	LogStateDir           string
 }
 
@@ -171,6 +174,8 @@ func main() {
 	flag.StringVar(&cfg.ProxyUsageXrayAPI, "proxy-usage-xray-api", os.Getenv("LATTICE_PROXY_USAGE_XRAY_API"), "optional loopback host:port of the xray API inbound; the agent runs `xray api statsquery` against it each interval (no new dependency; see ADR-003)")
 	flag.StringVar(&cfg.ProxyUsageXrayBin, "proxy-usage-xray-bin", os.Getenv("LATTICE_PROXY_USAGE_XRAY_BIN"), "xray binary for -proxy-usage-xray-api (default \"xray\" resolved on PATH)")
 	flag.StringVar(&cfg.ProxyUsageXrayPattern, "proxy-usage-xray-pattern", os.Getenv("LATTICE_PROXY_USAGE_XRAY_PATTERN"), "optional stat-name filter for -proxy-usage-xray-api (default \"user>>>\")")
+	flag.BoolVar(&cfg.SingBoxDiscover, "singbox-discover", os.Getenv("LATTICE_SINGBOX_DISCOVER") == "1", "report on-box sing-box nodes each interval by running read-only `sb --json list` (adoption bridge; read-only, no node mutation)")
+	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.Parse()
@@ -291,6 +296,9 @@ func main() {
 		}
 		if err := reportProxyUsage(cfg); err != nil {
 			log.Printf("proxy usage error: %v", err)
+		}
+		if err := reportSingBoxInventory(cfg); err != nil {
+			log.Printf("singbox discover error: %v", err)
 		}
 		if err := runTasks(cfg, runner); err != nil {
 			log.Printf("task poll error: %v", err)
@@ -767,6 +775,34 @@ func reportProxyUsageCollectorHealth(cfg agentConfig, source, status string, cau
 	return postAgentJSON(cfg, "/api/agent/proxy-usage", map[string]any{
 		"snapshot": snapshot,
 	}, nil)
+}
+
+// reportSingBoxInventory runs read-only on-box sing-box discovery (`sb --json
+// list`) and reports the result so the control plane can see proxies that exist
+// on the machine but are managed out-of-band (the adoption bridge). Opt-in via
+// -singbox-discover; a discovery failure is reported as a status=error inventory
+// (so the dashboard shows the failure) and also returned for logging.
+func reportSingBoxInventory(cfg agentConfig) error {
+	if !cfg.SingBoxDiscover {
+		return nil
+	}
+	inv, derr := singboxdiscover.Discover(context.Background(), singboxdiscover.Source{
+		Binary: cfg.SingBoxBin,
+		Addr:   cfg.PublicIP,
+	}, cfg.NodeID)
+	// Always post what we have (ok list OR error status); the post error, if any,
+	// is combined with any discovery error for the caller's log.
+	postErr := postAgentJSON(cfg, "/api/agent/singbox-inventory", map[string]any{
+		"inventory": inv,
+	}, nil)
+	switch {
+	case derr != nil && postErr != nil:
+		return fmt.Errorf("%w; report failed: %v", derr, postErr)
+	case derr != nil:
+		return derr
+	default:
+		return postErr
+	}
 }
 
 func boundedProxyUsageError(err error) string {
