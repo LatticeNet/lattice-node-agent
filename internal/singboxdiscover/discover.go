@@ -12,7 +12,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +43,11 @@ type Source struct {
 	Now func() time.Time
 	// runner is a test seam; production uses runBoundedCommand.
 	runner func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// runtimeFiles/readFile are test seams for the sing-box runtime config
+	// fallback. Production discovers files from the running process/system
+	// defaults and reads them directly.
+	runtimeFiles func() []string
+	readFile     func(string) ([]byte, error)
 }
 
 // Discover runs `sb --json list` (and `sb --json provision` for the core
@@ -77,6 +86,9 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 	out, err := run(listCtx, binary, append(append([]string(nil), base...), "list")...)
 	cancel()
 	if err != nil {
+		if fallback, fallbackErr := discoverRuntimeConfig(source, nodeID, at); fallbackErr == nil {
+			return fallback, nil
+		}
 		inv.Status = "error"
 		inv.Error = boundedErr(err)
 		return inv, err
@@ -87,6 +99,9 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 		Nodes []model.SingBoxNode `json:"nodes"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out), &listResp); err != nil {
+		if fallback, fallbackErr := discoverRuntimeConfig(source, nodeID, at); fallbackErr == nil {
+			return fallback, nil
+		}
 		inv.Status = "error"
 		inv.Error = "decode list: " + boundedErr(err)
 		return inv, fmt.Errorf("decode sb list: %w", err)
@@ -108,6 +123,216 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 		}
 	}
 	return inv, nil
+}
+
+func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.SingBoxInventory, error) {
+	filesFn := source.runtimeFiles
+	if filesFn == nil {
+		filesFn = singBoxRuntimeConfigFiles
+	}
+	readFn := source.readFile
+	if readFn == nil {
+		readFn = os.ReadFile
+	}
+	files := filesFn()
+	if len(files) == 0 {
+		return model.SingBoxInventory{}, fmt.Errorf("no sing-box runtime config files found")
+	}
+	inv := model.SingBoxInventory{NodeID: nodeID, At: at.UTC(), Status: "ok", Nodes: []model.SingBoxNode{}}
+	for _, path := range files {
+		raw, err := readFn(path)
+		if err != nil {
+			continue
+		}
+		nodes, err := parseSingBoxRuntimeConfig(path, raw, strings.TrimSpace(source.Addr))
+		if err != nil {
+			continue
+		}
+		inv.Nodes = append(inv.Nodes, nodes...)
+	}
+	if inv.Nodes == nil {
+		inv.Nodes = []model.SingBoxNode{}
+	}
+	return inv, nil
+}
+
+func singBoxRuntimeConfigFiles() []string {
+	seen := map[string]bool{}
+	var out []string
+	addFile := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || !filepath.IsAbs(path) {
+			return
+		}
+		clean := filepath.Clean(path)
+		if seen[clean] {
+			return
+		}
+		if st, err := os.Stat(clean); err == nil && !st.IsDir() {
+			seen[clean] = true
+			out = append(out, clean)
+		}
+	}
+	addDir := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || !filepath.IsAbs(path) {
+			return
+		}
+		matches, _ := filepath.Glob(filepath.Join(filepath.Clean(path), "*.json"))
+		sort.Strings(matches)
+		for _, match := range matches {
+			addFile(match)
+		}
+	}
+	for _, args := range singBoxProcessArgs() {
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			switch arg {
+			case "-c", "--config":
+				if i+1 < len(args) {
+					i++
+					addFile(args[i])
+				}
+			case "-C", "--config-directory":
+				if i+1 < len(args) {
+					i++
+					addDir(args[i])
+				}
+			default:
+				if value, ok := strings.CutPrefix(arg, "-c="); ok {
+					addFile(value)
+				}
+				if value, ok := strings.CutPrefix(arg, "--config="); ok {
+					addFile(value)
+				}
+				if value, ok := strings.CutPrefix(arg, "-C="); ok {
+					addDir(value)
+				}
+				if value, ok := strings.CutPrefix(arg, "--config-directory="); ok {
+					addDir(value)
+				}
+			}
+		}
+	}
+	addFile("/etc/sing-box/config.json")
+	addDir("/etc/sing-box/conf")
+	return out
+}
+
+func singBoxProcessArgs() [][]string {
+	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	var out [][]string
+	for _, path := range matches {
+		raw, err := os.ReadFile(path)
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		parts := bytes.Split(bytes.TrimRight(raw, "\x00"), []byte{0})
+		args := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if len(part) > 0 {
+				args = append(args, string(part))
+			}
+		}
+		if len(args) == 0 {
+			continue
+		}
+		base := filepath.Base(args[0])
+		if strings.Contains(base, "sing-box") && containsArg(args, "run") {
+			out = append(out, args)
+		}
+	}
+	return out
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+type singBoxRuntimeConfig struct {
+	Inbounds []singBoxRuntimeInbound `json:"inbounds"`
+}
+
+type singBoxRuntimeInbound struct {
+	Tag        string                 `json:"tag"`
+	Type       string                 `json:"type"`
+	Listen     string                 `json:"listen"`
+	ListenPort int                    `json:"listen_port"`
+	Users      []json.RawMessage      `json:"users"`
+	TLS        *singBoxRuntimeTLS     `json:"tls"`
+	Transport  *singBoxRuntimeNetwork `json:"transport"`
+}
+
+type singBoxRuntimeNetwork struct {
+	Type string `json:"type"`
+}
+
+type singBoxRuntimeTLS struct {
+	Enabled    bool                   `json:"enabled"`
+	ServerName string                 `json:"server_name"`
+	Reality    *singBoxRuntimeReality `json:"reality"`
+}
+
+type singBoxRuntimeReality struct {
+	Enabled   bool                         `json:"enabled"`
+	Handshake *singBoxRuntimeRealityTarget `json:"handshake"`
+}
+
+type singBoxRuntimeRealityTarget struct {
+	Server string `json:"server"`
+}
+
+func parseSingBoxRuntimeConfig(path string, raw []byte, addr string) ([]model.SingBoxNode, error) {
+	var cfg singBoxRuntimeConfig
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
+		return nil, err
+	}
+	nodes := make([]model.SingBoxNode, 0, len(cfg.Inbounds))
+	for _, in := range cfg.Inbounds {
+		if strings.TrimSpace(in.Type) == "" && strings.TrimSpace(in.Tag) == "" && in.ListenPort == 0 {
+			continue
+		}
+		name := strings.TrimSpace(in.Tag)
+		if name == "" {
+			name = filepath.Base(path)
+		}
+		network := ""
+		if in.Transport != nil {
+			network = strings.TrimSpace(in.Transport.Type)
+		}
+		sni := ""
+		if in.TLS != nil {
+			sni = strings.TrimSpace(in.TLS.ServerName)
+			if sni == "" && in.TLS.Reality != nil && in.TLS.Reality.Handshake != nil {
+				sni = strings.TrimSpace(in.TLS.Reality.Handshake.Server)
+			}
+			if network == "" && in.TLS.Reality != nil && in.TLS.Reality.Enabled {
+				network = "reality"
+			}
+		}
+		if network == "" {
+			network = "tcp"
+		}
+		port := ""
+		if in.ListenPort > 0 {
+			port = strconv.Itoa(in.ListenPort)
+		}
+		nodes = append(nodes, model.SingBoxNode{
+			Name:     name,
+			Protocol: strings.TrimSpace(in.Type),
+			Network:  network,
+			Address:  addr,
+			Port:     port,
+			SNI:      sni,
+			Host:     strings.TrimSpace(in.Listen),
+		})
+	}
+	return nodes, nil
 }
 
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {

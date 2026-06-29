@@ -51,6 +51,7 @@ func TestDiscoverListFailureReportsErrorStatus(t *testing.T) {
 			}
 			return []byte(`{}`), nil
 		},
+		runtimeFiles: func() []string { return nil },
 	}
 	inv, err := Discover(context.Background(), src, "node-y")
 	if err == nil {
@@ -61,6 +62,55 @@ func TestDiscoverListFailureReportsErrorStatus(t *testing.T) {
 	}
 	if !strings.Contains(inv.Error, "command not found") {
 		t.Fatalf("error not surfaced: %q", inv.Error)
+	}
+}
+
+func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
+	files := map[string]string{
+		"/etc/sing-box/config.json": `{"log":{},"outbounds":[]}`,
+		"/etc/sing-box/conf/VLESS-REALITY-31001.json": `{
+			"inbounds":[{
+				"tag":"VLESS-REALITY-31001.json",
+				"type":"vless",
+				"listen":"::",
+				"listen_port":31001,
+				"users":[{"uuid":"redacted"}],
+				"tls":{
+					"enabled":true,
+					"server_name":"www.cloudflare.com",
+					"reality":{"enabled":true,"handshake":{"server":"www.cloudflare.com","server_port":443}}
+				}
+			}]
+		}`,
+	}
+	src := Source{
+		Addr: "64.186.227.5",
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if args[len(args)-1] == "list" {
+				return nil, errors.New("sing-box: unknown flag --json")
+			}
+			return []byte(`{}`), nil
+		},
+		runtimeFiles: func() []string {
+			return []string{"/etc/sing-box/config.json", "/etc/sing-box/conf/VLESS-REALITY-31001.json"}
+		},
+		readFile: func(path string) ([]byte, error) {
+			return []byte(files[path]), nil
+		},
+	}
+	inv, err := Discover(context.Background(), src, "node-runtime")
+	if err != nil {
+		t.Fatalf("Discover fallback: %v", err)
+	}
+	if inv.Status != "ok" || len(inv.Nodes) != 1 {
+		t.Fatalf("unexpected inventory: %+v", inv)
+	}
+	n := inv.Nodes[0]
+	if n.Name != "VLESS-REALITY-31001.json" || n.Protocol != "vless" || n.Network != "reality" || n.Port != "31001" || n.Address != "64.186.227.5" || n.SNI != "www.cloudflare.com" {
+		t.Fatalf("runtime node parse wrong: %+v", n)
+	}
+	if n.ShareURL != "" || n.PublicKey != "" {
+		t.Fatalf("runtime fallback must not invent credential-bearing fields: %+v", n)
 	}
 }
 
