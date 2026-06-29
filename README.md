@@ -187,6 +187,29 @@ monotonic diffing, eligibility filtering, quota state, and audit as the
 authoritative layer. Direct sing-box/xray gRPC adapters can reuse this parser
 later without changing the server ingest contract.
 
+## On-box sing-box discovery
+
+`-singbox-discover` / `LATTICE_SINGBOX_DISCOVER=1` reports existing sing-box
+inbounds to `/api/agent/singbox-inventory` without enabling generic task
+execution. This is the read-only adoption path for machines that already run VPN
+configs outside Lattice.
+
+Discovery order:
+
+1. Try the 233boy management interface, `sb --json list`, plus best-effort
+   `sb --json provision` for version metadata.
+2. If that interface is missing or returns non-JSON, fall back to parsing the
+   running standard sing-box config set. The agent discovers `sing-box run`
+   arguments from `/proc/*/cmdline`, honors `-c/--config` and
+   `-C/--config-directory`, then falls back to `/etc/sing-box/config.json` and
+   `/etc/sing-box/conf/*.json`.
+
+The runtime-config fallback emits only safe inbound metadata: tag/name, protocol,
+network, public address, port, SNI, and listen host. It does not emit private
+keys or invent credential-bearing share URLs from raw config files. Nodes that
+run with `-allow-exec=false` should use this discovery path instead of dashboard
+manual probe tasks.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.
