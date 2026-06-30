@@ -210,6 +210,16 @@ keys or invent credential-bearing share URLs from raw config files. Nodes that
 run with `-allow-exec=false` should use this discovery path instead of dashboard
 manual probe tasks.
 
+Dashboard manual probe is different from continuous discovery: it queues a
+bounded task and asks the on-box `sb --json list/provision` interface first,
+then falls back to parsing the running sing-box config set. Older management
+scripts may print human error text before fallback JSON (for example when
+`--addr` is unsupported); the server parser extracts the first JSON object from
+each probe section and records a bounded error summary plus the task id when the
+probe still fails. Full stdout/stderr stay in Task History so operators can
+debug incompatible local sing-box layouts without losing the last good
+continuous-discovery inventory.
+
 ## Installer-persisted launch profile
 
 The dashboard's enroll and reconfigure commands set lattice-agent startup
@@ -233,6 +243,21 @@ keeps the same behavior after restart:
 If a task-backed dashboard action reports `agent task execution disabled`, rerun
 the node detail page's generated reconfigure command with `allow_exec=true`
 instead of enrolling the same machine as a second node.
+
+Agent 0.2.7+ reports a non-secret `agent_runtime` object with every metrics
+heartbeat. The dashboard uses it as runtime proof for exec/root/terminal
+transport/ssh-alert/sing-box-discovery state, while `agent_launch` remains only
+the saved desired installer profile. A node can therefore show three distinct
+states: runtime now, saved desired, and unsaved local draft.
+
+Terminal transport modes:
+
+- `poll` is the legacy HTTP store-and-forward path. It is slower but works with
+  older agents and avoids a long-lived browser-to-agent stream.
+- `stream` attaches the browser WebSocket to an agent-dialed WebSocket bridge.
+  It is lower latency and better for interactive shells. Browser paste is
+  handled through a single xterm paste path so native paste events and
+  Cmd/Ctrl+Shift+V do not duplicate input; bracketed paste is still honored.
 
 Default Linux install layout:
 
