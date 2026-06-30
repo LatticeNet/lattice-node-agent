@@ -227,10 +227,15 @@ if have curl; then dl() { curl -fsSL "$1" -o "$2"; }
 elif have wget; then dl() { wget -qO "$2" "$1"; }
 else die "need curl or wget to download the agent"; fi
 
-# checksum tool (sha256sum on Linux, shasum on macOS/BSD)
+# checksum tool (sha256sum on Linux, shasum on macOS/BSD, sha256 on FreeBSD)
 if have sha256sum; then sumcheck() { grep " $1\$" "$2" | sha256sum -c - ; }
 elif have shasum;   then sumcheck() { grep " $1\$" "$2" | shasum -a 256 -c - ; }
-else sumcheck() { log "no sha256 tool; skipping checksum verification"; return 0; }; fi
+elif have sha256;   then sumcheck() {
+  expected="$(awk -v name="$1" '$2 == name { print $1; found = 1 } END { if (!found) exit 1 }' "$2")" || return 1
+  actual="$(sha256 -q "$1")" || return 1
+  [ "$actual" = "$expected" ]
+}
+else die "need sha256sum, shasum, or sha256 to verify release checksums"; fi
 
 have install || die "missing required command: install"
 
@@ -258,7 +263,7 @@ if dl "$base/SHA256SUMS" "$tmp_dir/SHA256SUMS" 2>/dev/null; then
   ( cd "$tmp_dir" && sumcheck "$artifact" SHA256SUMS ) || die "checksum verification failed"
   ok "checksum verified"
 else
-  log "SHA256SUMS not available; proceeding without checksum"
+  die "SHA256SUMS not available; refusing to install without checksum manifest"
 fi
 
 # Upgrade in place: stop a running instance before replacing the binary.

@@ -33,6 +33,9 @@ jobs:
       - name: release workflow contract
         working-directory: lattice-node-agent
         run: sh scripts/check-release-workflow.sh
+      - name: install integrity contract
+        working-directory: lattice-node-agent
+        run: sh scripts/test-install-integrity.sh
       - name: vet
         working-directory: lattice-node-agent
         run: go vet ./...
