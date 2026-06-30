@@ -227,6 +227,11 @@ behavior through environment variables. `scripts/install.sh` persists these into
 `/opt/lattice/lattice-agent.env` (or the platform equivalent) so the service
 keeps the same behavior after restart:
 
+The installer downloads release artifacts only when it can also download
+`SHA256SUMS` and verify the selected binary with `sha256sum`, `shasum`, or
+FreeBSD `sha256`. Missing checksum tooling or a missing checksum manifest aborts
+the install before the binary is written.
+
 - `LATTICE_AGENT_ALLOW_EXEC=1` enables bounded task execution.
 - `LATTICE_AGENT_ALLOW_ROOT_EXEC=1` permits task execution while the agent runs
   as root.
