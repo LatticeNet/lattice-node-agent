@@ -52,6 +52,7 @@ const (
 	// In-band opcode prefix on browser->agent frames (agent->browser is raw bytes).
 	terminalOpcodeStdin  = 0x00 // payload[1:] written verbatim to the PTY
 	terminalOpcodeResize = 0x01 // payload[1:] is JSON {"cols":N,"rows":M}
+	terminalOpcodeClose  = 0x02 // browser requested an orderly PTY close
 	// terminalOpcodeResume carries the absolute count of output bytes the browser
 	// has already rendered (decimal ASCII). The agent replays only output beyond
 	// that offset from its ring, so a reconnect resumes without re-rendering or
@@ -471,6 +472,10 @@ func (r *terminalRunner) pumpInput(conn *websocket.Conn, ptmx *os.File, sink *st
 				}
 				touch()
 			}
+		case terminalOpcodeClose:
+			touch()
+			_ = ptmx.Close()
+			return
 		default:
 			debugf(r.cfg, "terminal stream unknown opcode 0x%02x: session=%s", payload[0], r.session.ID)
 		}
