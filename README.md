@@ -210,6 +210,30 @@ keys or invent credential-bearing share URLs from raw config files. Nodes that
 run with `-allow-exec=false` should use this discovery path instead of dashboard
 manual probe tasks.
 
+## Installer-persisted launch profile
+
+The dashboard's enroll and reconfigure commands set lattice-agent startup
+behavior through environment variables. `scripts/install.sh` persists these into
+`/opt/lattice/lattice-agent.env` (or the platform equivalent) so the service
+keeps the same behavior after restart:
+
+- `LATTICE_AGENT_ALLOW_EXEC=1` enables bounded task execution.
+- `LATTICE_AGENT_ALLOW_ROOT_EXEC=1` permits task execution while the agent runs
+  as root.
+- `LATTICE_NO_EXEC=1` is the hard kill switch and overrides execution/terminal
+  enablement.
+- `LATTICE_AGENT_ALLOW_TERMINAL=1` enables audited browser terminal sessions.
+- `LATTICE_TERMINAL_TRANSPORT=poll|stream` selects the terminal transport.
+- `LATTICE_SSH_ALERTS=1` reports accepted sshd logins.
+- `LATTICE_SINGBOX_DISCOVER=1` and `LATTICE_SINGBOX_BIN=sb` enable sing-box
+  discovery.
+- `LATTICE_PROXY_USAGE_FILE`, `LATTICE_PROXY_USAGE_URL`, and
+  `LATTICE_PROXY_USAGE_XRAY_API` configure proxy usage reporting sources.
+
+If a task-backed dashboard action reports `agent task execution disabled`, rerun
+the node detail page's generated reconfigure command with `allow_exec=true`
+instead of enrolling the same machine as a second node.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.
