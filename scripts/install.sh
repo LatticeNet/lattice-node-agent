@@ -17,8 +17,9 @@ token="${LATTICE_NODE_TOKEN:-}"
 bin_path="${LATTICE_AGENT_BIN:-$LATTICE_HOME/lattice-agent}"
 env_path="${LATTICE_AGENT_ENV:-$LATTICE_HOME/lattice-agent.env}"
 state_dir="${LATTICE_AGENT_STATE:-$LATTICE_HOME/state}"
-service_name="lattice-agent"
+service_name="${LATTICE_AGENT_SERVICE:-lattice-agent}"
 action="install"
+input_node_id="$node_id"
 
 for a in "$@"; do
   case "$a" in
@@ -65,6 +66,7 @@ if [ "$(id -u)" -ne 0 ]; then
       LATTICE_HOME="$LATTICE_HOME" LATTICE_AGENT_REPO="$repo" LATTICE_AGENT_VERSION="$version" \
       LATTICE_SERVER="$server" LATTICE_NODE_ID="$node_id" LATTICE_NODE_TOKEN="$token" \
       LATTICE_AGENT_BIN="$bin_path" LATTICE_AGENT_ENV="$env_path" LATTICE_AGENT_STATE="$state_dir" \
+      LATTICE_AGENT_SERVICE="$service_name" \
       LATTICE_AGENT_ALLOW_EXEC="${LATTICE_AGENT_ALLOW_EXEC:-}" \
       LATTICE_AGENT_ALLOW_ROOT_EXEC="${LATTICE_AGENT_ALLOW_ROOT_EXEC:-}" \
       LATTICE_NO_EXEC="${LATTICE_NO_EXEC:-}" \
@@ -82,6 +84,108 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
   die "please re-run as root (e.g. sudo sh $0)"
 fi
+
+# ---- existing install adoption ---------------------------------------------
+# New installs use:
+#   binary:  /opt/lattice/lattice-agent
+#   env:     /opt/lattice/lattice-agent.env
+#   service: lattice-agent.service
+#
+# Older beta nodes used:
+#   binary:  /opt/lattice/node-agent/lattice-agent
+#   env:     /opt/lattice/node-agent/agent.env
+#   service: lattice-node-agent.service
+#
+# Re-running the installer must upgrade the service that is already installed
+# instead of creating a second agent for the same machine. Explicit env values
+# (LATTICE_AGENT_BIN, LATTICE_AGENT_ENV, LATTICE_AGENT_SERVICE, etc.) still win.
+read_env_value() {
+  key="$1"
+  file="$2"
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "$file"
+    set +a
+    eval "printf '%s' \"\${$key:-}\""
+  ) 2>/dev/null || true
+}
+
+detect_systemd_install() {
+  [ "$os" = "linux" ] || return 0
+  have systemctl || return 0
+  [ -d /run/systemd/system ] || return 0
+  [ -z "${LATTICE_AGENT_SERVICE:-}" ] || return 0
+
+  for candidate in lattice-agent lattice-node-agent; do
+    unit="/etc/systemd/system/${candidate}.service"
+    [ -f "$unit" ] || continue
+    detected_bin="$(sed -n 's/^ExecStart=//p' "$unit" | sed -n '1p' | awk '{print $1}')"
+    case "$detected_bin" in
+      */lattice-agent) ;;
+      *) continue ;;
+    esac
+    service_name="$candidate"
+    [ -n "${LATTICE_AGENT_BIN:-}" ] || bin_path="$detected_bin"
+    if [ -z "${LATTICE_AGENT_ENV:-}" ]; then
+      detected_env="$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$unit" | sed -n '1p' | awk '{print $1}')"
+      [ -n "$detected_env" ] && env_path="$detected_env"
+    fi
+    if [ -z "${LATTICE_AGENT_STATE:-}" ] && [ "$env_path" = "/opt/lattice/node-agent/agent.env" ]; then
+      state_dir="/opt/lattice/node-agent/state"
+    fi
+    log "adopting existing service ${service_name}.service"
+    log "effective binary -> $bin_path"
+    log "effective env -> $env_path"
+    return 0
+  done
+}
+
+load_existing_config() {
+  existing_env=""
+  for candidate in "$env_path" "$LATTICE_HOME/lattice-agent.env" "/opt/lattice/node-agent/agent.env"; do
+    [ -f "$candidate" ] || continue
+    existing_env="$candidate"
+    break
+  done
+  [ -n "$existing_env" ] || return 0
+
+  existing_server="$(read_env_value LATTICE_SERVER "$existing_env")"
+  existing_node_id="$(read_env_value LATTICE_NODE_ID "$existing_env")"
+  existing_token="$(read_env_value LATTICE_NODE_TOKEN "$existing_env")"
+  log "loading existing credentials/config -> $existing_env"
+
+  [ -n "$server" ] || server="$existing_server"
+  [ -n "$node_id" ] || node_id="$existing_node_id"
+  if [ -n "$input_node_id" ] && [ -n "$existing_node_id" ] && [ "$input_node_id" != "$existing_node_id" ] && [ -n "$existing_token" ]; then
+    if [ -z "$token" ] || [ "$token" = "$existing_token" ]; then
+      die "existing token belongs to node $existing_node_id but this command targets $input_node_id; use the correct node reconfigure command or provide a matching LATTICE_NODE_TOKEN"
+    fi
+  fi
+  if [ -z "$token" ] && [ -n "$existing_token" ]; then
+    token="$existing_token"
+  fi
+
+  for key in \
+    LATTICE_AGENT_ALLOW_EXEC LATTICE_AGENT_ALLOW_ROOT_EXEC LATTICE_NO_EXEC \
+    LATTICE_AGENT_ALLOW_TERMINAL LATTICE_TERMINAL_TRANSPORT LATTICE_IP_MODE \
+    LATTICE_IP_RESOLVERS LATTICE_IP_SCRIPT LATTICE_PUBLIC_IP LATTICE_PUBLIC_IP6 \
+    LATTICE_SSH_ALERTS LATTICE_SINGBOX_DISCOVER LATTICE_SINGBOX_BIN \
+    LATTICE_PROXY_USAGE_FILE LATTICE_PROXY_USAGE_URL LATTICE_PROXY_USAGE_XRAY_API \
+    LATTICE_PROXY_USAGE_XRAY_BIN LATTICE_PROXY_USAGE_XRAY_PATTERN
+  do
+    eval "current=\${$key:-}"
+    [ -z "$current" ] || continue
+    existing_value="$(read_env_value "$key" "$existing_env")"
+    [ -n "$existing_value" ] || continue
+    export "$key=$existing_value"
+  done
+}
+
+detect_systemd_install
+unit_path="${LATTICE_AGENT_UNIT:-/etc/systemd/system/${service_name}.service}"
+openrc_path="/etc/init.d/${service_name}"
+load_existing_config
 
 # ---- service helpers (systemd / openrc / launchd) --------------------------
 svc_kind() {

@@ -234,6 +234,22 @@ If a task-backed dashboard action reports `agent task execution disabled`, rerun
 the node detail page's generated reconfigure command with `allow_exec=true`
 instead of enrolling the same machine as a second node.
 
+Default Linux install layout:
+
+- Binary: `/opt/lattice/lattice-agent`
+- Environment file: `/opt/lattice/lattice-agent.env`
+- State directory: `/opt/lattice/state`
+- systemd unit: `lattice-agent.service`
+
+Legacy beta nodes may still use `/opt/lattice/node-agent/lattice-agent`,
+`/opt/lattice/node-agent/agent.env`, and `lattice-node-agent.service`. The
+installer adopts that existing service and env file when rerun, preserving the
+node token and upgrading the binary that systemd actually starts. This avoids
+creating a duplicate agent under the canonical path. If a reconfigure command
+targets a different node id than the token stored in the existing env file, the
+installer refuses to run rather than cross-wiring one node's token to another
+node id.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.
