@@ -118,6 +118,23 @@ type agentConfig struct {
 	LogStateDir           string
 }
 
+type agentRuntimePayload struct {
+	AllowExec             bool      `json:"allow_exec"`
+	AllowRootExec         bool      `json:"allow_root_exec"`
+	NoExec                bool      `json:"no_exec"`
+	AllowTerminal         bool      `json:"allow_terminal"`
+	TerminalTransport     string    `json:"terminal_transport,omitempty"`
+	SSHAlerts             bool      `json:"ssh_alerts"`
+	SingBoxDiscover       bool      `json:"singbox_discover"`
+	SingBoxBin            string    `json:"singbox_bin,omitempty"`
+	ProxyUsageFile        string    `json:"proxy_usage_file,omitempty"`
+	ProxyUsageURL         string    `json:"proxy_usage_url,omitempty"`
+	ProxyUsageXrayAPI     string    `json:"proxy_usage_xray_api,omitempty"`
+	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
+	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
+	ReportedAt            time.Time `json:"reported_at,omitempty"`
+}
+
 func main() {
 	// If this process was re-executed as the task-execution rlimit shim, handle
 	// it before anything else: the shim applies resource limits and execs the
@@ -530,7 +547,23 @@ func reportMetrics(cfg agentConfig) error {
 	facts := hostfacts.Collect()
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
-		"version":       version,
+		"version": version,
+		"agent_runtime": agentRuntimePayload{
+			AllowExec:             cfg.AllowExec,
+			AllowRootExec:         cfg.AllowRoot,
+			NoExec:                cfg.NoExec,
+			AllowTerminal:         cfg.AllowTerminal,
+			TerminalTransport:     effectiveTerminalTransport(cfg.TerminalTransport),
+			SSHAlerts:             cfg.SSHAlerts,
+			SingBoxDiscover:       cfg.SingBoxDiscover,
+			SingBoxBin:            cfg.SingBoxBin,
+			ProxyUsageFile:        cfg.ProxyUsageFile,
+			ProxyUsageURL:         cfg.ProxyUsageURL,
+			ProxyUsageXrayAPI:     cfg.ProxyUsageXrayAPI,
+			ProxyUsageXrayBin:     cfg.ProxyUsageXrayBin,
+			ProxyUsageXrayPattern: cfg.ProxyUsageXrayPattern,
+			ReportedAt:            time.Now().UTC(),
+		},
 		"public_ip":     cfg.PublicIP,
 		"public_ipv6":   cfg.PublicIPv6,
 		"internal_ip":   cfg.InternalIP,
