@@ -255,9 +255,13 @@ Terminal transport modes:
 - `poll` is the legacy HTTP store-and-forward path. It is slower but works with
   older agents and avoids a long-lived browser-to-agent stream.
 - `stream` attaches the browser WebSocket to an agent-dialed WebSocket bridge.
-  It is lower latency and better for interactive shells. Browser paste is
-  handled through a single xterm paste path so native paste events and
-  Cmd/Ctrl+Shift+V do not duplicate input; bracketed paste is still honored.
+  It is lower latency and better for interactive shells. The agent keeps the PTY
+  alive across short WebSocket drops, redials the server, and replays recent
+  output from a bounded ring using the browser's rendered byte offset.
+  Browser paste is handled through a single xterm paste path so native paste
+  events and Cmd/Ctrl+Shift+V do not duplicate input; bracketed paste is still
+  honored. Explicit dashboard close sends a stream close control frame so the
+  node-side PTY is torn down immediately instead of waiting for detach cleanup.
 
 Default Linux install layout:
 
