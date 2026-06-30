@@ -140,7 +140,7 @@ func DecodeUsageSnapshot(data []byte, nodeID string, now time.Time) (model.Proxy
 	if raw, ok := top["stat"]; ok {
 		return decodeV2RayStats(raw, nodeID, now)
 	}
-	if _, ok := top["user_bytes"]; ok || top["core_uptime_sec"] != nil || top["at"] != nil {
+	if _, ok := top["user_bytes"]; ok || top["line_user_bytes"] != nil || top["core_uptime_sec"] != nil || top["at"] != nil {
 		var snapshot model.ProxyUsageSnapshot
 		if err := json.Unmarshal(data, &snapshot); err != nil {
 			return model.ProxyUsageSnapshot{}, err

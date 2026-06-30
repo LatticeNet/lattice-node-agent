@@ -62,6 +62,14 @@ func TestDecodeUsageSnapshotDirectAndEnvelope(t *testing.T) {
 	if envelope.NodeID != "node-b" || envelope.UserBytes["bob"] != 7 {
 		t.Fatalf("unexpected envelope snapshot: %+v", envelope)
 	}
+	lineOnly, err := DecodeUsageSnapshot([]byte(`{"line_user_bytes":{" line-a ":{" alice ":3,"alice":4},"line-b":{"bob":5}}}`), "node-c", fixed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lineOnly.UserBytes["alice"] != 7 || lineOnly.UserBytes["bob"] != 5 ||
+		lineOnly.LineUserBytes["line-a"]["alice"] != 7 || lineOnly.LineUserBytes["line-b"]["bob"] != 5 {
+		t.Fatalf("unexpected line-only snapshot: %+v", lineOnly)
+	}
 }
 
 func TestDecodeUsageSnapshotV2RayStats(t *testing.T) {
@@ -89,6 +97,9 @@ func TestDecodeUsageSnapshotRejectsMalformedCounters(t *testing.T) {
 	cases := []string{
 		`{"user_bytes":{"alice":-1}}`,
 		`{"user_bytes":{"":1}}`,
+		`{"line_user_bytes":{"": {"alice": 1}}}`,
+		`{"line_user_bytes":{"line-a": {"": 1}}}`,
+		`{"line_user_bytes":{"line-a": {"alice": -1}}}`,
 		`{"stat":[{"name":"user>>>alice>>>traffic>>>uplink","value":-1}]}`,
 		`{"hello":"world"}`,
 	}
