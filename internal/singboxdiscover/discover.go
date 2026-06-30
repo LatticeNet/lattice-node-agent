@@ -138,17 +138,25 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 	if len(files) == 0 {
 		return model.SingBoxInventory{}, fmt.Errorf("no sing-box runtime config files found")
 	}
-	inv := model.SingBoxInventory{NodeID: nodeID, At: at.UTC(), Status: "ok", Nodes: []model.SingBoxNode{}}
+	configs := []singBoxRuntimeConfigFile{}
 	for _, path := range files {
 		raw, err := readFn(path)
 		if err != nil {
 			continue
 		}
-		nodes, err := parseSingBoxRuntimeConfig(path, raw, strings.TrimSpace(source.Addr))
-		if err != nil {
+		var cfg singBoxRuntimeConfig
+		if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
 			continue
 		}
-		inv.Nodes = append(inv.Nodes, nodes...)
+		configs = append(configs, singBoxRuntimeConfigFile{path: path, cfg: cfg})
+	}
+	if len(configs) == 0 {
+		return model.SingBoxInventory{}, fmt.Errorf("no readable sing-box runtime config files found")
+	}
+	routeMap := singBoxRouteMap(configs)
+	inv := model.SingBoxInventory{NodeID: nodeID, At: at.UTC(), Status: "ok", Nodes: []model.SingBoxNode{}}
+	for _, parsed := range configs {
+		inv.Nodes = append(inv.Nodes, parseSingBoxRuntimeConfig(parsed.path, parsed.cfg, routeMap, strings.TrimSpace(source.Addr))...)
 	}
 	if inv.Nodes == nil {
 		inv.Nodes = []model.SingBoxNode{}
@@ -256,6 +264,12 @@ func containsArg(args []string, want string) bool {
 
 type singBoxRuntimeConfig struct {
 	Inbounds []singBoxRuntimeInbound `json:"inbounds"`
+	Route    *singBoxRuntimeRoute    `json:"route"`
+}
+
+type singBoxRuntimeConfigFile struct {
+	path string
+	cfg  singBoxRuntimeConfig
 }
 
 type singBoxRuntimeInbound struct {
@@ -264,8 +278,19 @@ type singBoxRuntimeInbound struct {
 	Listen     string                 `json:"listen"`
 	ListenPort int                    `json:"listen_port"`
 	Users      []json.RawMessage      `json:"users"`
+	Lattice    map[string]any         `json:"_lattice"`
 	TLS        *singBoxRuntimeTLS     `json:"tls"`
 	Transport  *singBoxRuntimeNetwork `json:"transport"`
+}
+
+type singBoxRuntimeRoute struct {
+	Rules []singBoxRuntimeRouteRule `json:"rules"`
+}
+
+type singBoxRuntimeRouteRule struct {
+	Inbound  []string `json:"inbound"`
+	Outbound string   `json:"outbound"`
+	Action   string   `json:"action"`
 }
 
 type singBoxRuntimeNetwork struct {
@@ -287,11 +312,29 @@ type singBoxRuntimeRealityTarget struct {
 	Server string `json:"server"`
 }
 
-func parseSingBoxRuntimeConfig(path string, raw []byte, addr string) ([]model.SingBoxNode, error) {
-	var cfg singBoxRuntimeConfig
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
-		return nil, err
+func singBoxRouteMap(configs []singBoxRuntimeConfigFile) map[string]string {
+	routes := map[string]string{}
+	for _, parsed := range configs {
+		if parsed.cfg.Route == nil {
+			continue
+		}
+		for _, rule := range parsed.cfg.Route.Rules {
+			outbound := strings.TrimSpace(rule.Outbound)
+			if outbound == "" {
+				continue
+			}
+			for _, inbound := range rule.Inbound {
+				inbound = strings.TrimSpace(inbound)
+				if inbound != "" {
+					routes[inbound] = outbound
+				}
+			}
+		}
 	}
+	return routes
+}
+
+func parseSingBoxRuntimeConfig(path string, cfg singBoxRuntimeConfig, routeMap map[string]string, addr string) []model.SingBoxNode {
 	nodes := make([]model.SingBoxNode, 0, len(cfg.Inbounds))
 	for _, in := range cfg.Inbounds {
 		if strings.TrimSpace(in.Type) == "" && strings.TrimSpace(in.Tag) == "" && in.ListenPort == 0 {
@@ -323,16 +366,56 @@ func parseSingBoxRuntimeConfig(path string, raw []byte, addr string) ([]model.Si
 			port = strconv.Itoa(in.ListenPort)
 		}
 		nodes = append(nodes, model.SingBoxNode{
-			Name:     name,
-			Protocol: strings.TrimSpace(in.Type),
-			Network:  network,
-			Address:  addr,
-			Port:     port,
-			SNI:      sni,
-			Host:     strings.TrimSpace(in.Listen),
+			Name:        name,
+			Protocol:    strings.TrimSpace(in.Type),
+			Network:     network,
+			Address:     addr,
+			Port:        port,
+			SNI:         sni,
+			ListenHost:  strings.TrimSpace(in.Listen),
+			OutboundRef: routeMap[name],
+			UserCount:   len(in.Users),
+			UserKnown:   in.Users != nil,
+			Metadata:    singBoxRuntimeMetadata(in.Lattice),
 		})
 	}
-	return nodes, nil
+	return nodes
+}
+
+func singBoxRuntimeMetadata(value map[string]any) map[string]string {
+	if len(value) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for key, raw := range value {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		switch v := raw.(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				out[key] = strings.TrimSpace(v)
+			}
+		case map[string]any:
+			if key != "labels" {
+				continue
+			}
+			for lk, lv := range v {
+				labelKey := strings.TrimSpace(lk)
+				if labelKey == "" {
+					continue
+				}
+				if s, ok := lv.(string); ok && strings.TrimSpace(s) != "" {
+					out["label."+labelKey] = strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {

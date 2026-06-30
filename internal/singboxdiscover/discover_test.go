@@ -68,6 +68,9 @@ func TestDiscoverListFailureReportsErrorStatus(t *testing.T) {
 func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
 	files := map[string]string{
 		"/etc/sing-box/config.json": `{"log":{},"outbounds":[]}`,
+		"/etc/sing-box/conf/routes.json": `{
+			"route":{"rules":[{"inbound":["VLESS-REALITY-31001.json"],"action":"route","outbound":"[openjobs]-qqpw-vds1-vless"}]}
+		}`,
 		"/etc/sing-box/conf/VLESS-REALITY-31001.json": `{
 			"inbounds":[{
 				"tag":"VLESS-REALITY-31001.json",
@@ -75,6 +78,7 @@ func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
 				"listen":"::",
 				"listen_port":31001,
 				"users":[{"uuid":"redacted"}],
+				"_lattice":{"owner":"ops","labels":{"tier":"edge"}},
 				"tls":{
 					"enabled":true,
 					"server_name":"www.cloudflare.com",
@@ -92,7 +96,7 @@ func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
 			return []byte(`{}`), nil
 		},
 		runtimeFiles: func() []string {
-			return []string{"/etc/sing-box/config.json", "/etc/sing-box/conf/VLESS-REALITY-31001.json"}
+			return []string{"/etc/sing-box/config.json", "/etc/sing-box/conf/routes.json", "/etc/sing-box/conf/VLESS-REALITY-31001.json"}
 		},
 		readFile: func(path string) ([]byte, error) {
 			return []byte(files[path]), nil
@@ -108,6 +112,12 @@ func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
 	n := inv.Nodes[0]
 	if n.Name != "VLESS-REALITY-31001.json" || n.Protocol != "vless" || n.Network != "reality" || n.Port != "31001" || n.Address != "64.186.227.5" || n.SNI != "www.cloudflare.com" {
 		t.Fatalf("runtime node parse wrong: %+v", n)
+	}
+	if n.ListenHost != "::" || n.OutboundRef != "[openjobs]-qqpw-vds1-vless" || !n.UserKnown || n.UserCount != 1 {
+		t.Fatalf("runtime enrichment wrong: %+v", n)
+	}
+	if n.Metadata["owner"] != "ops" || n.Metadata["label.tier"] != "edge" {
+		t.Fatalf("runtime metadata wrong: %+v", n.Metadata)
 	}
 	if n.ShareURL != "" || n.PublicKey != "" {
 		t.Fatalf("runtime fallback must not invent credential-bearing fields: %+v", n)
