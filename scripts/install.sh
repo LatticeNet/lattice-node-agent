@@ -227,8 +227,8 @@ if [ -z "$server" ] || [ -z "$node_id" ] || [ -z "$token" ]; then
 fi
 
 # download tool (curl preferred, wget fallback)
-if have curl; then dl() { curl -fsSL "$1" -o "$2"; }
-elif have wget; then dl() { wget -qO "$2" "$1"; }
+if have curl; then dl() { curl -fsSL --proto '=https' --tlsv1.2 "$1" -o "$2"; }
+elif have wget; then dl() { wget --https-only -qO "$2" "$1"; }
 else die "need curl or wget to download the agent"; fi
 
 # checksum tool (sha256sum on Linux, shasum on macOS/BSD, sha256 on FreeBSD)

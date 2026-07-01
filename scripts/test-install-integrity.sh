@@ -102,4 +102,14 @@ if ! grep -Fq '"/etc/lattice/agent.env"' "$ROOT/scripts/install.sh"; then
   exit 1
 fi
 
+if ! grep -Fq "curl -fsSL --proto '=https' --tlsv1.2" "$ROOT/scripts/install.sh"; then
+  echo "installer curl downloader must refuse non-HTTPS redirects" >&2
+  exit 1
+fi
+
+if ! grep -Fq "wget --https-only -qO" "$ROOT/scripts/install.sh"; then
+  echo "installer wget downloader must refuse non-HTTPS redirects" >&2
+  exit 1
+fi
+
 printf 'install integrity contract ok\n'
