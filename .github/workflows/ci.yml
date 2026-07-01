@@ -24,9 +24,7 @@ jobs:
           check-latest: true
           cache: false
       - name: create workspace
-        run: |
-          go work init ./lattice-sdk ./lattice-node-agent
-          go work edit -replace=github.com/LatticeNet/lattice-sdk@v0.2.0=./lattice-sdk
+        run: go work init ./lattice-sdk ./lattice-node-agent
       - name: gofmt
         working-directory: lattice-node-agent
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)

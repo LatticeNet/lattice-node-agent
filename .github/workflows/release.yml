@@ -57,9 +57,7 @@ jobs:
           check-latest: true
           cache: false
       - name: create workspace
-        run: |
-          go work init ./lattice-sdk ./lattice-node-agent
-          go work edit -replace=github.com/LatticeNet/lattice-sdk@v0.2.0=./lattice-sdk
+        run: go work init ./lattice-sdk ./lattice-node-agent
       - name: build binary
         id: build
         working-directory: lattice-node-agent

@@ -28,6 +28,13 @@ require "actions/upload-artifact@v7" "Node 24-compatible artifact upload action"
 require "actions/download-artifact@v8" "Node 24-compatible artifact download action"
 require "lattice-agent-linux-amd64" "linux amd64 release binary"
 require "lattice-agent-linux-arm64" "linux arm64 release binary"
+require "lattice-agent-darwin-amd64" "darwin amd64 release binary"
+require "lattice-agent-darwin-arm64" "darwin arm64 release binary"
 require "SHA256SUMS" "combined checksum manifest"
 require '-X main.version=$VERSION' "release tag injected into agent -version"
 require "gh release" "GitHub Release publication"
+
+if grep -Fq -- "github.com/LatticeNet/lattice-sdk@v0.2.0" "$workflow"; then
+  echo "release workflow must not pin a stale lattice-sdk workspace replace" >&2
+  exit 1
+fi

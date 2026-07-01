@@ -309,11 +309,12 @@ go build ./cmd/lattice-agent
 
 ## Releases
 
-Push a `v*` tag to publish Linux binaries:
+Push a `v*` tag to publish Linux and Darwin binaries:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+NEXT_AGENT=v0.2.8
+git tag "$NEXT_AGENT"
+git push origin "$NEXT_AGENT"
 ```
 
 The release workflow builds:
@@ -321,6 +322,8 @@ The release workflow builds:
 ```txt
 lattice-agent-linux-amd64
 lattice-agent-linux-arm64
+lattice-agent-darwin-amd64
+lattice-agent-darwin-arm64
 SHA256SUMS
 ```
 
