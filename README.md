@@ -312,7 +312,7 @@ go build ./cmd/lattice-agent
 Push a `v*` tag to publish Linux and Darwin binaries:
 
 ```sh
-NEXT_AGENT=v0.2.8
+NEXT_AGENT=v0.2.9
 git tag "$NEXT_AGENT"
 git push origin "$NEXT_AGENT"
 ```
