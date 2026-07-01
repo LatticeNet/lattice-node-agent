@@ -73,10 +73,33 @@ func TestRunnerCapsOutput(t *testing.T) {
 		OutputLimit: 3,
 	})
 	if result.ExitCode != 0 {
-		t.Fatalf("expected success, got %#v", result)
+		t.Fatalf("expected script exit 0, got %#v", result)
 	}
 	if result.Stdout != "abc" {
 		t.Fatalf("expected capped stdout, got %q", result.Stdout)
+	}
+	if !strings.Contains(result.Error, "stdout exceeded task output limit") {
+		t.Fatalf("expected stdout truncation error, got %#v", result)
+	}
+}
+
+func TestRunnerReportsStderrTruncation(t *testing.T) {
+	r := Runner{AllowExec: true, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_1",
+		Interpreter: "sh",
+		Script:      "printf 'abcdef' >&2",
+		TimeoutSec:  5,
+		OutputLimit: 3,
+	})
+	if result.ExitCode != 0 {
+		t.Fatalf("expected script exit 0, got %#v", result)
+	}
+	if result.Stderr != "abc" {
+		t.Fatalf("expected capped stderr, got %q", result.Stderr)
+	}
+	if !strings.Contains(result.Error, "stderr exceeded task output limit") {
+		t.Fatalf("expected stderr truncation error, got %#v", result)
 	}
 }
 

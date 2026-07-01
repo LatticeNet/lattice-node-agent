@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -221,6 +222,13 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 			result.Error = err.Error()
 		}
 	}
+	if truncated := outputTruncationError(stdout, stderr); truncated != "" {
+		if result.Error != "" {
+			result.Error += "; " + truncated
+		} else {
+			result.Error = truncated
+		}
+	}
 	result.FinishedAt = time.Now().UTC()
 	return result
 }
@@ -237,8 +245,9 @@ func exitCode(err error) int {
 }
 
 type cappedBuffer struct {
-	buf   bytes.Buffer
-	limit int
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
@@ -246,13 +255,30 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	if remaining > 0 {
 		if len(p) > remaining {
 			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
 		} else {
 			_, _ = b.buf.Write(p)
 		}
+	} else if len(p) > 0 {
+		b.truncated = true
 	}
 	return len(p), nil
 }
 
 func (b *cappedBuffer) String() string {
 	return b.buf.String()
+}
+
+func outputTruncationError(stdout, stderr cappedBuffer) string {
+	var streams []string
+	if stdout.truncated {
+		streams = append(streams, "stdout")
+	}
+	if stderr.truncated {
+		streams = append(streams, "stderr")
+	}
+	if len(streams) == 0 {
+		return ""
+	}
+	return strings.Join(streams, " and ") + " exceeded task output limit; output truncated"
 }

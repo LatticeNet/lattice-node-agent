@@ -32,6 +32,10 @@ go run ./cmd/lattice-agent \
 
 `-allow-exec=false` is the safe default. Use `-allow-exec=true` only on nodes
 where remote script execution is acceptable.
+Task stdout and stderr are capped per task; if either stream exceeds the
+server-provided output limit, the agent returns the capped bytes and marks the
+task result with an explicit truncation error instead of reporting silent
+success.
 
 The node token is sent in the `Authorization: Bearer` header on every request.
 The loopback `http://127.0.0.1:8088` URL above is safe because the token never
