@@ -96,6 +96,10 @@ fi
 #   env:     /opt/lattice/node-agent/agent.env
 #   service: lattice-node-agent.service
 #
+# Earlier manual docs also showed /etc/lattice/agent.env. Adopt it when present
+# so those nodes can migrate into the current /opt/lattice layout without losing
+# their token during an installer re-run.
+#
 # Re-running the installer must upgrade the service that is already installed
 # instead of creating a second agent for the same machine. Explicit env values
 # (LATTICE_AGENT_BIN, LATTICE_AGENT_ENV, LATTICE_AGENT_SERVICE, etc.) still win.
@@ -143,7 +147,7 @@ detect_systemd_install() {
 
 load_existing_config() {
   existing_env=""
-  for candidate in "$env_path" "$LATTICE_HOME/lattice-agent.env" "/opt/lattice/node-agent/agent.env"; do
+  for candidate in "$env_path" "$LATTICE_HOME/lattice-agent.env" "/opt/lattice/node-agent/agent.env" "/etc/lattice/agent.env"; do
     [ -f "$candidate" ] || continue
     existing_env="$candidate"
     break

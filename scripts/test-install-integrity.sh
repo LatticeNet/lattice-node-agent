@@ -97,4 +97,9 @@ if ! grep -Fq "SHA256SUMS" "$LOG"; then
   exit 1
 fi
 
+if ! grep -Fq '"/etc/lattice/agent.env"' "$ROOT/scripts/install.sh"; then
+  echo "installer must adopt legacy /etc/lattice/agent.env configs" >&2
+  exit 1
+fi
+
 printf 'install integrity contract ok\n'
