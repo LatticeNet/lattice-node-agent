@@ -63,6 +63,35 @@ func TestRunnerRequiresExplicitExecEnable(t *testing.T) {
 	}
 }
 
+func TestSandboxProfileReportsExecutionPosture(t *testing.T) {
+	disabled := SandboxProfile(false, false, 1000)
+	if disabled.Level != "disabled" || !contains(disabled.Features, "exec-kill-switch") {
+		t.Fatalf("disabled profile wrong: %+v", disabled)
+	}
+
+	rootRefused := SandboxProfile(true, false, 0)
+	if rootRefused.Level != "root-refused" || !contains(rootRefused.Features, "root-exec-guard") || rootRefused.Warning == "" {
+		t.Fatalf("root-refused profile wrong: %+v", rootRefused)
+	}
+
+	enabled := SandboxProfile(true, false, 1000)
+	if !contains(enabled.Features, "interpreter-allowlist") || !contains(enabled.Features, "timeout") {
+		t.Fatalf("enabled profile missing common features: %+v", enabled)
+	}
+	if runtime.GOOS == "linux" {
+		if enabled.Level != "linux-rlimit-process-group" || !contains(enabled.Features, "rlimit-cpu") || !contains(enabled.Features, "process-group-kill") {
+			t.Fatalf("linux profile missing hardening features: %+v", enabled)
+		}
+	} else if enabled.Level != "basic" || enabled.Warning == "" {
+		t.Fatalf("non-linux profile wrong: %+v", enabled)
+	}
+
+	rootAllowed := SandboxProfile(true, true, 0)
+	if !strings.Contains(rootAllowed.Warning, "root") {
+		t.Fatalf("root-allowed profile should warn, got %+v", rootAllowed)
+	}
+}
+
 func TestRunnerCapsOutput(t *testing.T) {
 	r := Runner{AllowExec: true, getUID: nonRootUID}
 	result := r.Run(model.Task{
@@ -284,4 +313,13 @@ func processAlive(pid int) bool {
 	}
 	// ESRCH: no such process. EPERM: exists but not ours (still "alive").
 	return err == syscall.EPERM
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

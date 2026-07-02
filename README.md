@@ -36,6 +36,11 @@ Task stdout and stderr are capped per task; if either stream exceeds the
 server-provided output limit, the agent returns the capped bytes and marks the
 task result with an explicit truncation error instead of reporting silent
 success.
+Each metrics heartbeat also reports a `task_sandbox` runtime profile so
+operators can distinguish disabled execution, root-refused execution, and the
+Linux rlimit/process-group hardened path from the dashboard. This is visibility,
+not a policy bypass: `-allow-exec`, `-allow-root-exec`, and `-no-exec` remain the
+authoritative execution gates.
 
 The node token is sent in the `Authorization: Bearer` header on every request.
 The loopback `http://127.0.0.1:8088` URL above is safe because the token never

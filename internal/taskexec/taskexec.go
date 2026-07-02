@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -90,6 +91,65 @@ type Runner struct {
 	// tests can simulate "running as root" without actually being root. When
 	// nil it defaults to os.Geteuid.
 	getUID func() int
+}
+
+// SandboxReport describes the runtime isolation level operators should see for
+// this agent. It is an observability contract only; Runner remains the
+// authoritative execution gate.
+type SandboxReport struct {
+	Level    string   `json:"task_sandbox"`
+	Features []string `json:"task_sandbox_features,omitempty"`
+	Warning  string   `json:"task_sandbox_warning,omitempty"`
+}
+
+// SandboxProfile summarizes the task-execution hardening that will apply if a
+// task is leased to this agent under the current flags and OS.
+func SandboxProfile(allowExec, allowRoot bool, effectiveUID int) SandboxReport {
+	if !allowExec {
+		return SandboxReport{
+			Level:    "disabled",
+			Features: []string{"exec-kill-switch"},
+		}
+	}
+	if effectiveUID == 0 && !allowRoot {
+		return SandboxReport{
+			Level:    "root-refused",
+			Features: []string{"root-exec-guard"},
+			Warning:  "agent runs as root but task execution is refused until -allow-root-exec is set",
+		}
+	}
+
+	features := []string{
+		"interpreter-allowlist",
+		"minimal-env",
+		"output-cap",
+		"temp-workdir",
+		"timeout",
+	}
+	report := SandboxReport{Features: features}
+	if runtime.GOOS == "linux" {
+		report.Level = "linux-rlimit-process-group"
+		report.Features = append(report.Features,
+			"process-group-kill",
+			"rlimit-as",
+			"rlimit-cpu",
+			"rlimit-data",
+			"rlimit-fsize",
+			"rlimit-nproc",
+		)
+	} else {
+		report.Level = "basic"
+		report.Warning = "non-linux task execution lacks Linux rlimit/process-group hardening"
+	}
+	sort.Strings(report.Features)
+	if effectiveUID == 0 && allowRoot {
+		if report.Warning == "" {
+			report.Warning = "task scripts run as root"
+		} else {
+			report.Warning += "; task scripts run as root"
+		}
+	}
+	return report
 }
 
 func (r Runner) effectiveUID() int {

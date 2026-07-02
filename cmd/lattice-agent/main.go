@@ -124,6 +124,9 @@ type agentRuntimePayload struct {
 	NoExec                bool      `json:"no_exec"`
 	AllowTerminal         bool      `json:"allow_terminal"`
 	TerminalTransport     string    `json:"terminal_transport,omitempty"`
+	TaskSandbox           string    `json:"task_sandbox,omitempty"`
+	TaskSandboxFeatures   []string  `json:"task_sandbox_features,omitempty"`
+	TaskSandboxWarning    string    `json:"task_sandbox_warning,omitempty"`
 	SSHAlerts             bool      `json:"ssh_alerts"`
 	SingBoxDiscover       bool      `json:"singbox_discover"`
 	SingBoxBin            string    `json:"singbox_bin,omitempty"`
@@ -545,6 +548,7 @@ func applyIPConfigOverride(cfg *agentConfig, ipc *model.NodeIPConfig) {
 func reportMetrics(cfg agentConfig) error {
 	m := metrics.Collect()
 	facts := hostfacts.Collect()
+	sandbox := taskexec.SandboxProfile(cfg.AllowExec, cfg.AllowRoot, os.Geteuid())
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version": version,
@@ -554,6 +558,9 @@ func reportMetrics(cfg agentConfig) error {
 			NoExec:                cfg.NoExec,
 			AllowTerminal:         cfg.AllowTerminal,
 			TerminalTransport:     effectiveTerminalTransport(cfg.TerminalTransport),
+			TaskSandbox:           sandbox.Level,
+			TaskSandboxFeatures:   sandbox.Features,
+			TaskSandboxWarning:    sandbox.Warning,
 			SSHAlerts:             cfg.SSHAlerts,
 			SingBoxDiscover:       cfg.SingBoxDiscover,
 			SingBoxBin:            cfg.SingBoxBin,
