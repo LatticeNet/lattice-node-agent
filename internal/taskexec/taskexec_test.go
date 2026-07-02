@@ -75,11 +75,11 @@ func TestSandboxProfileReportsExecutionPosture(t *testing.T) {
 	}
 
 	enabled := SandboxProfile(true, false, 1000)
-	if !contains(enabled.Features, "interpreter-allowlist") || !contains(enabled.Features, "timeout") || !contains(enabled.Features, "non-root-agent") {
+	if !contains(enabled.Features, "interpreter-allowlist") || !contains(enabled.Features, "timeout") || !contains(enabled.Features, "non-root-agent") || !contains(enabled.Features, "task-local-tmpdir") {
 		t.Fatalf("enabled profile missing common features: %+v", enabled)
 	}
 	if runtime.GOOS == "linux" {
-		if enabled.Level != "linux-rlimit-process-group" || !contains(enabled.Features, "rlimit-cpu") || !contains(enabled.Features, "process-group-kill") || !contains(enabled.Features, "no-new-privileges") {
+		if enabled.Level != "linux-rlimit-process-group" || !contains(enabled.Features, "rlimit-cpu") || !contains(enabled.Features, "process-group-kill") || !contains(enabled.Features, "no-new-privileges") || !contains(enabled.Features, "private-umask") {
 			t.Fatalf("linux profile missing hardening features: %+v", enabled)
 		}
 	} else if enabled.Level != "basic" || enabled.Warning == "" {
@@ -183,6 +183,127 @@ func TestRunnerPropagatesLeaseID(t *testing.T) {
 	}
 	if result.Stdout != "lease_abc" {
 		t.Fatalf("expected lease id in task env, got %q", result.Stdout)
+	}
+}
+
+func TestRunnerSetsPrivateTaskTempEnvironment(t *testing.T) {
+	r := Runner{AllowExec: true, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_env",
+		Interpreter: "sh",
+		Script:      "printf 'PWD=%s\nHOME=%s\nTMPDIR=%s\nXDG_RUNTIME_DIR=%s\n' \"$(pwd -P)\" \"$HOME\" \"$TMPDIR\" \"$XDG_RUNTIME_DIR\"",
+		TimeoutSec:  5,
+		OutputLimit: 512,
+	})
+	if result.ExitCode != 0 {
+		t.Fatalf("expected success, got %#v", result)
+	}
+	env := parseKeyValueLines(result.Stdout)
+	pwd := env["PWD"]
+	if pwd == "" || !filepath.IsAbs(pwd) {
+		t.Fatalf("expected absolute task PWD, got stdout=%q", result.Stdout)
+	}
+	canonicalPWD := normalizePathForTest(pwd)
+	for _, key := range []string{"HOME", "TMPDIR", "XDG_RUNTIME_DIR"} {
+		if normalizePathForTest(env[key]) != canonicalPWD {
+			t.Fatalf("expected %s to equal task PWD %q, got %q (stdout=%q)", key, pwd, env[key], result.Stdout)
+		}
+	}
+}
+
+func TestRunnerUsesConfiguredWorkRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tasks")
+	r := Runner{AllowExec: true, WorkdirRoot: root, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_work_root",
+		Interpreter: "sh",
+		Script:      "printf 'PWD=%s\nTMPDIR=%s\n' \"$(pwd -P)\" \"$TMPDIR\"",
+		TimeoutSec:  5,
+		OutputLimit: 512,
+	})
+	if result.ExitCode != 0 {
+		t.Fatalf("expected success, got %#v", result)
+	}
+	env := parseKeyValueLines(result.Stdout)
+	canonicalRoot := normalizePathForTest(root)
+	for _, key := range []string{"PWD", "TMPDIR"} {
+		if !strings.HasPrefix(normalizePathForTest(env[key]), canonicalRoot+string(os.PathSeparator)) {
+			t.Fatalf("expected %s under configured root %q, got %q (stdout=%q)", key, root, env[key], result.Stdout)
+		}
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("expected configured root to exist: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode&0o022 != 0 {
+		t.Fatalf("expected configured root not group/world writable, mode=%03o", mode)
+	}
+
+	profile := SandboxProfileWithOptions(true, false, 1000, SandboxOptions{WorkdirRoot: root})
+	if !contains(profile.Features, "configured-work-root") {
+		t.Fatalf("expected configured-work-root feature, got %+v", profile)
+	}
+}
+
+func TestRunnerRejectsRelativeWorkRoot(t *testing.T) {
+	r := Runner{AllowExec: true, WorkdirRoot: "relative-tasks", getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_bad_work_root",
+		Interpreter: "sh",
+		Script:      "printf should-not-run",
+		TimeoutSec:  5,
+		OutputLimit: 64,
+	})
+	if result.ExitCode != -1 || !strings.Contains(result.Error, "must be absolute") {
+		t.Fatalf("expected relative work root refusal, got %#v", result)
+	}
+	if result.Stdout != "" {
+		t.Fatalf("script should not have run, stdout=%q", result.Stdout)
+	}
+}
+
+func TestRunnerRefusesUnsafeWorkRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "unsafe")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{AllowExec: true, WorkdirRoot: root, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_unsafe_work_root",
+		Interpreter: "sh",
+		Script:      "printf should-not-run",
+		TimeoutSec:  5,
+		OutputLimit: 64,
+	})
+	if result.ExitCode != -1 || !strings.Contains(result.Error, "group/world writable") {
+		t.Fatalf("expected unsafe work root refusal, got %#v", result)
+	}
+	if result.Stdout != "" {
+		t.Fatalf("script should not have run, stdout=%q", result.Stdout)
+	}
+}
+
+func TestRunnerSetsPrivateUmaskOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("private umask is asserted on linux only (GOOS=%s)", runtime.GOOS)
+	}
+	r := Runner{AllowExec: true, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_private_umask",
+		Interpreter: "sh",
+		Script:      "umask",
+		TimeoutSec:  5,
+		OutputLimit: 64,
+	})
+	if result.ExitCode != 0 {
+		t.Fatalf("expected success reading umask, got %#v", result)
+	}
+	got := strings.TrimSpace(result.Stdout)
+	if got != "0077" && got != "077" {
+		t.Fatalf("expected umask 0077, got stdout=%q result=%#v", result.Stdout, result)
 	}
 }
 
@@ -358,4 +479,27 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func parseKeyValueLines(s string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func normalizePathForTest(path string) string {
+	path = filepath.Clean(path)
+	if runtime.GOOS == "darwin" {
+		for _, alias := range []string{"/var", "/tmp", "/etc"} {
+			if path == alias || strings.HasPrefix(path, alias+"/") {
+				return "/private" + path
+			}
+		}
+	}
+	return path
 }

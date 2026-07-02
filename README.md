@@ -60,6 +60,20 @@ default; once configured, task launch fails closed if the agent cannot prepare
 or join the task cgroup, so a node does not silently run without the requested
 cap.
 
+Operators can also pin per-task working directories under a dedicated root:
+
+```sh
+LATTICE_TASK_WORK_ROOT=/opt/lattice/state/tasks
+```
+
+Each task still gets a fresh private subdirectory that is removed after the
+task. The agent sets `PWD`, `HOME`, `TMPDIR`, and `XDG_RUNTIME_DIR` to that
+directory so task-local temporary files do not spill into a shared temp path.
+The configured root must be absolute and not group/world writable; otherwise
+the task fails before the script runs. This is workdir containment, not a full
+mount namespace: scripts can still read or write other host paths allowed to
+the agent user.
+
 For least-privilege Linux systemd installs, set `LATTICE_AGENT_RUN_USER` before
 running `scripts/install.sh`:
 
@@ -339,7 +353,12 @@ node id.
   script-size limits before a task can be leased.
 - Server-side result ingestion also rejects stdout, stderr, or error text that
   exceeds the task's output cap.
-- Temporary working directory and minimal environment.
+- Temporary working directory and minimal environment. `HOME`, `TMPDIR`, and
+  `XDG_RUNTIME_DIR` are bound to the task's private workdir; set
+  `LATTICE_TASK_WORK_ROOT` to place those per-task directories under an
+  operator-controlled root.
+- Linux tasks inherit `umask 077` from the rlimit shim so files created by task
+  scripts default to owner-only access.
 - Leased tasks carry a server-issued `lease_id`; the agent returns it with the
   result and exposes it to the task as `LATTICE_TASK_LEASE_ID` for traceability.
 - Leased task payloads contain only execution fields; control-plane actor/token

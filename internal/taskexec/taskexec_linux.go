@@ -78,11 +78,12 @@ func MaybeRunChildShim(argv []string) bool {
 			os.Exit(126)
 		}
 	}
+	syscall.Umask(0o077)
 
 	// Exec replaces this shim process with the interpreter, preserving the
 	// process group (set by Setpgid on the parent command) and the rlimits
-	// just installed. The environment is already the sandbox env set by the
-	// parent on the shim command.
+	// just installed. The private umask and environment are already installed
+	// on the shim process, so the interpreter and its descendants inherit them.
 	if err := syscall.Exec(interp, []string{interp, scriptPath}, os.Environ()); err != nil {
 		fmt.Fprintf(os.Stderr, "taskexec shim: exec %s: %v\n", interp, err)
 		os.Exit(126)

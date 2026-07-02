@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,10 +154,23 @@ type Runner struct {
 	// task cgroup cannot be prepared or joined, the task fails instead of
 	// silently running without the requested cap.
 	Cgroup CgroupConfig
+	// WorkdirRoot optionally selects the parent directory for per-task workdirs.
+	// Empty preserves the historical behavior of using the OS temp directory.
+	// When set, it must be an absolute non-group/world-writable directory; task
+	// launch fails before script execution if the root cannot be prepared safely.
+	WorkdirRoot string
 	// getUID returns the effective uid of the agent process. It is a field so
 	// tests can simulate "running as root" without actually being root. When
 	// nil it defaults to os.Geteuid.
 	getUID func() int
+}
+
+// SandboxOptions describes optional task sandbox controls for posture
+// reporting. It intentionally mirrors Runner's execution-relevant knobs without
+// exposing test-only fields.
+type SandboxOptions struct {
+	Cgroup      CgroupConfig
+	WorkdirRoot string
 }
 
 // SandboxReport describes the runtime isolation level operators should see for
@@ -177,6 +191,13 @@ func SandboxProfile(allowExec, allowRoot bool, effectiveUID int) SandboxReport {
 // SandboxProfileWithCgroup summarizes the task-execution hardening with the
 // same semantics as SandboxProfile, including optional cgroup v2 configuration.
 func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgroup CgroupConfig) SandboxReport {
+	return SandboxProfileWithOptions(allowExec, allowRoot, effectiveUID, SandboxOptions{Cgroup: cgroup})
+}
+
+// SandboxProfileWithOptions summarizes the task-execution hardening with the
+// same semantics as SandboxProfile, including optional cgroup v2 and workdir
+// root configuration.
+func SandboxProfileWithOptions(allowExec, allowRoot bool, effectiveUID int, opts SandboxOptions) SandboxReport {
 	if !allowExec {
 		return SandboxReport{
 			Level:    "disabled",
@@ -195,8 +216,12 @@ func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgrou
 		"interpreter-allowlist",
 		"minimal-env",
 		"output-cap",
+		"task-local-tmpdir",
 		"temp-workdir",
 		"timeout",
+	}
+	if strings.TrimSpace(opts.WorkdirRoot) != "" {
+		features = append(features, "configured-work-root")
 	}
 	report := SandboxReport{Features: features}
 	if effectiveUID != 0 {
@@ -206,6 +231,7 @@ func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgrou
 		report.Level = "linux-rlimit-process-group"
 		report.Features = append(report.Features,
 			"no-new-privileges",
+			"private-umask",
 			"process-group-kill",
 			"rlimit-as",
 			"rlimit-cpu",
@@ -213,14 +239,14 @@ func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgrou
 			"rlimit-fsize",
 			"rlimit-nproc",
 		)
-		if cgroup.enabled() {
+		if opts.Cgroup.enabled() {
 			report.Level = "linux-rlimit-process-group-cgroupv2"
-			report.Features = append(report.Features, cgroupFeatureNames(cgroup)...)
+			report.Features = append(report.Features, cgroupFeatureNames(opts.Cgroup)...)
 		}
 	} else {
 		report.Level = "basic"
 		report.Warning = "non-linux task execution lacks Linux rlimit/process-group hardening"
-		if cgroup.enabled() {
+		if opts.Cgroup.enabled() {
 			report.Warning += "; configured task cgroups are Linux-only"
 		}
 	}
@@ -309,7 +335,7 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	dir, err := os.MkdirTemp("", "lattice-task-*")
+	dir, err := createTaskWorkdir(r.WorkdirRoot)
 	if err != nil {
 		result.ExitCode = -1
 		result.Error = err.Error()
@@ -347,7 +373,14 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 
 	cmd := buildHardenedCmd(interp, scriptPath, timeout, cgroup.Path())
 	cmd.Dir = dir
-	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "HOME=" + dir, "LATTICE_TASK_ID=" + task.ID, "LATTICE_TASK_LEASE_ID=" + task.LeaseID}
+	cmd.Env = []string{
+		"PATH=/usr/bin:/bin:/usr/local/bin",
+		"HOME=" + dir,
+		"TMPDIR=" + dir,
+		"XDG_RUNTIME_DIR=" + dir,
+		"LATTICE_TASK_ID=" + task.ID,
+		"LATTICE_TASK_LEASE_ID=" + task.LeaseID,
+	}
 
 	var stdout, stderr cappedBuffer
 	stdout.limit = limit
@@ -398,6 +431,46 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	}
 	result.FinishedAt = time.Now().UTC()
 	return result
+}
+
+func createTaskWorkdir(root string) (string, error) {
+	base, err := prepareTaskWorkdirRoot(root)
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp(base, "lattice-task-*")
+	if err != nil {
+		return "", fmt.Errorf("create task workdir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("secure task workdir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+func prepareTaskWorkdirRoot(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("task work root must be absolute: %s", root)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("prepare task work root %s: %w", root, err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("stat task work root %s: %w", root, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("task work root %s is not a directory", root)
+	}
+	if mode := info.Mode().Perm(); mode&0o022 != 0 {
+		return "", fmt.Errorf("task work root %s must not be group/world writable (mode %03o)", root, mode)
+	}
+	return root, nil
 }
 
 func exitCode(err error) int {
