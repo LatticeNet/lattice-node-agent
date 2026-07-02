@@ -277,6 +277,14 @@ ok "installed binary -> $bin_path"
 
 # ---- env file (0600; holds the token, NOT passed on the command line) ------
 quote_env() { printf "%s" "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/"; }
+xml_escape() {
+  printf "%s" "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
 umask 077
 cat >"$env_path" <<EOF
 LATTICE_SERVER=$(quote_env "$server")
@@ -349,37 +357,43 @@ EOF
     ;;
   launchd)
     # launchd: token lives in EnvironmentVariables (plist is 0600), not argv.
+    # Every value is XML-escaped so enrollment commands with URL query
+    # delimiters or generated token punctuation cannot corrupt the plist.
     cat >"$plist_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${plist_label}</string>
-  <key>ProgramArguments</key><array><string>${bin_path}</string></array>
+  <key>Label</key><string>$(xml_escape "$plist_label")</string>
+  <key>ProgramArguments</key><array><string>$(xml_escape "$bin_path")</string></array>
   <key>EnvironmentVariables</key><dict>
-    <key>LATTICE_SERVER</key><string>${server}</string>
-    <key>LATTICE_NODE_ID</key><string>${node_id}</string>
-    <key>LATTICE_NODE_TOKEN</key><string>${token}</string>
-    <key>LATTICE_LOG_STATE_DIR</key><string>${state_dir}</string>
-    <key>LATTICE_AGENT_ALLOW_EXEC</key><string>${LATTICE_AGENT_ALLOW_EXEC:-0}</string>
-    <key>LATTICE_AGENT_ALLOW_ROOT_EXEC</key><string>${LATTICE_AGENT_ALLOW_ROOT_EXEC:-0}</string>
-    <key>LATTICE_NO_EXEC</key><string>${LATTICE_NO_EXEC:-0}</string>
-    <key>LATTICE_AGENT_ALLOW_TERMINAL</key><string>${LATTICE_AGENT_ALLOW_TERMINAL:-0}</string>
-    <key>LATTICE_TERMINAL_TRANSPORT</key><string>${LATTICE_TERMINAL_TRANSPORT:-poll}</string>
-    <key>LATTICE_IP_MODE</key><string>${LATTICE_IP_MODE:-auto}</string>
-    <key>LATTICE_SSH_ALERTS</key><string>${LATTICE_SSH_ALERTS:-0}</string>
-    <key>LATTICE_SINGBOX_DISCOVER</key><string>${LATTICE_SINGBOX_DISCOVER:-0}</string>
-    <key>LATTICE_SINGBOX_BIN</key><string>${LATTICE_SINGBOX_BIN:-sb}</string>
-    <key>LATTICE_PROXY_USAGE_FILE</key><string>${LATTICE_PROXY_USAGE_FILE:-}</string>
-    <key>LATTICE_PROXY_USAGE_URL</key><string>${LATTICE_PROXY_USAGE_URL:-}</string>
-    <key>LATTICE_PROXY_USAGE_XRAY_API</key><string>${LATTICE_PROXY_USAGE_XRAY_API:-}</string>
-    <key>LATTICE_PROXY_USAGE_XRAY_BIN</key><string>${LATTICE_PROXY_USAGE_XRAY_BIN:-}</string>
-    <key>LATTICE_PROXY_USAGE_XRAY_PATTERN</key><string>${LATTICE_PROXY_USAGE_XRAY_PATTERN:-}</string>
+    <key>LATTICE_SERVER</key><string>$(xml_escape "$server")</string>
+    <key>LATTICE_NODE_ID</key><string>$(xml_escape "$node_id")</string>
+    <key>LATTICE_NODE_TOKEN</key><string>$(xml_escape "$token")</string>
+    <key>LATTICE_LOG_STATE_DIR</key><string>$(xml_escape "$state_dir")</string>
+    <key>LATTICE_AGENT_ALLOW_EXEC</key><string>$(xml_escape "${LATTICE_AGENT_ALLOW_EXEC:-0}")</string>
+    <key>LATTICE_AGENT_ALLOW_ROOT_EXEC</key><string>$(xml_escape "${LATTICE_AGENT_ALLOW_ROOT_EXEC:-0}")</string>
+    <key>LATTICE_NO_EXEC</key><string>$(xml_escape "${LATTICE_NO_EXEC:-0}")</string>
+    <key>LATTICE_AGENT_ALLOW_TERMINAL</key><string>$(xml_escape "${LATTICE_AGENT_ALLOW_TERMINAL:-0}")</string>
+    <key>LATTICE_TERMINAL_TRANSPORT</key><string>$(xml_escape "${LATTICE_TERMINAL_TRANSPORT:-poll}")</string>
+    <key>LATTICE_IP_MODE</key><string>$(xml_escape "${LATTICE_IP_MODE:-auto}")</string>
+    <key>LATTICE_IP_RESOLVERS</key><string>$(xml_escape "${LATTICE_IP_RESOLVERS:-}")</string>
+    <key>LATTICE_IP_SCRIPT</key><string>$(xml_escape "${LATTICE_IP_SCRIPT:-}")</string>
+    <key>LATTICE_PUBLIC_IP</key><string>$(xml_escape "${LATTICE_PUBLIC_IP:-}")</string>
+    <key>LATTICE_PUBLIC_IP6</key><string>$(xml_escape "${LATTICE_PUBLIC_IP6:-}")</string>
+    <key>LATTICE_SSH_ALERTS</key><string>$(xml_escape "${LATTICE_SSH_ALERTS:-0}")</string>
+    <key>LATTICE_SINGBOX_DISCOVER</key><string>$(xml_escape "${LATTICE_SINGBOX_DISCOVER:-0}")</string>
+    <key>LATTICE_SINGBOX_BIN</key><string>$(xml_escape "${LATTICE_SINGBOX_BIN:-sb}")</string>
+    <key>LATTICE_PROXY_USAGE_FILE</key><string>$(xml_escape "${LATTICE_PROXY_USAGE_FILE:-}")</string>
+    <key>LATTICE_PROXY_USAGE_URL</key><string>$(xml_escape "${LATTICE_PROXY_USAGE_URL:-}")</string>
+    <key>LATTICE_PROXY_USAGE_XRAY_API</key><string>$(xml_escape "${LATTICE_PROXY_USAGE_XRAY_API:-}")</string>
+    <key>LATTICE_PROXY_USAGE_XRAY_BIN</key><string>$(xml_escape "${LATTICE_PROXY_USAGE_XRAY_BIN:-}")</string>
+    <key>LATTICE_PROXY_USAGE_XRAY_PATTERN</key><string>$(xml_escape "${LATTICE_PROXY_USAGE_XRAY_PATTERN:-}")</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${state_dir}/agent.log</string>
-  <key>StandardErrorPath</key><string>${state_dir}/agent.log</string>
+  <key>StandardOutPath</key><string>$(xml_escape "$state_dir")/agent.log</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$state_dir")/agent.log</string>
 </dict>
 </plist>
 EOF
