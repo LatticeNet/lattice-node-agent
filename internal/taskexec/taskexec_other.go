@@ -3,6 +3,7 @@
 package taskexec
 
 import (
+	"fmt"
 	"os/exec"
 	"syscall"
 	"time"
@@ -13,12 +14,19 @@ import (
 // so main can call it unconditionally regardless of platform.
 func MaybeRunChildShim(argv []string) bool { return false }
 
+func prepareTaskCgroup(config CgroupConfig, _ string) (preparedCgroup, error) {
+	if config.enabled() {
+		return preparedCgroup{}, fmt.Errorf("task cgroups are only supported on Linux")
+	}
+	return preparedCgroup{}, nil
+}
+
 // buildHardenedCmd builds the task command on non-Linux platforms (dev/macOS).
 // There is no rlimit shim here, but we still place the child in its own process
 // group (supported on Unix-like systems) so killProcessGroup can reap the whole
 // tree on timeout. Resource rlimits are deliberately not applied off Linux;
 // this path is for development and is documented as such.
-func buildHardenedCmd(interp, scriptPath string, _ time.Duration) *exec.Cmd {
+func buildHardenedCmd(interp, scriptPath string, _ time.Duration, _ string) *exec.Cmd {
 	cmd := exec.Command(interp, scriptPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	return cmd

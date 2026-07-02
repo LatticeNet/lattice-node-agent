@@ -42,6 +42,22 @@ Linux rlimit/process-group hardened path from the dashboard. This is visibility,
 not a policy bypass: `-allow-exec`, `-allow-root-exec`, and `-no-exec` remain the
 authoritative execution gates.
 
+On Linux hosts with a delegated cgroup v2 service cgroup, operators can add
+per-task resident-memory, process/thread, and CPU caps:
+
+```sh
+LATTICE_TASK_CGROUP_ROOT=auto \
+LATTICE_TASK_CGROUP_MEMORY_MAX=536870912 \
+LATTICE_TASK_CGROUP_PIDS_MAX=64 \
+LATTICE_TASK_CGROUP_CPU_MAX="100000 100000"
+```
+
+`auto` resolves to a `lattice-tasks` child under the agent's own cgroup. An
+absolute writable cgroup root can be used instead. Cgroup caps are off by
+default; once configured, task launch fails closed if the agent cannot prepare
+or join the task cgroup, so a node does not silently run without the requested
+cap.
+
 The node token is sent in the `Authorization: Bearer` header on every request.
 The loopback `http://127.0.0.1:8088` URL above is safe because the token never
 leaves the host. For a **remote** server the agent refuses to start on a

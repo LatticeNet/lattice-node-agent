@@ -45,8 +45,9 @@ const (
 	// We therefore set it high enough not to break the allowlisted interpreters
 	// while still catching pathological virtual-space blowups, and rely on
 	// RLIMIT_DATA (below) as the meaningful data-segment guard. The real
-	// resident-memory guard is a cgroup v2 memory.max on the task's process,
-	// which is a deferred improvement (not implemented here).
+	// resident-memory guard is a configured cgroup v2 memory.max on the task's
+	// process; without cgroup configuration this remains only a virtual-space
+	// backstop.
 	maxAddressSpaceBytes = 8 * 1024 * 1024 * 1024 // 8 GiB (virtual-space backstop only)
 	// maxDataBytes caps the data segment (RLIMIT_DATA). This is the meaningful
 	// per-task memory guard: unlike RLIMIT_AS it bounds the heap/brk and
@@ -58,6 +59,67 @@ const (
 	// after the context deadline rather than long before it.
 	cpuGraceSeconds = 5
 )
+
+const (
+	// DefaultCgroupMemoryMax is the resident-memory cgroup cap used when a
+	// cgroup root is configured and no explicit memory.max value is supplied.
+	DefaultCgroupMemoryMax = "536870912" // 512 MiB
+	// DefaultCgroupPidsMax caps the number of processes/threads in the task's
+	// cgroup when cgroup v2 enforcement is enabled.
+	DefaultCgroupPidsMax = "64"
+	// DefaultCgroupCPUMax limits each task cgroup to one CPU worth of runtime.
+	DefaultCgroupCPUMax = "100000 100000"
+)
+
+// CgroupConfig enables optional Linux cgroup v2 caps for each task. It is
+// intentionally off by default: operators must configure Root (or "auto") only
+// on hosts where the agent's service cgroup is delegated or the explicit root
+// is writable. Once configured, task launch fails closed if the cgroup cannot
+// be prepared or joined.
+type CgroupConfig struct {
+	Root      string
+	MemoryMax string
+	PidsMax   string
+	CPUMax    string
+}
+
+func (c CgroupConfig) enabled() bool {
+	return strings.TrimSpace(c.Root) != ""
+}
+
+func (c CgroupConfig) normalized() CgroupConfig {
+	c.Root = strings.TrimSpace(c.Root)
+	c.MemoryMax = strings.TrimSpace(c.MemoryMax)
+	c.PidsMax = strings.TrimSpace(c.PidsMax)
+	c.CPUMax = strings.TrimSpace(c.CPUMax)
+	if c.enabled() {
+		if c.MemoryMax == "" {
+			c.MemoryMax = DefaultCgroupMemoryMax
+		}
+		if c.PidsMax == "" {
+			c.PidsMax = DefaultCgroupPidsMax
+		}
+		if c.CPUMax == "" {
+			c.CPUMax = DefaultCgroupCPUMax
+		}
+	}
+	return c
+}
+
+type preparedCgroup struct {
+	path    string
+	cleanup func()
+}
+
+func (p preparedCgroup) Path() string {
+	return p.path
+}
+
+func (p preparedCgroup) Cleanup() {
+	if p.cleanup != nil {
+		p.cleanup()
+	}
+}
 
 // MissingInterpreters returns the sorted list of allowlisted interpreter names
 // that cannot currently be resolved on PATH. It performs the same exec.LookPath
@@ -87,6 +149,10 @@ type Runner struct {
 	// since that would run them with full host privileges. Operators that
 	// genuinely need root (nft/wg manipulation) set this explicitly.
 	AllowRoot bool
+	// Cgroup optionally adds per-task Linux cgroup v2 caps. If configured and a
+	// task cgroup cannot be prepared or joined, the task fails instead of
+	// silently running without the requested cap.
+	Cgroup CgroupConfig
 	// getUID returns the effective uid of the agent process. It is a field so
 	// tests can simulate "running as root" without actually being root. When
 	// nil it defaults to os.Geteuid.
@@ -105,6 +171,12 @@ type SandboxReport struct {
 // SandboxProfile summarizes the task-execution hardening that will apply if a
 // task is leased to this agent under the current flags and OS.
 func SandboxProfile(allowExec, allowRoot bool, effectiveUID int) SandboxReport {
+	return SandboxProfileWithCgroup(allowExec, allowRoot, effectiveUID, CgroupConfig{})
+}
+
+// SandboxProfileWithCgroup summarizes the task-execution hardening with the
+// same semantics as SandboxProfile, including optional cgroup v2 configuration.
+func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgroup CgroupConfig) SandboxReport {
 	if !allowExec {
 		return SandboxReport{
 			Level:    "disabled",
@@ -137,9 +209,16 @@ func SandboxProfile(allowExec, allowRoot bool, effectiveUID int) SandboxReport {
 			"rlimit-fsize",
 			"rlimit-nproc",
 		)
+		if cgroup.enabled() {
+			report.Level = "linux-rlimit-process-group-cgroupv2"
+			report.Features = append(report.Features, cgroupFeatureNames(cgroup)...)
+		}
 	} else {
 		report.Level = "basic"
 		report.Warning = "non-linux task execution lacks Linux rlimit/process-group hardening"
+		if cgroup.enabled() {
+			report.Warning += "; configured task cgroups are Linux-only"
+		}
 	}
 	sort.Strings(report.Features)
 	if effectiveUID == 0 && allowRoot {
@@ -150,6 +229,21 @@ func SandboxProfile(allowExec, allowRoot bool, effectiveUID int) SandboxReport {
 		}
 	}
 	return report
+}
+
+func cgroupFeatureNames(c CgroupConfig) []string {
+	c = c.normalized()
+	features := []string{"cgroup-v2-fail-closed"}
+	if c.MemoryMax != "" && c.MemoryMax != "max" {
+		features = append(features, "cgroup-v2-memory-max")
+	}
+	if c.PidsMax != "" && c.PidsMax != "max" {
+		features = append(features, "cgroup-v2-pids-max")
+	}
+	if c.CPUMax != "" && c.CPUMax != "max" {
+		features = append(features, "cgroup-v2-cpu-max")
+	}
+	return features
 }
 
 func (r Runner) effectiveUID() int {
@@ -238,7 +332,16 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	// it routes the interpreter through a self-exec shim that applies rlimits
 	// (inherited across exec into the whole tree) and puts the child in its own
 	// process group. On other platforms it is a plain exec of the interpreter.
-	cmd := buildHardenedCmd(interp, scriptPath, timeout)
+	cgroup, err := prepareTaskCgroup(r.Cgroup, task.ID)
+	if err != nil {
+		result.ExitCode = -1
+		result.Error = err.Error()
+		result.FinishedAt = time.Now().UTC()
+		return result
+	}
+	defer cgroup.Cleanup()
+
+	cmd := buildHardenedCmd(interp, scriptPath, timeout, cgroup.Path())
 	cmd.Dir = dir
 	cmd.Env = []string{"PATH=/usr/bin:/bin:/usr/local/bin", "HOME=" + dir, "LATTICE_TASK_ID=" + task.ID, "LATTICE_TASK_LEASE_ID=" + task.LeaseID}
 

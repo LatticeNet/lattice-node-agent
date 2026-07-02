@@ -92,6 +92,22 @@ func TestSandboxProfileReportsExecutionPosture(t *testing.T) {
 	}
 }
 
+func TestSandboxProfileReportsConfiguredCgroupCaps(t *testing.T) {
+	profile := SandboxProfileWithCgroup(true, false, 1000, CgroupConfig{Root: "/sys/fs/cgroup/lattice-test"})
+	if runtime.GOOS == "linux" {
+		if profile.Level != "linux-rlimit-process-group-cgroupv2" {
+			t.Fatalf("linux cgroup profile level = %q", profile.Level)
+		}
+		for _, feature := range []string{"cgroup-v2-cpu-max", "cgroup-v2-fail-closed", "cgroup-v2-memory-max", "cgroup-v2-pids-max"} {
+			if !contains(profile.Features, feature) {
+				t.Fatalf("profile missing %s: %+v", feature, profile)
+			}
+		}
+	} else if !strings.Contains(profile.Warning, "Linux-only") {
+		t.Fatalf("non-linux cgroup profile should warn, got %+v", profile)
+	}
+}
+
 func TestRunnerCapsOutput(t *testing.T) {
 	r := Runner{AllowExec: true, getUID: nonRootUID}
 	result := r.Run(model.Task{

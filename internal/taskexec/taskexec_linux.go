@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -16,6 +18,7 @@ import (
 // runs tasks by re-executing itself as:
 //
 //	/proc/self/exe <shimSentinel> <cpuSecs> <interp> <scriptPath>
+//	/proc/self/exe <shimSentinel> <cpuSecs> <cgroupPath> <interp> <scriptPath>
 //
 // The shim sets resource rlimits on itself (which are inherited across the
 // following exec and into any descendants) and then execs the real interpreter.
@@ -35,12 +38,13 @@ const rlimitNProc = 0x6
 // it returns false and normal startup proceeds. main must call this before any
 // other work so the sentinel argv is handled.
 //
-// argv layout: [exe, shimSentinel, cpuSecs, interp, scriptPath].
+// argv layout: [exe, shimSentinel, cpuSecs, interp, scriptPath] or
+// [exe, shimSentinel, cpuSecs, cgroupPath, interp, scriptPath].
 func MaybeRunChildShim(argv []string) bool {
 	if len(argv) < 2 || argv[1] != shimSentinel {
 		return false
 	}
-	if len(argv) != 5 {
+	if len(argv) != 5 && len(argv) != 6 {
 		fmt.Fprintln(os.Stderr, "taskexec shim: malformed arguments")
 		os.Exit(2)
 	}
@@ -49,10 +53,22 @@ func MaybeRunChildShim(argv []string) bool {
 		fmt.Fprintf(os.Stderr, "taskexec shim: bad cpu seconds: %v\n", err)
 		os.Exit(2)
 	}
-	interp := argv[3]
-	scriptPath := argv[4]
+	var cgroupPath string
+	interpArg := 3
+	if len(argv) == 6 {
+		cgroupPath = argv[3]
+		interpArg = 4
+	}
+	interp := argv[interpArg]
+	scriptPath := argv[interpArg+1]
 
 	applyResourceLimits(cpuSecs)
+	if cgroupPath != "" {
+		if err := joinTaskCgroup(cgroupPath); err != nil {
+			fmt.Fprintf(os.Stderr, "taskexec shim: join cgroup: %v\n", err)
+			os.Exit(126)
+		}
+	}
 
 	// Exec replaces this shim process with the interpreter, preserving the
 	// process group (set by Setpgid on the parent command) and the rlimits
@@ -75,9 +91,8 @@ func applyResourceLimits(cpuSecs uint64) {
 	// therefore shared with the agent's own threads and every other concurrent
 	// task running under the same uid, so it blunts fork bombs but does not give
 	// true per-task isolation (one task can consume the budget and starve
-	// others, and the count includes unrelated processes of that uid). Real
-	// per-task process isolation requires a PID namespace plus a cgroup
-	// pids.max scoped to the task — a deferred improvement, not implemented here.
+	// others, and the count includes unrelated processes of that uid). Configure
+	// cgroup v2 pids.max for a real per-task process/thread cap.
 	nproc := nprocLimit()
 	setRlimit(rlimitNProc, nproc, nproc)
 	// RLIMIT_AS is a coarse virtual-space backstop only (see maxAddressSpaceBytes);
@@ -146,16 +161,197 @@ func setRlimit(resource int, cur, max uint64) {
 	_ = syscall.Setrlimit(resource, &syscall.Rlimit{Cur: cur, Max: max})
 }
 
+func prepareTaskCgroup(config CgroupConfig, taskID string) (preparedCgroup, error) {
+	config = config.normalized()
+	if !config.enabled() {
+		return preparedCgroup{}, nil
+	}
+	root, err := resolveCgroupRoot(config.Root)
+	if err != nil {
+		return preparedCgroup{}, err
+	}
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		return preparedCgroup{}, fmt.Errorf("prepare task cgroup root %s: %w", root, err)
+	}
+	if err := ensureCgroupV2Root(root, config); err != nil {
+		return preparedCgroup{}, err
+	}
+	name := "task-" + safeCgroupName(taskID) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	path := filepath.Join(root, name)
+	if err := os.Mkdir(path, 0o750); err != nil {
+		return preparedCgroup{}, fmt.Errorf("create task cgroup %s: %w", path, err)
+	}
+	cleanup := func() {
+		// cgroup.kill is not available on every cgroup v2 kernel. Use it when
+		// present to make cleanup robust, then remove the cgroup best-effort.
+		_ = os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0o644)
+		if err := os.Remove(path); err != nil {
+			for _, name := range []string{"memory.max", "pids.max", "cpu.max", "cgroup.procs", "cgroup.kill"} {
+				_ = os.Remove(filepath.Join(path, name))
+			}
+			_ = os.Remove(path)
+		}
+	}
+	if err := configureTaskCgroup(path, config); err != nil {
+		cleanup()
+		return preparedCgroup{}, err
+	}
+	return preparedCgroup{path: path, cleanup: cleanup}, nil
+}
+
+func resolveCgroupRoot(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", fmt.Errorf("task cgroup root is empty")
+	}
+	if root != "auto" {
+		if !filepath.IsAbs(root) {
+			return "", fmt.Errorf("task cgroup root must be absolute or \"auto\": %q", root)
+		}
+		return filepath.Clean(root), nil
+	}
+	self, err := selfCgroupPath()
+	if err != nil {
+		return "", err
+	}
+	rel := strings.TrimPrefix(filepath.Clean(self), string(filepath.Separator))
+	return filepath.Join("/sys/fs/cgroup", rel, "lattice-tasks"), nil
+}
+
+func selfCgroupPath() (string, error) {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", fmt.Errorf("read /proc/self/cgroup: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			path := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+			if path == "" {
+				path = "/"
+			}
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("cgroup v2 unified hierarchy not found in /proc/self/cgroup")
+}
+
+func safeCgroupName(taskID string) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	for _, r := range taskID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+		if b.Len() >= 64 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+func ensureCgroupV2Root(root string, config CgroupConfig) error {
+	required := requiredCgroupControllers(config)
+	controllersPath := filepath.Join(root, "cgroup.controllers")
+	data, err := os.ReadFile(controllersPath)
+	if err != nil {
+		return fmt.Errorf("task cgroup root %s is not a cgroup v2 directory: %w", root, err)
+	}
+	if len(required) == 0 {
+		return nil
+	}
+	available := map[string]bool{}
+	for _, controller := range strings.Fields(string(data)) {
+		available[controller] = true
+	}
+	for _, controller := range required {
+		if !available[controller] {
+			return fmt.Errorf("task cgroup root %s does not expose %s controller", root, controller)
+		}
+	}
+	subtreePath := filepath.Join(root, "cgroup.subtree_control")
+	if _, err := os.Stat(subtreePath); err != nil {
+		return fmt.Errorf("task cgroup root %s cannot delegate controllers: %w", root, err)
+	}
+	var enable []string
+	for _, controller := range required {
+		enable = append(enable, "+"+controller)
+	}
+	if err := os.WriteFile(subtreePath, []byte(strings.Join(enable, " ")), 0o644); err != nil {
+		return fmt.Errorf("enable task cgroup controllers %s: %w", strings.Join(enable, " "), err)
+	}
+	return nil
+}
+
+func requiredCgroupControllers(config CgroupConfig) []string {
+	config = config.normalized()
+	var controllers []string
+	if config.CPUMax != "" && config.CPUMax != "max" {
+		controllers = append(controllers, "cpu")
+	}
+	if config.MemoryMax != "" && config.MemoryMax != "max" {
+		controllers = append(controllers, "memory")
+	}
+	if config.PidsMax != "" && config.PidsMax != "max" {
+		controllers = append(controllers, "pids")
+	}
+	return controllers
+}
+
+func configureTaskCgroup(path string, config CgroupConfig) error {
+	if err := writeCgroupControl(path, "memory.max", config.MemoryMax); err != nil {
+		return err
+	}
+	if err := writeCgroupControl(path, "pids.max", config.PidsMax); err != nil {
+		return err
+	}
+	if err := writeCgroupControl(path, "cpu.max", config.CPUMax); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeCgroupControl(path, file, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if err := os.WriteFile(filepath.Join(path, file), []byte(value), 0o644); err != nil {
+		return fmt.Errorf("write task cgroup %s=%q: %w", file, value, err)
+	}
+	return nil
+}
+
+func joinTaskCgroup(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	return os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0o644)
+}
+
 // buildHardenedCmd constructs the task command on Linux. It re-execs the agent
 // binary into the rlimit shim (which then execs the interpreter) and places the
 // child in its own process group so the whole tree can be killed on timeout.
-func buildHardenedCmd(interp, scriptPath string, timeout time.Duration) *exec.Cmd {
+func buildHardenedCmd(interp, scriptPath string, timeout time.Duration, cgroupPath string) *exec.Cmd {
 	cpuSecs := uint64(timeout/time.Second) + cpuGraceSeconds
 	if cpuSecs < cpuGraceSeconds {
 		cpuSecs = cpuGraceSeconds
 	}
 	self := selfExe()
-	cmd := exec.Command(self, shimSentinel, strconv.FormatUint(cpuSecs, 10), interp, scriptPath)
+	args := []string{shimSentinel, strconv.FormatUint(cpuSecs, 10)}
+	if cgroupPath != "" {
+		args = append(args, cgroupPath)
+	}
+	args = append(args, interp, scriptPath)
+	cmd := exec.Command(self, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	return cmd
 }

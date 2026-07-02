@@ -47,14 +47,18 @@ const (
 )
 
 type agentConfig struct {
-	Server        string
-	NodeID        string
-	Token         string
-	Interval      time.Duration
-	AllowExec     bool
-	AllowRoot     bool
-	NoExec        bool
-	AllowTerminal bool
+	Server              string
+	NodeID              string
+	Token               string
+	Interval            time.Duration
+	AllowExec           bool
+	AllowRoot           bool
+	NoExec              bool
+	TaskCgroupRoot      string
+	TaskCgroupMemoryMax string
+	TaskCgroupPidsMax   string
+	TaskCgroupCPUMax    string
+	AllowTerminal       bool
 	// TerminalTransport selects how an accepted terminal session moves bytes:
 	// "poll" (default, legacy HTTP store-and-forward) or "stream" (agent-dialed
 	// WebSocket bridge). Normalized after flag parsing; unknown values fall back
@@ -161,6 +165,10 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
+	flag.StringVar(&cfg.TaskCgroupRoot, "task-cgroup-root", os.Getenv("LATTICE_TASK_CGROUP_ROOT"), "Linux cgroup v2 root for per-task caps; use \"auto\" for the agent service cgroup or leave empty to disable")
+	flag.StringVar(&cfg.TaskCgroupMemoryMax, "task-cgroup-memory-max", env("LATTICE_TASK_CGROUP_MEMORY_MAX", taskexec.DefaultCgroupMemoryMax), "memory.max value for per-task cgroups when -task-cgroup-root is set")
+	flag.StringVar(&cfg.TaskCgroupPidsMax, "task-cgroup-pids-max", env("LATTICE_TASK_CGROUP_PIDS_MAX", taskexec.DefaultCgroupPidsMax), "pids.max value for per-task cgroups when -task-cgroup-root is set")
+	flag.StringVar(&cfg.TaskCgroupCPUMax, "task-cgroup-cpu-max", env("LATTICE_TASK_CGROUP_CPU_MAX", taskexec.DefaultCgroupCPUMax), "cpu.max value for per-task cgroups when -task-cgroup-root is set")
 	flag.BoolVar(&cfg.AllowTerminal, "allow-terminal", os.Getenv("LATTICE_AGENT_ALLOW_TERMINAL") == "1", "allow audited interactive terminal sessions (high risk; runs as the agent user)")
 	flag.StringVar(&cfg.TerminalTransport, "terminal-transport", env("LATTICE_TERMINAL_TRANSPORT", terminalTransportPoll), "terminal transport when -allow-terminal is set: \"poll\" (default) or \"stream\" (agent-dialed WebSocket)")
 	flag.BoolVar(&cfg.LocalDebug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
@@ -289,7 +297,7 @@ func main() {
 	} else {
 		applyAgentConfig(&cfg, agentCfg)
 	}
-	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
+	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v task_cgroup=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.taskCgroupConfig().Root != "", cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
 	}
@@ -297,7 +305,7 @@ func main() {
 		go runTerminalLoop(context.Background(), cfg)
 	}
 
-	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot}
+	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig()}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
@@ -545,10 +553,19 @@ func applyIPConfigOverride(cfg *agentConfig, ipc *model.NodeIPConfig) {
 	}
 }
 
+func (cfg agentConfig) taskCgroupConfig() taskexec.CgroupConfig {
+	return taskexec.CgroupConfig{
+		Root:      cfg.TaskCgroupRoot,
+		MemoryMax: cfg.TaskCgroupMemoryMax,
+		PidsMax:   cfg.TaskCgroupPidsMax,
+		CPUMax:    cfg.TaskCgroupCPUMax,
+	}
+}
+
 func reportMetrics(cfg agentConfig) error {
 	m := metrics.Collect()
 	facts := hostfacts.Collect()
-	sandbox := taskexec.SandboxProfile(cfg.AllowExec, cfg.AllowRoot, os.Geteuid())
+	sandbox := taskexec.SandboxProfileWithCgroup(cfg.AllowExec, cfg.AllowRoot, os.Geteuid(), cfg.taskCgroupConfig())
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version": version,
@@ -629,6 +646,7 @@ func runIPDiscoveryScript(cfg *agentConfig) (string, string, error) {
 	result := taskexec.Runner{
 		AllowExec: cfg.AllowExec && !cfg.NoExec,
 		AllowRoot: cfg.AllowRoot,
+		Cgroup:    cfg.taskCgroupConfig(),
 	}.Run(model.Task{
 		ID:          "ip-discovery",
 		Interpreter: ipDiscoveryInterpreter(script),
