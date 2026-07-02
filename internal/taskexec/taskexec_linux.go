@@ -33,6 +33,11 @@ const shimSentinel = "__lattice_taskexec_rlimit_shim__"
 // dependency just for one constant.
 const rlimitNProc = 0x6
 
+// prSetNoNewPrivs is PR_SET_NO_NEW_PRIVS. The syscall package does not expose
+// the prctl option constants; defining the Linux ABI value locally avoids a new
+// dependency for one hardening bit.
+const prSetNoNewPrivs = 38
+
 // MaybeRunChildShim inspects argv; if it is a re-exec into the rlimit shim, it
 // applies rlimits and execs the target interpreter, never returning. Otherwise
 // it returns false and normal startup proceeds. main must call this before any
@@ -63,6 +68,10 @@ func MaybeRunChildShim(argv []string) bool {
 	scriptPath := argv[interpArg+1]
 
 	applyResourceLimits(cpuSecs)
+	if err := setNoNewPrivileges(); err != nil {
+		fmt.Fprintf(os.Stderr, "taskexec shim: set no_new_privs: %v\n", err)
+		os.Exit(126)
+	}
 	if cgroupPath != "" {
 		if err := joinTaskCgroup(cgroupPath); err != nil {
 			fmt.Fprintf(os.Stderr, "taskexec shim: join cgroup: %v\n", err)
@@ -159,6 +168,14 @@ func setRlimit(resource int, cur, max uint64) {
 	// unprivileged user already at the cap), keep going rather than abort the
 	// task. The other limits still apply.
 	_ = syscall.Setrlimit(resource, &syscall.Rlimit{Cur: cur, Max: max})
+}
+
+func setNoNewPrivileges() error {
+	_, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, uintptr(prSetNoNewPrivs), 1, 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func prepareTaskCgroup(config CgroupConfig, taskID string) (preparedCgroup, error) {

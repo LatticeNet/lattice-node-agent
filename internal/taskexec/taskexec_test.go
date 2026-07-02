@@ -79,7 +79,7 @@ func TestSandboxProfileReportsExecutionPosture(t *testing.T) {
 		t.Fatalf("enabled profile missing common features: %+v", enabled)
 	}
 	if runtime.GOOS == "linux" {
-		if enabled.Level != "linux-rlimit-process-group" || !contains(enabled.Features, "rlimit-cpu") || !contains(enabled.Features, "process-group-kill") {
+		if enabled.Level != "linux-rlimit-process-group" || !contains(enabled.Features, "rlimit-cpu") || !contains(enabled.Features, "process-group-kill") || !contains(enabled.Features, "no-new-privileges") {
 			t.Fatalf("linux profile missing hardening features: %+v", enabled)
 		}
 	} else if enabled.Level != "basic" || enabled.Warning == "" {
@@ -89,6 +89,26 @@ func TestSandboxProfileReportsExecutionPosture(t *testing.T) {
 	rootAllowed := SandboxProfile(true, true, 0)
 	if !strings.Contains(rootAllowed.Warning, "root") {
 		t.Fatalf("root-allowed profile should warn, got %+v", rootAllowed)
+	}
+}
+
+func TestRunnerSetsNoNewPrivilegesOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("no_new_privs is asserted on linux only (GOOS=%s)", runtime.GOOS)
+	}
+	r := Runner{AllowExec: true, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_no_new_privs",
+		Interpreter: "sh",
+		Script:      "awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status",
+		TimeoutSec:  5,
+		OutputLimit: 64,
+	})
+	if result.ExitCode != 0 {
+		t.Fatalf("expected success reading NoNewPrivs, got %#v", result)
+	}
+	if strings.TrimSpace(result.Stdout) != "1" {
+		t.Fatalf("expected NoNewPrivs=1, got stdout=%q result=%#v", result.Stdout, result)
 	}
 }
 

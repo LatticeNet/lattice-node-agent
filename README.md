@@ -40,7 +40,9 @@ Each metrics heartbeat also reports a `task_sandbox` runtime profile so
 operators can distinguish disabled execution, root-refused execution, and the
 Linux rlimit/process-group hardened path from the dashboard. This is visibility,
 not a policy bypass: `-allow-exec`, `-allow-root-exec`, and `-no-exec` remain the
-authoritative execution gates.
+authoritative execution gates. On Linux, task interpreters also run with
+`no_new_privs` set, so a script cannot gain additional privilege through setuid
+or file-capability executables.
 
 On Linux hosts with a delegated cgroup v2 service cgroup, operators can add
 per-task resident-memory, process/thread, and CPU caps:

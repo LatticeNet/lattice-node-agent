@@ -205,6 +205,7 @@ func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgrou
 	if runtime.GOOS == "linux" {
 		report.Level = "linux-rlimit-process-group"
 		report.Features = append(report.Features,
+			"no-new-privileges",
 			"process-group-kill",
 			"rlimit-as",
 			"rlimit-cpu",
