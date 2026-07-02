@@ -18,6 +18,9 @@ bin_path="${LATTICE_AGENT_BIN:-$LATTICE_HOME/lattice-agent}"
 env_path="${LATTICE_AGENT_ENV:-$LATTICE_HOME/lattice-agent.env}"
 state_dir="${LATTICE_AGENT_STATE:-$LATTICE_HOME/state}"
 service_name="${LATTICE_AGENT_SERVICE:-lattice-agent}"
+run_user="${LATTICE_AGENT_RUN_USER:-}"
+run_group="${LATTICE_AGENT_RUN_GROUP:-}"
+create_run_user="${LATTICE_AGENT_CREATE_USER:-1}"
 action="install"
 input_node_id="$node_id"
 
@@ -28,6 +31,7 @@ for a in "$@"; do
       echo "Usage: install.sh [--uninstall]"
       echo "Env: LATTICE_SERVER, LATTICE_NODE_ID, LATTICE_NODE_TOKEN (required for install)"
       echo "     LATTICE_HOME (default /opt/lattice), LATTICE_AGENT_VERSION (default latest)"
+      echo "     LATTICE_AGENT_RUN_USER / LATTICE_AGENT_RUN_GROUP for optional non-root systemd service"
       exit 0 ;;
   esac
 done
@@ -67,6 +71,9 @@ if [ "$(id -u)" -ne 0 ]; then
       LATTICE_SERVER="$server" LATTICE_NODE_ID="$node_id" LATTICE_NODE_TOKEN="$token" \
       LATTICE_AGENT_BIN="$bin_path" LATTICE_AGENT_ENV="$env_path" LATTICE_AGENT_STATE="$state_dir" \
       LATTICE_AGENT_SERVICE="$service_name" \
+      LATTICE_AGENT_RUN_USER="${LATTICE_AGENT_RUN_USER:-}" \
+      LATTICE_AGENT_RUN_GROUP="${LATTICE_AGENT_RUN_GROUP:-}" \
+      LATTICE_AGENT_CREATE_USER="${LATTICE_AGENT_CREATE_USER:-}" \
       LATTICE_AGENT_ALLOW_EXEC="${LATTICE_AGENT_ALLOW_EXEC:-}" \
       LATTICE_AGENT_ALLOW_ROOT_EXEC="${LATTICE_AGENT_ALLOW_ROOT_EXEC:-}" \
       LATTICE_NO_EXEC="${LATTICE_NO_EXEC:-}" \
@@ -142,6 +149,14 @@ detect_systemd_install() {
     if [ -z "${LATTICE_AGENT_STATE:-}" ] && [ "$env_path" = "/opt/lattice/node-agent/agent.env" ]; then
       state_dir="/opt/lattice/node-agent/state"
     fi
+    if [ -z "${LATTICE_AGENT_RUN_USER:-}" ]; then
+      detected_user="$(sed -n 's/^User=//p' "$unit" | sed -n '1p')"
+      [ -n "$detected_user" ] && run_user="$detected_user"
+    fi
+    if [ -z "${LATTICE_AGENT_RUN_GROUP:-}" ]; then
+      detected_group="$(sed -n 's/^Group=//p' "$unit" | sed -n '1p')"
+      [ -n "$detected_group" ] && run_group="$detected_group"
+    fi
     log "adopting existing service ${service_name}.service"
     log "effective binary -> $bin_path"
     log "effective env -> $env_path"
@@ -175,6 +190,7 @@ load_existing_config() {
   fi
 
   for key in \
+    LATTICE_AGENT_RUN_USER LATTICE_AGENT_RUN_GROUP LATTICE_AGENT_CREATE_USER \
     LATTICE_AGENT_ALLOW_EXEC LATTICE_AGENT_ALLOW_ROOT_EXEC LATTICE_NO_EXEC \
     LATTICE_TASK_CGROUP_ROOT LATTICE_TASK_CGROUP_MEMORY_MAX \
     LATTICE_TASK_CGROUP_PIDS_MAX LATTICE_TASK_CGROUP_CPU_MAX \
@@ -196,6 +212,87 @@ detect_systemd_install
 unit_path="${LATTICE_AGENT_UNIT:-/etc/systemd/system/${service_name}.service}"
 openrc_path="/etc/init.d/${service_name}"
 load_existing_config
+run_user="${LATTICE_AGENT_RUN_USER:-$run_user}"
+run_group="${LATTICE_AGENT_RUN_GROUP:-$run_group}"
+create_run_user="${LATTICE_AGENT_CREATE_USER:-$create_run_user}"
+
+validate_account_name() {
+  name="$1"
+  label="$2"
+  case "$name" in
+    ""|-*|*[!A-Za-z0-9_.-]*) die "$label contains unsupported characters: $name" ;;
+  esac
+}
+
+group_exists() {
+  if have getent; then getent group "$1" >/dev/null 2>&1; return $?; fi
+  [ -r /etc/group ] || return 1
+  while IFS=: read -r name _; do
+    [ "$name" = "$1" ] && return 0
+  done </etc/group
+  return 1
+}
+
+create_group_if_needed() {
+  group="$1"
+  group_exists "$group" && return 0
+  [ "$create_run_user" != "0" ] || die "group $group does not exist; create it or unset LATTICE_AGENT_CREATE_USER=0"
+  if have groupadd; then
+    groupadd --system "$group" 2>/dev/null || groupadd "$group"
+  elif have addgroup; then
+    addgroup -S "$group" 2>/dev/null || addgroup "$group"
+  else
+    die "cannot create group $group (missing groupadd/addgroup)"
+  fi
+}
+
+create_user_if_needed() {
+  user="$1"
+  group="$2"
+  if id -u "$user" >/dev/null 2>&1; then
+    return 0
+  fi
+  [ "$create_run_user" != "0" ] || die "user $user does not exist; create it or unset LATTICE_AGENT_CREATE_USER=0"
+  shell="/usr/sbin/nologin"
+  [ -x "$shell" ] || shell="/sbin/nologin"
+  [ -x "$shell" ] || shell="/bin/false"
+  if have useradd; then
+    useradd --system --no-create-home --home-dir "$LATTICE_HOME" --shell "$shell" --gid "$group" "$user" 2>/dev/null || \
+      useradd -r -M -d "$LATTICE_HOME" -s "$shell" -g "$group" "$user"
+  elif have adduser; then
+    adduser -S -D -H -h "$LATTICE_HOME" -s "$shell" -G "$group" "$user" 2>/dev/null || \
+      adduser --system --no-create-home --home "$LATTICE_HOME" --shell "$shell" --ingroup "$group" "$user"
+  else
+    die "cannot create user $user (missing useradd/adduser)"
+  fi
+}
+
+prepare_service_identity() {
+  [ -n "$run_user" ] || return 0
+  [ "$os" = "linux" ] || die "LATTICE_AGENT_RUN_USER is supported only on Linux systemd installs"
+  validate_account_name "$run_user" "LATTICE_AGENT_RUN_USER"
+  if id -u "$run_user" >/dev/null 2>&1; then
+    if [ -z "$run_group" ]; then
+      run_group="$(id -gn "$run_user" 2>/dev/null || true)"
+    fi
+    [ -n "$run_group" ] || die "cannot resolve primary group for $run_user"
+    validate_account_name "$run_group" "LATTICE_AGENT_RUN_GROUP"
+    group_exists "$run_group" || die "group $run_group does not exist"
+    return 0
+  fi
+  [ -n "$run_group" ] || run_group="$run_user"
+  validate_account_name "$run_group" "LATTICE_AGENT_RUN_GROUP"
+  create_group_if_needed "$run_group"
+  create_user_if_needed "$run_user" "$run_group"
+}
+
+apply_service_identity_permissions() {
+  [ -n "$run_user" ] || return 0
+  chgrp "$run_group" "$LATTICE_HOME" || die "cannot set $LATTICE_HOME group to $run_group"
+  chmod 0750 "$LATTICE_HOME" 2>/dev/null || true
+  chown "$run_user:$run_group" "$state_dir" || die "cannot assign $state_dir to $run_user:$run_group"
+  chmod 0750 "$state_dir" 2>/dev/null || true
+}
 
 # ---- service helpers (systemd / openrc / launchd) --------------------------
 svc_kind() {
@@ -248,6 +345,11 @@ elif have sha256;   then sumcheck() {
 else die "need sha256sum, shasum, or sha256 to verify release checksums"; fi
 
 have install || die "missing required command: install"
+kind="$(svc_kind)"
+if [ -n "$run_user" ] && [ "$kind" != "systemd" ]; then
+  die "LATTICE_AGENT_RUN_USER is supported only for systemd installs"
+fi
+prepare_service_identity
 
 # ---- base dir under /opt/lattice -------------------------------------------
 if [ ! -d "$LATTICE_HOME" ]; then
@@ -257,6 +359,7 @@ fi
 [ -w "$LATTICE_HOME" ] || die "$LATTICE_HOME is not writable"
 mkdir -p "$state_dir"
 chmod 0750 "$LATTICE_HOME" 2>/dev/null || true
+apply_service_identity_permissions
 
 # ---- download + verify + install binary ------------------------------------
 artifact="lattice-agent-${os}-${arch}"
@@ -297,6 +400,9 @@ LATTICE_SERVER=$(quote_env "$server")
 LATTICE_NODE_ID=$(quote_env "$node_id")
 LATTICE_NODE_TOKEN=$(quote_env "$token")
 LATTICE_LOG_STATE_DIR=$(quote_env "$state_dir")
+LATTICE_AGENT_RUN_USER=$(quote_env "$run_user")
+LATTICE_AGENT_RUN_GROUP=$(quote_env "$run_group")
+LATTICE_AGENT_CREATE_USER=$(quote_env "$create_run_user")
 LATTICE_AGENT_ALLOW_EXEC=$(quote_env "${LATTICE_AGENT_ALLOW_EXEC:-0}")
 LATTICE_AGENT_ALLOW_ROOT_EXEC=$(quote_env "${LATTICE_AGENT_ALLOW_ROOT_EXEC:-0}")
 LATTICE_NO_EXEC=$(quote_env "${LATTICE_NO_EXEC:-0}")
@@ -324,9 +430,13 @@ chmod 0600 "$env_path"
 ok "wrote env -> $env_path"
 
 # ---- register + start the boot service -------------------------------------
-kind="$(svc_kind)"
 case "$kind" in
   systemd)
+    unit_identity=""
+    if [ -n "$run_user" ]; then
+      unit_identity="User=$run_user
+Group=$run_group"
+    fi
     cat >"$unit_path" <<EOF
 [Unit]
 Description=Lattice node agent
@@ -335,6 +445,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+$unit_identity
 EnvironmentFile=$env_path
 ExecStart=$bin_path
 Delegate=yes

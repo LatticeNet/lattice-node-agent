@@ -199,6 +199,9 @@ func SandboxProfileWithCgroup(allowExec, allowRoot bool, effectiveUID int, cgrou
 		"timeout",
 	}
 	report := SandboxReport{Features: features}
+	if effectiveUID != 0 {
+		report.Features = append(report.Features, "non-root-agent")
+	}
 	if runtime.GOOS == "linux" {
 		report.Level = "linux-rlimit-process-group"
 		report.Features = append(report.Features,

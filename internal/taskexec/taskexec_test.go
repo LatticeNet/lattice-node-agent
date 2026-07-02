@@ -75,7 +75,7 @@ func TestSandboxProfileReportsExecutionPosture(t *testing.T) {
 	}
 
 	enabled := SandboxProfile(true, false, 1000)
-	if !contains(enabled.Features, "interpreter-allowlist") || !contains(enabled.Features, "timeout") {
+	if !contains(enabled.Features, "interpreter-allowlist") || !contains(enabled.Features, "timeout") || !contains(enabled.Features, "non-root-agent") {
 		t.Fatalf("enabled profile missing common features: %+v", enabled)
 	}
 	if runtime.GOOS == "linux" {

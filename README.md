@@ -58,6 +58,22 @@ default; once configured, task launch fails closed if the agent cannot prepare
 or join the task cgroup, so a node does not silently run without the requested
 cap.
 
+For least-privilege Linux systemd installs, set `LATTICE_AGENT_RUN_USER` before
+running `scripts/install.sh`:
+
+```sh
+LATTICE_AGENT_RUN_USER=lattice-agent \
+LATTICE_AGENT_RUN_GROUP=lattice-agent \
+sh scripts/install.sh
+```
+
+The installer creates the user/group when needed, writes `User=`/`Group=` into
+the systemd unit, keeps the token env file root-only, and grants the service
+user ownership of the agent state directory. This profile is best for
+monitoring, inventory, terminal, and non-privileged tasks. Host mutation tasks
+such as nft/WireGuard apply or agent self-update still require a root-capable
+service profile or a separately delegated privileged helper.
+
 The node token is sent in the `Authorization: Bearer` header on every request.
 The loopback `http://127.0.0.1:8088` URL above is safe because the token never
 leaves the host. For a **remote** server the agent refuses to start on a
@@ -262,6 +278,8 @@ missing checksum manifest aborts the install before the binary is written.
   as root.
 - `LATTICE_NO_EXEC=1` is the hard kill switch and overrides execution/terminal
   enablement.
+- `LATTICE_AGENT_RUN_USER` / `LATTICE_AGENT_RUN_GROUP` configure an optional
+  non-root systemd service identity during install or reconfigure.
 - `LATTICE_AGENT_ALLOW_TERMINAL=1` enables audited browser terminal sessions.
 - `LATTICE_TERMINAL_TRANSPORT=poll|stream` selects the terminal transport.
 - `LATTICE_SSH_ALERTS=1` reports accepted sshd logins.

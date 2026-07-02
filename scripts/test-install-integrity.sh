@@ -112,6 +112,20 @@ if ! grep -Fq "wget --https-only -qO" "$ROOT/scripts/install.sh"; then
   exit 1
 fi
 
+for expected in \
+  'LATTICE_AGENT_RUN_USER="${LATTICE_AGENT_RUN_USER:-}"' \
+  'LATTICE_AGENT_RUN_USER=$(quote_env "$run_user")' \
+  'User=$run_user' \
+  'Group=$run_group' \
+  'Delegate=yes' \
+  'chown "$run_user:$run_group" "$state_dir"'
+do
+  if ! grep -Fq "$expected" "$ROOT/scripts/install.sh"; then
+    echo "installer non-root systemd contract missing: $expected" >&2
+    exit 1
+  fi
+done
+
 DARWIN_TMP="$TMP/darwin"
 DARWIN_BIN="$DARWIN_TMP/bin"
 DARWIN_HOME="$DARWIN_TMP/home"
