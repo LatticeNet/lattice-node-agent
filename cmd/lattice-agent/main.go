@@ -438,7 +438,7 @@ func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("monitors status %d", resp.StatusCode)
+		return nil, agentHTTPError(resp, "fetch monitors")
 	}
 	var monitors []model.Monitor
 	if err := json.NewDecoder(resp.Body).Decode(&monitors); err != nil {
@@ -460,7 +460,7 @@ func fetchAgentConfig(cfg agentConfig) (model.AgentConfig, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return model.AgentConfig{}, fmt.Errorf("agent config status %d", resp.StatusCode)
+		return model.AgentConfig{}, agentHTTPError(resp, "fetch agent config")
 	}
 	var out model.AgentConfig
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
@@ -942,7 +942,7 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned %s", resp.Status)
+		return agentHTTPError(resp, "fetch tasks")
 	}
 	var tasks []model.Task
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
@@ -1111,9 +1111,8 @@ func postAgentDebugBatch(cfg agentConfig, batch model.AgentDebugBatch) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("server returned %s", resp.Status)
+		return agentHTTPError(resp, "post agent debug batch")
 	}
 	return nil
 }
@@ -1137,7 +1136,7 @@ func postJSON(url string, bearerToken string, payload any, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("server returned %s", resp.Status)
+		return agentHTTPError(resp, "post "+req.URL.Path)
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -1164,7 +1163,7 @@ func selfcheckControlPlaneWithClient(server string, client *http.Client) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned %s", resp.Status)
+		return agentHTTPError(resp, "selfcheck control plane")
 	}
 	return nil
 }

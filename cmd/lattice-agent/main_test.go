@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,6 +144,96 @@ func TestReportMetricsUsesBearerAuthAndOmitsBodyToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestAgentHTTPErrorIncludesStructuredServerDiagnostics(t *testing.T) {
+	resp := testResponse(http.StatusForbidden, `{"error":{"code":"agent_update_policy_stale","message":"re-plan before approving","request_id":"req-body"}}`)
+	resp.Header.Set(latticeRequestIDHeader, "req-header")
+
+	err := agentHTTPError(resp, "fetch tasks")
+
+	requireErrorContains(t, err, "fetch tasks")
+	requireErrorContains(t, err, "403 Forbidden")
+	requireErrorContains(t, err, "agent_update_policy_stale")
+	requireErrorContains(t, err, "re-plan before approving")
+	requireErrorContains(t, err, "request_id=req-body")
+}
+
+func TestAgentHTTPErrorUsesHeaderRequestIDForTextClientError(t *testing.T) {
+	resp := testResponse(http.StatusTooManyRequests, "retry later")
+	resp.Header.Set(latticeRequestIDHeader, "req-header")
+	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
+
+	err := agentHTTPError(resp, "post /api/agent/logs")
+
+	requireErrorContains(t, err, "429 Too Many Requests")
+	requireErrorContains(t, err, "retry later")
+	requireErrorContains(t, err, "request_id=req-header")
+}
+
+func TestAgentHTTPErrorHidesUnstructuredServerBody(t *testing.T) {
+	resp := testResponse(http.StatusInternalServerError, "database password leaked")
+	resp.Header.Set("Content-Type", "text/plain")
+
+	err := agentHTTPError(resp, "fetch monitors")
+
+	requireErrorContains(t, err, "fetch monitors")
+	requireErrorContains(t, err, "500 Internal Server Error")
+	requireErrorNotContains(t, err, "database password leaked")
+}
+
+func TestPostJSONReturnsStructuredServerDiagnostics(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/agent/task-result" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		resp := testResponse(http.StatusConflict, `{"error":{"code":"task_result_conflict","message":"task already finished","request_id":"req-task"}}`)
+		resp.Header.Set(latticeRequestIDHeader, "req-header")
+		return resp, nil
+	})}
+
+	err := postJSON("http://lattice.test/api/agent/task-result", "node-secret", map[string]any{"ok": true}, nil)
+
+	requireErrorContains(t, err, "post /api/agent/task-result")
+	requireErrorContains(t, err, "409 Conflict")
+	requireErrorContains(t, err, "task_result_conflict")
+	requireErrorContains(t, err, "task already finished")
+	requireErrorContains(t, err, "request_id=req-task")
+}
+
+func TestShipLogBatchReturnsStatusAndStructuredDiagnostics(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/agent/logs" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		if r.Header.Get("Authorization") != "Bearer node-secret" {
+			return testResponse(http.StatusBadRequest, "missing bearer"), nil
+		}
+		resp := testResponse(http.StatusTooManyRequests, `{"error":{"code":"rate_limited","message":"slow down","request_id":"req-log"}}`)
+		resp.Header.Set(latticeRequestIDHeader, "req-header")
+		return resp, nil
+	})}
+
+	status, err := shipLogBatch(agentConfig{
+		Server: "http://lattice.test",
+		NodeID: "node-a",
+		Token:  "node-secret",
+	}, model.LogBatch{SourceID: "src-a", Lines: []string{"hello"}})
+
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", status, http.StatusTooManyRequests)
+	}
+	requireErrorContains(t, err, "ship log batch")
+	requireErrorContains(t, err, "429 Too Many Requests")
+	requireErrorContains(t, err, "rate_limited")
+	requireErrorContains(t, err, "slow down")
+	requireErrorContains(t, err, "request_id=req-log")
 }
 
 func TestReportProxyUsageIncludesCollectorHealthOnSuccess(t *testing.T) {
@@ -564,5 +655,25 @@ func testResponse(status int, body string) *http.Response {
 		Status:     http.StatusText(status),
 		Body:       io.NopCloser(bytes.NewBufferString(body)),
 		Header:     make(http.Header),
+	}
+}
+
+func requireErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error containing %q, got nil", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected error containing %q, got %q", want, err.Error())
+	}
+}
+
+func requireErrorNotContains(t *testing.T, err error, unwanted string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if strings.Contains(err.Error(), unwanted) {
+		t.Fatalf("expected error not to contain %q, got %q", unwanted, err.Error())
 	}
 }

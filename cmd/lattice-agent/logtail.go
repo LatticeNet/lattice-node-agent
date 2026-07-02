@@ -94,7 +94,8 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 	}
 	pending := []string{}
 	var dropped uint64
-	loggedErr := false
+	loggedReadErr := false
+	loggedShipErr := false
 
 	flush := time.NewTicker(logTailFlushInterval)
 	defer flush.Stop()
@@ -106,13 +107,13 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 		}
 		lines, err := tailer.Poll()
 		if err != nil {
-			if !loggedErr {
+			if !loggedReadErr {
 				log.Printf("logtail %s (%s): %v", src.ID, src.Path, err)
-				loggedErr = true
+				loggedReadErr = true
 			}
 			continue
 		}
-		loggedErr = false
+		loggedReadErr = false
 		if len(lines) > 0 {
 			pending = append(pending, lines...)
 			if len(pending) > logTailMaxPending {
@@ -140,10 +141,15 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 			}
 			status, err := shipLogBatch(m.snapshotConfig(), batch)
 			if err != nil || status != http.StatusOK {
+				if err != nil && !loggedShipErr {
+					log.Printf("logtail %s (%s): ship failed: %v", src.ID, src.Path, err)
+					loggedShipErr = true
+				}
 				// Hold position; retry on the next tick. The checkpoint is not
 				// advanced, so a restart re-reads from the last shipped offset.
 				break
 			}
+			loggedShipErr = false
 			dropped = 0
 			pending = pending[n:]
 		}
@@ -198,7 +204,7 @@ func fetchLogSources(cfg agentConfig) ([]model.LogSource, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("log-sources status %d", resp.StatusCode)
+		return nil, agentHTTPError(resp, "fetch log sources")
 	}
 	var out struct {
 		Sources []model.LogSource `json:"sources"`
@@ -227,6 +233,9 @@ func shipLogBatch(cfg agentConfig, batch model.LogBatch) (int, error) {
 		return 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, agentHTTPError(resp, "ship log batch")
+	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	return resp.StatusCode, nil
 }

@@ -243,8 +243,7 @@ func getAgentJSON(cfg agentConfig, path string, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-		return fmt.Errorf("server returned %s", resp.Status)
+		return agentHTTPError(resp, "get "+path)
 	}
 	if out == nil {
 		return nil
