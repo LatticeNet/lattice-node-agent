@@ -207,11 +207,7 @@ func (r *terminalRunner) runStream(ctx context.Context) {
 	}
 
 	cmd := exec.Command(shell)
-	cmd.Env = append(os.Environ(),
-		"TERM=xterm-256color",
-		"LATTICE_TERMINAL_SESSION_ID="+r.session.ID,
-		"LATTICE_NODE_ID="+r.cfg.NodeID,
-	)
+	cmd.Env = terminalShellEnv(os.Environ(), r.session.ID, r.cfg.NodeID)
 	// Do NOT set Setpgid here. creack/pty's StartWithSize already sets Setsid,
 	// which makes the shell a session+group leader (pgrp == pid) — that is the
 	// process group teardown later SIGKILLs via Getpgid + Kill(-pgid). Setting

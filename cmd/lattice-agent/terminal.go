@@ -113,11 +113,7 @@ func (r *terminalRunner) runPoll(ctx context.Context) {
 		return
 	}
 	cmd := exec.CommandContext(ctx, shell)
-	cmd.Env = append(os.Environ(),
-		"TERM=xterm-256color",
-		"LATTICE_TERMINAL_SESSION_ID="+r.session.ID,
-		"LATTICE_NODE_ID="+r.cfg.NodeID,
-	)
+	cmd.Env = terminalShellEnv(os.Environ(), r.session.ID, r.cfg.NodeID)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)})
 	if err != nil {
 		_ = r.postStatus(model.TerminalFailed, err.Error())
