@@ -366,20 +366,33 @@ func parseSingBoxRuntimeConfig(path string, cfg singBoxRuntimeConfig, routeMap m
 			port = strconv.Itoa(in.ListenPort)
 		}
 		nodes = append(nodes, model.SingBoxNode{
-			Name:        name,
-			Protocol:    strings.TrimSpace(in.Type),
-			Network:     network,
-			Address:     addr,
-			Port:        port,
-			SNI:         sni,
-			ListenHost:  strings.TrimSpace(in.Listen),
-			OutboundRef: routeMap[name],
-			UserCount:   len(in.Users),
-			UserKnown:   in.Users != nil,
-			Metadata:    singBoxRuntimeMetadata(in.Lattice),
+			Name:             name,
+			LineID:           singBoxLatticeString(in.Lattice, "line_id"),
+			NodeIdentityUUID: singBoxLatticeString(in.Lattice, "node_uuid"),
+			Protocol:         strings.TrimSpace(in.Type),
+			Network:          network,
+			Address:          addr,
+			Port:             port,
+			SNI:              sni,
+			ListenHost:       strings.TrimSpace(in.Listen),
+			OutboundRef:      routeMap[name],
+			UserCount:        len(in.Users),
+			UserKnown:        in.Users != nil,
+			Metadata:         singBoxRuntimeMetadata(in.Lattice),
 		})
 	}
 	return nodes
+}
+
+func singBoxLatticeString(value map[string]any, key string) string {
+	if len(value) == 0 {
+		return ""
+	}
+	v, ok := value[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(v)
 }
 
 func singBoxRuntimeMetadata(value map[string]any) map[string]string {

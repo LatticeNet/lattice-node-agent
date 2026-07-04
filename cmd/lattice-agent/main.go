@@ -83,14 +83,15 @@ type agentConfig struct {
 	// AllowInsecureHTTP opts in to sending the node token over a non-loopback
 	// http:// server URL. Default false: the agent refuses such a config because
 	// the Authorization: Bearer token would travel in cleartext.
-	AllowInsecureHTTP bool
-	PublicIP          string
-	PublicIPv6        string
-	IPMode            string
-	IPResolvers       string
-	staticPublicIP    string
-	staticPublicIPv6  string
-	ipScript          string
+	AllowInsecureHTTP   bool
+	PublicIP            string
+	PublicIPv6          string
+	LatticeIdentityUUID string
+	IPMode              string
+	IPResolvers         string
+	staticPublicIP      string
+	staticPublicIPv6    string
+	ipScript            string
 	// startup* preserve the launch-time IP flags so a server-pushed NodeIPConfig
 	// override can be cleared back to them.
 	startupIPMode         string
@@ -517,6 +518,10 @@ func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
 	if newEffective := effectiveTerminalTransport(cfg.TerminalTransport); newEffective != oldEffective {
 		log.Printf("lattice-agent terminal transport updated: effective=%s (server override=%q, startup=%s)",
 			newEffective, override, cfg.TerminalTransport)
+	}
+	if identity := strings.TrimSpace(remote.LatticeIdentityUUID); identity != "" && identity != cfg.LatticeIdentityUUID {
+		cfg.LatticeIdentityUUID = identity
+		log.Printf("lattice-agent identity updated: lattice_identity_uuid=%s", identity)
 	}
 
 	applyIPConfigOverride(cfg, remote.IPConfig)

@@ -78,7 +78,7 @@ func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
 				"listen":"::",
 				"listen_port":31001,
 				"users":[{"uuid":"redacted"}],
-				"_lattice":{"owner":"ops","labels":{"tier":"edge"}},
+				"_lattice":{"owner":"ops","line_id":"line-uuid-a","node_uuid":"node-uuid-a","labels":{"tier":"edge"}},
 				"tls":{
 					"enabled":true,
 					"server_name":"www.cloudflare.com",
@@ -115,6 +115,9 @@ func TestDiscoverFallsBackToRuntimeConfigDirectory(t *testing.T) {
 	}
 	if n.ListenHost != "::" || n.OutboundRef != "[openjobs]-qqpw-vds1-vless" || !n.UserKnown || n.UserCount != 1 {
 		t.Fatalf("runtime enrichment wrong: %+v", n)
+	}
+	if n.LineID != "line-uuid-a" || n.NodeIdentityUUID != "node-uuid-a" {
+		t.Fatalf("runtime lattice identity wrong: %+v", n)
 	}
 	if n.Metadata["owner"] != "ops" || n.Metadata["label.tier"] != "edge" {
 		t.Fatalf("runtime metadata wrong: %+v", n.Metadata)
