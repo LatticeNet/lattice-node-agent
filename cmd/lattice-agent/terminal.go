@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -30,18 +31,24 @@ const (
 )
 
 type terminalManager struct {
-	cfg    agentConfig
-	mu     sync.Mutex
-	active map[string]struct{}
+	cfg              agentConfig
+	mu               sync.Mutex
+	active           map[string]struct{}
+	controlConnected atomic.Bool
 }
 
 func runTerminalLoop(ctx context.Context, cfg agentConfig) {
 	manager := &terminalManager{cfg: cfg, active: map[string]struct{}{}}
+	go manager.runControlLoop(ctx)
 	ticker := time.NewTicker(terminalPollInterval)
 	defer ticker.Stop()
 	for {
-		if err := manager.poll(ctx); err != nil {
-			log.Printf("terminal poll error: %v", err)
+		if !manager.controlConnected.Load() {
+			if err := manager.poll(ctx); err != nil {
+				log.Printf("terminal poll error: %v", err)
+			}
+		} else {
+			debugf(cfg, "terminal control stream connected; skipping fallback poll")
 		}
 		select {
 		case <-ctx.Done():
@@ -49,6 +56,22 @@ func runTerminalLoop(ctx context.Context, cfg agentConfig) {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (m *terminalManager) startSession(ctx context.Context, session model.TerminalSession) bool {
+	m.mu.Lock()
+	if _, exists := m.active[session.ID]; exists {
+		m.mu.Unlock()
+		return false
+	}
+	m.active[session.ID] = struct{}{}
+	m.mu.Unlock()
+	runner := &terminalRunner{cfg: m.cfg, session: session}
+	go func() {
+		defer m.remove(session.ID)
+		runner.run(ctx)
+	}()
+	return true
 }
 
 func (m *terminalManager) poll(ctx context.Context) error {
@@ -60,18 +83,7 @@ func (m *terminalManager) poll(ctx context.Context) error {
 		return err
 	}
 	for _, session := range body.Sessions {
-		m.mu.Lock()
-		if _, exists := m.active[session.ID]; exists {
-			m.mu.Unlock()
-			continue
-		}
-		m.active[session.ID] = struct{}{}
-		m.mu.Unlock()
-		runner := &terminalRunner{cfg: m.cfg, session: session}
-		go func() {
-			defer m.remove(session.ID)
-			runner.run(ctx)
-		}()
+		m.startSession(ctx, session)
 	}
 	return nil
 }
@@ -80,6 +92,44 @@ func (m *terminalManager) remove(sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.active, sessionID)
+}
+
+func (m *terminalManager) setControlConnected(connected bool) {
+	m.controlConnected.Store(connected)
+}
+
+func (m *terminalManager) controlOnline() bool {
+	return m.controlConnected.Load()
+}
+
+func (m *terminalManager) logControlError(err error) {
+	if err != nil {
+		debugf(m.cfg, "terminal control stream error: %v", err)
+	}
+}
+
+func (m *terminalManager) pollLegacy(ctx context.Context) error {
+	if m.controlOnline() {
+		return nil
+	}
+	if err := m.poll(ctx); err != nil {
+		log.Printf("terminal poll error: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (m *terminalManager) legacyPollLoop(ctx context.Context) {
+	ticker := time.NewTicker(terminalPollInterval)
+	defer ticker.Stop()
+	for {
+		_ = m.pollLegacy(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 type terminalRunner struct {
