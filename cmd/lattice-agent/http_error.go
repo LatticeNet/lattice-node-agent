@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -18,6 +19,27 @@ const (
 	latticeRequestIDHeader   = "X-Lattice-Request-ID"
 )
 
+type agentHTTPStatusError struct {
+	statusCode int
+	err        error
+}
+
+func (e *agentHTTPStatusError) Error() string {
+	return e.err.Error()
+}
+
+func (e *agentHTTPStatusError) Unwrap() error {
+	return e.err
+}
+
+func agentHTTPStatusCode(err error) (int, bool) {
+	var statusErr *agentHTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.statusCode, true
+	}
+	return 0, false
+}
+
 func agentHTTPError(resp *http.Response, operation string) error {
 	body, truncated := readAgentHTTPErrorBody(resp.Body)
 	requestID := strings.TrimSpace(resp.Header.Get(latticeRequestIDHeader))
@@ -30,14 +52,20 @@ func agentHTTPError(resp *http.Response, operation string) error {
 		if message == "" {
 			message = http.StatusText(resp.StatusCode)
 		}
-		return formatAgentHTTPError(operation, resp, apiErr.Code, message, requestID)
+		return &agentHTTPStatusError{
+			statusCode: resp.StatusCode,
+			err:        formatAgentHTTPError(operation, resp, apiErr.Code, message, requestID),
+		}
 	}
 
 	summary := ""
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 && isAgentTextErrorBody(resp.Header.Get("Content-Type"), body) {
 		summary = truncateAgentHTTPErrorSummary(strings.TrimSpace(string(body)), truncated)
 	}
-	return formatAgentHTTPError(operation, resp, "", summary, requestID)
+	return &agentHTTPStatusError{
+		statusCode: resp.StatusCode,
+		err:        formatAgentHTTPError(operation, resp, "", summary, requestID),
+	}
 }
 
 func readAgentHTTPErrorBody(body io.Reader) ([]byte, bool) {

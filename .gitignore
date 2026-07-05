@@ -5,3 +5,4 @@ coverage.out
 
 # OMC orchestration tool state (not part of the project)
 .omc/
+.ace-tool/

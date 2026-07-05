@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	terminalPollInterval  = 750 * time.Millisecond
+	terminalPollInterval  = 5 * time.Second
 	terminalInputInterval = 250 * time.Millisecond
 	terminalReadChunk     = 4096
 
@@ -162,6 +163,12 @@ func (r *terminalRunner) runPoll(ctx context.Context) {
 			finished = true
 		case <-inputTicker.C:
 			if err := r.pollInputs(ptmx); err != nil {
+				if errors.Is(err, errTerminalSessionGone) {
+					_ = ptmx.Close()
+					waitErr = err
+					finished = true
+					continue
+				}
 				log.Printf("terminal input poll error: %v", err)
 			}
 		}
@@ -182,6 +189,9 @@ func (r *terminalRunner) pollInputs(ptmx *os.File) error {
 	path := fmt.Sprintf("/api/agent/terminal/sessions/%s/inputs?node_id=%s&cursor=%d",
 		url.PathEscape(r.session.ID), url.QueryEscape(r.cfg.NodeID), r.inputCursor)
 	if err := getAgentJSON(r.cfg, path, &body); err != nil {
+		if status, ok := agentHTTPStatusCode(err); ok && (status == http.StatusNotFound || status == http.StatusGone) {
+			return errTerminalSessionGone
+		}
 		return err
 	}
 	for _, input := range body.Inputs {
