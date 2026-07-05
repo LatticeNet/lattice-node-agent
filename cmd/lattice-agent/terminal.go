@@ -98,37 +98,9 @@ func (m *terminalManager) setControlConnected(connected bool) {
 	m.controlConnected.Store(connected)
 }
 
-func (m *terminalManager) controlOnline() bool {
-	return m.controlConnected.Load()
-}
-
 func (m *terminalManager) logControlError(err error) {
 	if err != nil {
 		debugf(m.cfg, "terminal control stream error: %v", err)
-	}
-}
-
-func (m *terminalManager) pollLegacy(ctx context.Context) error {
-	if m.controlOnline() {
-		return nil
-	}
-	if err := m.poll(ctx); err != nil {
-		log.Printf("terminal poll error: %v", err)
-		return err
-	}
-	return nil
-}
-
-func (m *terminalManager) legacyPollLoop(ctx context.Context) {
-	ticker := time.NewTicker(terminalPollInterval)
-	defer ticker.Stop()
-	for {
-		_ = m.pollLegacy(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
 	}
 }
 
