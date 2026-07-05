@@ -24,8 +24,8 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.2.8" {
-		t.Fatalf("version = %q, want 0.2.8", version)
+	if version != "0.3.0" {
+		t.Fatalf("version = %q, want 0.3.0", version)
 	}
 }
 
