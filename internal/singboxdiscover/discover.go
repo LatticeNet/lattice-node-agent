@@ -109,6 +109,11 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 	if listResp.Nodes != nil {
 		inv.Nodes = listResp.Nodes
 	}
+	// `sb --json list` emits only per-inbound fields — no outbound/routing and no
+	// `_lattice`. Best-effort enrich from the on-box config (matched by inbound
+	// tag) so the primary path also carries chain/line data; never overwrites a
+	// value sb already provided, and silently skips if the config is unreadable.
+	enrichSingBoxNodesFromConfig(source, inv.Nodes)
 
 	// Best-effort core version/health; a failure here must not fail discovery.
 	provCtx, cancel2 := context.WithTimeout(ctx, timeout)
@@ -126,30 +131,7 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 }
 
 func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.SingBoxInventory, error) {
-	filesFn := source.runtimeFiles
-	if filesFn == nil {
-		filesFn = singBoxRuntimeConfigFiles
-	}
-	readFn := source.readFile
-	if readFn == nil {
-		readFn = os.ReadFile
-	}
-	files := filesFn()
-	if len(files) == 0 {
-		return model.SingBoxInventory{}, fmt.Errorf("no sing-box runtime config files found")
-	}
-	configs := []singBoxRuntimeConfigFile{}
-	for _, path := range files {
-		raw, err := readFn(path)
-		if err != nil {
-			continue
-		}
-		var cfg singBoxRuntimeConfig
-		if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
-			continue
-		}
-		configs = append(configs, singBoxRuntimeConfigFile{path: path, cfg: cfg})
-	}
+	configs := loadSingBoxRuntimeConfigFiles(source)
 	if len(configs) == 0 {
 		return model.SingBoxInventory{}, fmt.Errorf("no readable sing-box runtime config files found")
 	}
@@ -163,6 +145,120 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 		inv.Nodes = []model.SingBoxNode{}
 	}
 	return inv, nil
+}
+
+// loadSingBoxRuntimeConfigFiles locates and reads the on-box sing-box config
+// files (the running process's -c/-C paths plus the /etc/sing-box defaults) and
+// returns each one that parsed successfully. Returns an empty slice when none
+// are found or readable. Both the config-FALLBACK path and the PRIMARY-path
+// enrichment use this to recover the route/outbound/_lattice data that
+// `sb --json list` omits.
+func loadSingBoxRuntimeConfigFiles(source Source) []singBoxRuntimeConfigFile {
+	filesFn := source.runtimeFiles
+	if filesFn == nil {
+		filesFn = singBoxRuntimeConfigFiles
+	}
+	readFn := source.readFile
+	if readFn == nil {
+		readFn = os.ReadFile
+	}
+	configs := []singBoxRuntimeConfigFile{}
+	for _, path := range filesFn() {
+		raw, err := readFn(path)
+		if err != nil {
+			continue
+		}
+		var cfg singBoxRuntimeConfig
+		if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
+			continue
+		}
+		configs = append(configs, singBoxRuntimeConfigFile{path: path, cfg: cfg})
+	}
+	return configs
+}
+
+type singBoxLatticeIdentity struct {
+	LineID   string
+	NodeUUID string
+}
+
+// singBoxLatticeByInbound indexes each inbound's `_lattice` identity (line_id /
+// node_uuid) by inbound tag, so a primary-path node can recover its LineID /
+// NodeIdentityUUID by matching node.Name to the inbound tag. Inbounds without a
+// tag or without either identity value are skipped.
+func singBoxLatticeByInbound(configs []singBoxRuntimeConfigFile) map[string]singBoxLatticeIdentity {
+	out := map[string]singBoxLatticeIdentity{}
+	for _, parsed := range configs {
+		for _, in := range parsed.cfg.Inbounds {
+			tag := strings.TrimSpace(in.Tag)
+			if tag == "" {
+				continue
+			}
+			ident := singBoxLatticeIdentity{
+				LineID:   singBoxLatticeString(in.Lattice, "line_id"),
+				NodeUUID: singBoxLatticeString(in.Lattice, "node_uuid"),
+			}
+			if ident.LineID == "" && ident.NodeUUID == "" {
+				continue
+			}
+			out[tag] = ident
+		}
+	}
+	return out
+}
+
+// enrichSingBoxNodesFromConfig augments PRIMARY-path (`sb --json list`) nodes
+// with the route/outbound/_lattice data that the sb JSON does not carry. It
+// reads the on-box config ONCE, matches each node by its inbound tag
+// (node.Name == config inbound tag / filename), and fills only fields sb left
+// empty — it NEVER overwrites a value sb already provided. Best-effort: if the
+// config cannot be read, the sb data is returned unchanged.
+func enrichSingBoxNodesFromConfig(source Source, nodes []model.SingBoxNode) {
+	if len(nodes) == 0 {
+		return
+	}
+	configs := loadSingBoxRuntimeConfigFiles(source)
+	if len(configs) == 0 {
+		return
+	}
+	routeMap := singBoxRouteMap(configs)
+	outboundMap := singBoxOutboundMap(configs)
+	latticeByInbound := singBoxLatticeByInbound(configs)
+	for i := range nodes {
+		tag := strings.TrimSpace(nodes[i].Name)
+		if tag == "" {
+			continue
+		}
+		if nodes[i].OutboundRef == "" {
+			if ref, ok := routeMap[tag]; ok {
+				nodes[i].OutboundRef = ref
+			}
+		}
+		if nodes[i].OutboundRef != "" {
+			// outboundMap already zeroes Server/ServerPort for terminal/logical
+			// outbounds (direct/block/dns/selector/urltest), so those inbounds
+			// keep an empty OutboundServer/OutboundPort.
+			if ob, ok := outboundMap[nodes[i].OutboundRef]; ok {
+				if nodes[i].OutboundServer == "" {
+					nodes[i].OutboundServer = ob.Server
+				}
+				if nodes[i].OutboundPort == "" && ob.ServerPort > 0 {
+					nodes[i].OutboundPort = strconv.Itoa(ob.ServerPort)
+				}
+				if nodes[i].OutboundType == "" {
+					nodes[i].OutboundType = ob.Type
+				}
+			}
+		}
+		if ident, ok := latticeByInbound[tag]; ok {
+			if nodes[i].LineID == "" {
+				nodes[i].LineID = ident.LineID
+			}
+			if nodes[i].NodeIdentityUUID == "" {
+				nodes[i].NodeIdentityUUID = ident.NodeUUID
+			}
+		}
+	}
 }
 
 func singBoxRuntimeConfigFiles() []string {
