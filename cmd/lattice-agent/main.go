@@ -34,6 +34,23 @@ import (
 )
 
 var version = "0.3.0"
+var compatServerMin = "alpha-0.2.1a11"
+var compatDashboardMin = "alpha-0.2.1a11"
+var compatChannel = "alpha"
+
+type agentCompatibility struct {
+	ServerMin    string `json:"server_min"`
+	DashboardMin string `json:"dashboard_min"`
+	Channel      string `json:"channel"`
+}
+
+func compatibilityPayload() agentCompatibility {
+	return agentCompatibility{
+		ServerMin:    compatServerMin,
+		DashboardMin: compatDashboardMin,
+		Channel:      compatChannel,
+	}
+}
 
 // httpClient bounds every agent request so a hung or black-holed server cannot
 // wedge the agent's poll loop indefinitely. The total timeout comfortably
@@ -154,6 +171,7 @@ func main() {
 
 	var cfg agentConfig
 	var printVersion bool
+	var printCompat bool
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
@@ -209,9 +227,16 @@ func main() {
 	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
+	flag.BoolVar(&printCompat, "compat-json", false, "print embedded server/dashboard compatibility metadata and exit")
 	flag.Parse()
 	if printVersion {
 		fmt.Println(version)
+		return
+	}
+	if printCompat {
+		if err := json.NewEncoder(os.Stdout).Encode(compatibilityPayload()); err != nil {
+			log.Fatalf("compatibility encode failed: %v", err)
+		}
 		return
 	}
 	cfg.Debug = cfg.LocalDebug
@@ -283,6 +308,7 @@ func main() {
 	refreshIPs(&cfg)
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
+		"compatibility":        compatibilityPayload(),
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
 		"internal_ip":          cfg.InternalIP,
@@ -582,7 +608,8 @@ func reportMetrics(cfg agentConfig) error {
 	sandbox := taskexec.SandboxProfileWithOptions(cfg.AllowExec, cfg.AllowRoot, os.Geteuid(), cfg.taskSandboxOptions())
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
-		"version": version,
+		"version":       version,
+		"compatibility": compatibilityPayload(),
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,

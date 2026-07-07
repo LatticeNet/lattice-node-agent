@@ -373,10 +373,14 @@ go build ./cmd/lattice-agent
 
 ## Releases
 
-Push a `v*` tag to publish Linux and Darwin binaries:
+Push a semver tag to publish Linux and Darwin binaries. During alpha/beta
+development, use prerelease tags such as `v0.3.3-alpha.1`; stable-looking
+`vX.Y.Z` tags are reserved for deliberate stable releases. Prerelease releases
+are marked GitHub prerelease and explicitly not Latest, so server
+`target_version=latest` will not auto-select them.
 
 ```sh
-NEXT_AGENT=v0.3.0
+NEXT_AGENT=v0.3.3-alpha.1
 git tag "$NEXT_AGENT"
 git push origin "$NEXT_AGENT"
 ```
@@ -397,6 +401,13 @@ The tag version is injected into the binary with `-X main.version=...`, so:
 lattice-agent -version
 ```
 
-must match the server update policy target version. Use the matching artifact
-URL and SHA-256 digest from `SHA256SUMS` when configuring server-controlled
-agent updates.
+must match the server update policy target version. Compatibility metadata is
+separate so update scripts can keep strict version checks:
+
+```sh
+lattice-agent -compat-json
+```
+
+Release builds inject the minimum supported server/dashboard channel into that
+JSON. Use the matching artifact URL and SHA-256 digest from `SHA256SUMS` when
+configuring server-controlled agent updates.

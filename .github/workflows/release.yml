@@ -36,9 +36,9 @@ jobs:
       - name: validate release ref
         run: |
           case "$GITHUB_REF_NAME" in
-            v*) ;;
+            v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-alpha.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-rc.[0-9]*) ;;
             *)
-              echo "::error::release workflow must run from a v* tag"
+              echo "::error::release workflow tags must be stable vX.Y.Z or prerelease vX.Y.Z-alpha.N / beta.N / rc.N"
               exit 1
               ;;
           esac
@@ -65,12 +65,16 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           ARTIFACT: ${{ matrix.artifact }}
+          LATTICE_COMPAT_SERVER_MIN: alpha-0.2.1a11
+          LATTICE_COMPAT_DASHBOARD_MIN: alpha-0.2.1a11
+          LATTICE_COMPAT_CHANNEL: alpha
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/$ARTIFACT" ./cmd/lattice-agent
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.compatServerMin=$LATTICE_COMPAT_SERVER_MIN -X main.compatDashboardMin=$LATTICE_COMPAT_DASHBOARD_MIN -X main.compatChannel=$LATTICE_COMPAT_CHANNEL" -o "dist/$ARTIFACT" ./cmd/lattice-agent
           if [ "$GOOS/$GOARCH" = "linux/amd64" ]; then
             test "$(dist/$ARTIFACT -version)" = "$VERSION"
+            dist/$ARTIFACT -compat-json | grep -F "\"server_min\":\"$LATTICE_COMPAT_SERVER_MIN\""
           fi
           (cd dist && sha256sum "$ARTIFACT" > "$ARTIFACT.sha256")
           echo "binary_path=lattice-node-agent/dist/$ARTIFACT" >> "$GITHUB_OUTPUT"
@@ -96,9 +100,9 @@ jobs:
       - name: validate release ref
         run: |
           case "$GITHUB_REF_NAME" in
-            v*) ;;
+            v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-alpha.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*|v[0-9]*.[0-9]*.[0-9]*-rc.[0-9]*) ;;
             *)
-              echo "::error::release workflow must run from a v* tag"
+              echo "::error::release workflow tags must be stable vX.Y.Z or prerelease vX.Y.Z-alpha.N / beta.N / rc.N"
               exit 1
               ;;
           esac
@@ -119,7 +123,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          PRERELEASE=false
+          MAKE_LATEST=true
+          RELEASE_CREATE_FLAGS="--latest"
+          CHANNEL_NOTE="Stable release."
+          case "$GITHUB_REF_NAME" in
+            *-alpha.* | *-beta.* | *-rc.*)
+              PRERELEASE=true
+              MAKE_LATEST=false
+              RELEASE_CREATE_FLAGS="--prerelease --latest=false"
+              CHANNEL_NOTE="Prerelease channel. It must not become GitHub Latest and server latest will not auto-select it."
+              ;;
+          esac
           NOTES="lattice-node-agent $GITHUB_REF_NAME
+
+          $CHANNEL_NOTE
 
           Artifacts:
           - lattice-agent-linux-amd64
@@ -128,9 +146,11 @@ jobs:
           - lattice-agent-darwin-arm64
           - SHA256SUMS
 
-          Use the matching binary URL and SHA-256 digest in Lattice agent update policies. The binary reports version $VERSION through -version."
+          Use the matching binary URL and SHA-256 digest in Lattice agent update policies. The binary reports version $VERSION through -version and compatibility metadata through -compat-json."
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.id')"
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F "prerelease=$PRERELEASE" -f "make_latest=$MAKE_LATEST" >/dev/null
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "lattice-node-agent $GITHUB_REF_NAME" --notes "$NOTES"
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "lattice-node-agent $GITHUB_REF_NAME" --notes "$NOTES" $RELEASE_CREATE_FLAGS
           fi

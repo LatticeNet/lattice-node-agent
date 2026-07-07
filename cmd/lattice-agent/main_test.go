@@ -29,6 +29,16 @@ func TestVersionMatchesCurrentRelease(t *testing.T) {
 	}
 }
 
+func TestCompatibilityPayloadIsEmbedded(t *testing.T) {
+	got := compatibilityPayload()
+	if got.ServerMin == "" || got.DashboardMin == "" || got.Channel == "" {
+		t.Fatalf("compatibility metadata must be embedded: %+v", got)
+	}
+	if got.Channel != "alpha" {
+		t.Fatalf("compatibility channel = %q, want alpha", got.Channel)
+	}
+}
+
 func TestApplyAgentConfigControlsDebugCollection(t *testing.T) {
 	sink := newDebugSink(10)
 	cfg := agentConfig{DebugSink: sink}

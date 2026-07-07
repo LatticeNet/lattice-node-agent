@@ -32,6 +32,11 @@ require "lattice-agent-darwin-amd64" "darwin amd64 release binary"
 require "lattice-agent-darwin-arm64" "darwin arm64 release binary"
 require "SHA256SUMS" "combined checksum manifest"
 require '-X main.version=$VERSION' "release tag injected into agent -version"
+require '-X main.compatServerMin=$LATTICE_COMPAT_SERVER_MIN' "release compatibility server floor injected"
+require '-compat-json' "release binary exposes embedded compatibility metadata"
+require 'vX.Y.Z-alpha.N / beta.N / rc.N' "prerelease tag format guard"
+require '--prerelease --latest=false' "prereleases must not become GitHub Latest"
+require 'make_latest=$MAKE_LATEST' "existing releases have latest/prerelease metadata corrected"
 require "gh release" "GitHub Release publication"
 
 if grep -Fq -- "github.com/LatticeNet/lattice-sdk@v0.2.0" "$workflow"; then
