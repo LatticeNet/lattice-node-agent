@@ -6,6 +6,8 @@ github.com/LatticeNet/lattice-sdk v0.2.15-0.20260704002253-f54c6a701864 h1:kBdso
 github.com/LatticeNet/lattice-sdk v0.2.15-0.20260704002253-f54c6a701864/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
 github.com/LatticeNet/lattice-sdk v0.2.15 h1:1Fkppi0JEA4z7yTTHBr2vcmhubPL5YoLrBkOM92e9Mo=
 github.com/LatticeNet/lattice-sdk v0.2.15/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
+github.com/LatticeNet/lattice-sdk v0.2.16 h1:r+un8z9Z+adupRTf09EbQ26zF4BMOMw55WhNrz1WHh0=
+github.com/LatticeNet/lattice-sdk v0.2.16/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
 github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
 github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
