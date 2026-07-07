@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 func TestDiscoverParsesListAndVersion(t *testing.T) {
@@ -142,6 +144,64 @@ func TestDiscoverProvisionFailureStillReturnsNodes(t *testing.T) {
 	}
 	if inv.Status != "ok" || inv.CoreVersion != "" {
 		t.Fatalf("unexpected: %+v", inv)
+	}
+}
+
+func TestDiscoverRuntimeConfigResolvesOutboundDestination(t *testing.T) {
+	files := map[string]string{
+		"/etc/sing-box/config.json": `{
+			"inbounds":[
+				{"tag":"in-relay","type":"vless","listen":"::","listen_port":20001,"users":[{"uuid":"u1"}]},
+				{"tag":"in-direct","type":"vless","listen":"::","listen_port":20002,"users":[{"uuid":"u2"}]}
+			],
+			"outbounds":[
+				{"tag":"exit-b","type":"vless","server":"198.51.100.9","server_port":443},
+				{"tag":"direct","type":"direct"}
+			],
+			"route":{"rules":[
+				{"inbound":["in-relay"],"action":"route","outbound":"exit-b"},
+				{"inbound":["in-direct"],"action":"route","outbound":"direct"}
+			]}
+		}`,
+	}
+	src := Source{
+		Addr: "203.0.113.1",
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if args[len(args)-1] == "list" {
+				return nil, errors.New("sing-box: unknown flag --json")
+			}
+			return []byte(`{}`), nil
+		},
+		runtimeFiles: func() []string { return []string{"/etc/sing-box/config.json"} },
+		readFile:     func(path string) ([]byte, error) { return []byte(files[path]), nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-relay")
+	if err != nil {
+		t.Fatalf("Discover fallback: %v", err)
+	}
+	if inv.Status != "ok" || len(inv.Nodes) != 2 {
+		t.Fatalf("want 2 nodes ok, got status=%q nodes=%+v", inv.Status, inv.Nodes)
+	}
+	var relay, direct *model.SingBoxNode
+	for i := range inv.Nodes {
+		switch inv.Nodes[i].Name {
+		case "in-relay":
+			relay = &inv.Nodes[i]
+		case "in-direct":
+			direct = &inv.Nodes[i]
+		}
+	}
+	if relay == nil || direct == nil {
+		t.Fatalf("expected both inbounds present: %+v", inv.Nodes)
+	}
+	// The relayed inbound must resolve its outbound tag to the downstream exit.
+	if relay.OutboundRef != "exit-b" || relay.OutboundServer != "198.51.100.9" ||
+		relay.OutboundPort != "443" || relay.OutboundType != "vless" {
+		t.Fatalf("relay outbound resolution wrong: %+v", relay)
+	}
+	// The direct inbound carries no downstream server/port.
+	if direct.OutboundRef != "direct" || direct.OutboundServer != "" || direct.OutboundPort != "" {
+		t.Fatalf("direct outbound must leave server/port empty: %+v", direct)
 	}
 }
 

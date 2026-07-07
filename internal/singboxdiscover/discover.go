@@ -154,9 +154,10 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 		return model.SingBoxInventory{}, fmt.Errorf("no readable sing-box runtime config files found")
 	}
 	routeMap := singBoxRouteMap(configs)
+	outboundMap := singBoxOutboundMap(configs)
 	inv := model.SingBoxInventory{NodeID: nodeID, At: at.UTC(), Status: "ok", Nodes: []model.SingBoxNode{}}
 	for _, parsed := range configs {
-		inv.Nodes = append(inv.Nodes, parseSingBoxRuntimeConfig(parsed.path, parsed.cfg, routeMap, strings.TrimSpace(source.Addr))...)
+		inv.Nodes = append(inv.Nodes, parseSingBoxRuntimeConfig(parsed.path, parsed.cfg, routeMap, outboundMap, strings.TrimSpace(source.Addr))...)
 	}
 	if inv.Nodes == nil {
 		inv.Nodes = []model.SingBoxNode{}
@@ -263,8 +264,9 @@ func containsArg(args []string, want string) bool {
 }
 
 type singBoxRuntimeConfig struct {
-	Inbounds []singBoxRuntimeInbound `json:"inbounds"`
-	Route    *singBoxRuntimeRoute    `json:"route"`
+	Inbounds  []singBoxRuntimeInbound  `json:"inbounds"`
+	Outbounds []singBoxRuntimeOutbound `json:"outbounds"`
+	Route     *singBoxRuntimeRoute     `json:"route"`
 }
 
 type singBoxRuntimeConfigFile struct {
@@ -291,6 +293,13 @@ type singBoxRuntimeRouteRule struct {
 	Inbound  []string `json:"inbound"`
 	Outbound string   `json:"outbound"`
 	Action   string   `json:"action"`
+}
+
+type singBoxRuntimeOutbound struct {
+	Tag        string `json:"tag"`
+	Type       string `json:"type"`
+	Server     string `json:"server"`
+	ServerPort int    `json:"server_port"`
 }
 
 type singBoxRuntimeNetwork struct {
@@ -334,7 +343,35 @@ func singBoxRouteMap(configs []singBoxRuntimeConfigFile) map[string]string {
 	return routes
 }
 
-func parseSingBoxRuntimeConfig(path string, cfg singBoxRuntimeConfig, routeMap map[string]string, addr string) []model.SingBoxNode {
+// singBoxOutboundMap indexes every declared outbound by its tag across all config
+// files so an inbound's outbound tag can be resolved to its downstream
+// destination (server:port). Terminal/logical outbounds (direct/block/dns) and
+// group outbounds (selector/urltest) carry no dest of their own — they still get
+// recorded so the outbound type is known, but their Server/ServerPort stay empty.
+func singBoxOutboundMap(configs []singBoxRuntimeConfigFile) map[string]singBoxRuntimeOutbound {
+	outbounds := map[string]singBoxRuntimeOutbound{}
+	for _, parsed := range configs {
+		for _, ob := range parsed.cfg.Outbounds {
+			tag := strings.TrimSpace(ob.Tag)
+			if tag == "" {
+				continue
+			}
+			ob.Tag = tag
+			ob.Type = strings.TrimSpace(ob.Type)
+			switch ob.Type {
+			case "direct", "block", "dns", "selector", "urltest":
+				ob.Server = ""
+				ob.ServerPort = 0
+			default:
+				ob.Server = strings.TrimSpace(ob.Server)
+			}
+			outbounds[tag] = ob
+		}
+	}
+	return outbounds
+}
+
+func parseSingBoxRuntimeConfig(path string, cfg singBoxRuntimeConfig, routeMap map[string]string, outboundMap map[string]singBoxRuntimeOutbound, addr string) []model.SingBoxNode {
 	nodes := make([]model.SingBoxNode, 0, len(cfg.Inbounds))
 	for _, in := range cfg.Inbounds {
 		if strings.TrimSpace(in.Type) == "" && strings.TrimSpace(in.Tag) == "" && in.ListenPort == 0 {
@@ -365,7 +402,7 @@ func parseSingBoxRuntimeConfig(path string, cfg singBoxRuntimeConfig, routeMap m
 		if in.ListenPort > 0 {
 			port = strconv.Itoa(in.ListenPort)
 		}
-		nodes = append(nodes, model.SingBoxNode{
+		node := model.SingBoxNode{
 			Name:             name,
 			LineID:           singBoxLatticeString(in.Lattice, "line_id"),
 			NodeIdentityUUID: singBoxLatticeString(in.Lattice, "node_uuid"),
@@ -379,7 +416,18 @@ func parseSingBoxRuntimeConfig(path string, cfg singBoxRuntimeConfig, routeMap m
 			UserCount:        len(in.Users),
 			UserKnown:        in.Users != nil,
 			Metadata:         singBoxRuntimeMetadata(in.Lattice),
-		})
+		}
+		// Resolve the outbound tag to its downstream destination so the server can
+		// draw cross-node relay (jump) edges. Terminal outbounds (e.g. "direct")
+		// carry no server/port and leave those fields empty.
+		if ob, ok := outboundMap[node.OutboundRef]; ok {
+			node.OutboundServer = ob.Server
+			if ob.ServerPort > 0 {
+				node.OutboundPort = strconv.Itoa(ob.ServerPort)
+			}
+			node.OutboundType = ob.Type
+		}
+		nodes = append(nodes, node)
 	}
 	return nodes
 }
