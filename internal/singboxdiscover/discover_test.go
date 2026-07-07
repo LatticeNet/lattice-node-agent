@@ -205,6 +205,86 @@ func TestDiscoverRuntimeConfigResolvesOutboundDestination(t *testing.T) {
 	}
 }
 
+func TestPrimaryPathEnrichesFromConfig(t *testing.T) {
+	// `sb --json list` output carries only per-inbound fields. Trojan-41003 also
+	// arrives with an sb-provided line_id, which enrichment must not clobber.
+	listJSON := `{"ok":true,"count":3,"nodes":[
+		{"name":"Trojan-41001.json","protocol":"trojan","port":"41001"},
+		{"name":"VLESS-41002.json","protocol":"vless","port":"41002"},
+		{"name":"Trojan-41003.json","protocol":"trojan","port":"41003","line_id":"sb-provided-line"}
+	]}`
+	files := map[string]string{
+		"/etc/sing-box/config.json": `{
+			"inbounds":[
+				{"tag":"Trojan-41001.json","type":"trojan","listen":"::","listen_port":41001,"_lattice":{"line_id":"line-uuid-a","node_uuid":"node-uuid-a"}},
+				{"tag":"VLESS-41002.json","type":"vless","listen":"::","listen_port":41002,"_lattice":{"line_id":"line-uuid-b","node_uuid":"node-uuid-b"}},
+				{"tag":"Trojan-41003.json","type":"trojan","listen":"::","listen_port":41003,"_lattice":{"line_id":"config-line-c"}}
+			],
+			"outbounds":[
+				{"tag":"exit-hk","type":"trojan","server":"198.51.100.9","server_port":8443},
+				{"tag":"direct","type":"direct"}
+			],
+			"route":{"rules":[
+				{"inbound":["Trojan-41001.json"],"action":"route","outbound":"exit-hk"},
+				{"inbound":["VLESS-41002.json"],"action":"route","outbound":"direct"},
+				{"inbound":["Trojan-41003.json"],"action":"route","outbound":"exit-hk"}
+			]}
+		}`,
+	}
+	src := Source{
+		Addr: "203.0.113.42",
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			switch args[len(args)-1] {
+			case "list":
+				return []byte(listJSON), nil
+			case "provision":
+				return []byte(`{"ok":true,"version":"1.12.0"}`), nil
+			}
+			return nil, errors.New("unexpected command")
+		},
+		runtimeFiles: func() []string { return []string{"/etc/sing-box/config.json"} },
+		readFile:     func(path string) ([]byte, error) { return []byte(files[path]), nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-primary")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if inv.Status != "ok" || len(inv.Nodes) != 3 {
+		t.Fatalf("unexpected inventory: status=%q nodes=%+v", inv.Status, inv.Nodes)
+	}
+	byName := map[string]model.SingBoxNode{}
+	for _, n := range inv.Nodes {
+		byName[n.Name] = n
+	}
+	// Relayed inbound: outbound tag + downstream server:port + line/identity all
+	// recovered from the config that sb omitted.
+	relay := byName["Trojan-41001.json"]
+	if relay.OutboundRef != "exit-hk" || relay.OutboundServer != "198.51.100.9" ||
+		relay.OutboundPort != "8443" || relay.OutboundType != "trojan" {
+		t.Fatalf("relay outbound enrichment wrong: %+v", relay)
+	}
+	if relay.LineID != "line-uuid-a" || relay.NodeIdentityUUID != "node-uuid-a" {
+		t.Fatalf("relay lattice identity enrichment wrong: %+v", relay)
+	}
+	// Direct-routed inbound: outbound tag recorded but no downstream server/port.
+	direct := byName["VLESS-41002.json"]
+	if direct.OutboundRef != "direct" || direct.OutboundServer != "" || direct.OutboundPort != "" {
+		t.Fatalf("direct-routed inbound must leave OutboundServer/Port empty: %+v", direct)
+	}
+	if direct.LineID != "line-uuid-b" {
+		t.Fatalf("direct inbound line enrichment wrong: %+v", direct)
+	}
+	// sb-provided value must survive: config line_id ("config-line-c") must NOT
+	// overwrite the sb-provided one.
+	kept := byName["Trojan-41003.json"]
+	if kept.LineID != "sb-provided-line" {
+		t.Fatalf("sb-provided LineID must not be overwritten, got %q", kept.LineID)
+	}
+	if kept.OutboundRef != "exit-hk" || kept.OutboundServer != "198.51.100.9" {
+		t.Fatalf("outbound enrichment should still apply to sb node: %+v", kept)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
