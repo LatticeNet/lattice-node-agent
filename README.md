@@ -374,13 +374,13 @@ go build ./cmd/lattice-agent
 ## Releases
 
 Push a semver tag to publish Linux and Darwin binaries. During alpha/beta
-development, use prerelease tags such as `v0.3.3-alpha.1`; stable-looking
+development, use prerelease tags such as `v0.2.10-alpha.1`; stable-looking
 `vX.Y.Z` tags are reserved for deliberate stable releases. Prerelease releases
 are marked GitHub prerelease and explicitly not Latest, so server
 `target_version=latest` will not auto-select them.
 
 ```sh
-NEXT_AGENT=v0.3.3-alpha.1
+NEXT_AGENT=v0.2.9
 git tag "$NEXT_AGENT"
 git push origin "$NEXT_AGENT"
 ```

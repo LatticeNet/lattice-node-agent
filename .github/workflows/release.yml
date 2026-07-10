@@ -65,16 +65,22 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           ARTIFACT: ${{ matrix.artifact }}
-          LATTICE_COMPAT_SERVER_MIN: alpha-0.2.1a11
-          LATTICE_COMPAT_DASHBOARD_MIN: alpha-0.2.1a11
-          LATTICE_COMPAT_CHANNEL: alpha
+          LATTICE_COMPAT_SERVER_MIN: v0.2.1
+          LATTICE_COMPAT_DASHBOARD_MIN: v0.2.1
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          LATTICE_COMPAT_CHANNEL=stable
+          case "$GITHUB_REF_NAME" in
+            *-alpha.*) LATTICE_COMPAT_CHANNEL=alpha ;;
+            *-beta.*) LATTICE_COMPAT_CHANNEL=beta ;;
+            *-rc.*) LATTICE_COMPAT_CHANNEL=rc ;;
+          esac
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION -X main.compatServerMin=$LATTICE_COMPAT_SERVER_MIN -X main.compatDashboardMin=$LATTICE_COMPAT_DASHBOARD_MIN -X main.compatChannel=$LATTICE_COMPAT_CHANNEL" -o "dist/$ARTIFACT" ./cmd/lattice-agent
           if [ "$GOOS/$GOARCH" = "linux/amd64" ]; then
             test "$(dist/$ARTIFACT -version)" = "$VERSION"
             dist/$ARTIFACT -compat-json | grep -F "\"server_min\":\"$LATTICE_COMPAT_SERVER_MIN\""
+            dist/$ARTIFACT -compat-json | grep -F "\"channel\":\"$LATTICE_COMPAT_CHANNEL\""
           fi
           (cd dist && sha256sum "$ARTIFACT" > "$ARTIFACT.sha256")
           echo "binary_path=lattice-node-agent/dist/$ARTIFACT" >> "$GITHUB_OUTPUT"
