@@ -300,7 +300,9 @@ missing checksum manifest aborts the install before the binary is written.
 - `LATTICE_TERMINAL_TRANSPORT=poll|stream` selects the terminal transport.
 - `LATTICE_SSH_ALERTS=1` reports accepted sshd logins.
 - `LATTICE_SINGBOX_DISCOVER=1` and `LATTICE_SINGBOX_BIN=sb` enable sing-box
-  discovery.
+  discovery. `LATTICE_SINGBOX_META` overrides the design-15 sidecar path
+  (default `/etc/sing-box/lattice-metadata.json`), which annotates each line
+  with its control-plane `line_uuid` and declared downstream chain edge.
 - `LATTICE_PROXY_USAGE_FILE`, `LATTICE_PROXY_USAGE_URL`, and
   `LATTICE_PROXY_USAGE_XRAY_API` configure proxy usage reporting sources.
 
