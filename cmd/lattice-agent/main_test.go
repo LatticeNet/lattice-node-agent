@@ -145,14 +145,19 @@ func TestReportMetricsUsesBearerAuthAndOmitsBodyToken(t *testing.T) {
 		if _, ok := body["host_facts"].(map[string]any); !ok {
 			return testResponse(http.StatusBadRequest, "missing host_facts"), nil
 		}
+		runtime, ok := body["agent_runtime"].(map[string]any)
+		if !ok || runtime["singbox_stats_api"] != "127.0.0.1:8080" {
+			return testResponse(http.StatusBadRequest, "missing singbox_stats_api"), nil
+		}
 		return testResponse(http.StatusOK, `{"ok":true}`), nil
 	})}
 
 	err := reportMetrics(agentConfig{
-		Server:   "http://lattice.test",
-		NodeID:   "node-a",
-		Token:    "node-secret",
-		Interval: time.Second,
+		Server:          "http://lattice.test",
+		NodeID:          "node-a",
+		Token:           "node-secret",
+		Interval:        time.Second,
+		SingBoxStatsAPI: "127.0.0.1:8080",
 	})
 	if err != nil {
 		t.Fatal(err)

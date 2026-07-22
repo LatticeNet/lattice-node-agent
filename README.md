@@ -305,6 +305,9 @@ missing checksum manifest aborts the install before the binary is written.
   with its control-plane `line_uuid` and declared downstream chain edge.
 - `LATTICE_PROXY_USAGE_FILE`, `LATTICE_PROXY_USAGE_URL`, and
   `LATTICE_PROXY_USAGE_XRAY_API` configure proxy usage reporting sources.
+- `LATTICE_SINGBOX_STATS_API=127.0.0.1:8080` enables the sing-box stats
+  collector (read-only loopback gRPC against the core's experimental API;
+  vendored proto, ADR-004).
 
 If a task-backed dashboard action reports `agent task execution disabled`, rerun
 the node detail page's generated reconfigure command with `allow_exec=true`

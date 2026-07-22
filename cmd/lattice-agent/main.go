@@ -136,6 +136,7 @@ type agentConfig struct {
 	ProxyUsageXrayAPI     string
 	ProxyUsageXrayBin     string
 	ProxyUsageXrayPattern string
+	SingBoxStatsAPI       string
 	SingBoxDiscover       bool
 	SingBoxBin            string
 	SingBoxMeta           string
@@ -159,6 +160,7 @@ type agentRuntimePayload struct {
 	ProxyUsageXrayAPI     string    `json:"proxy_usage_xray_api,omitempty"`
 	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
 	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
+	SingBoxStatsAPI       string    `json:"singbox_stats_api,omitempty"`
 	ReportedAt            time.Time `json:"reported_at,omitempty"`
 }
 
@@ -222,6 +224,7 @@ func main() {
 	flag.StringVar(&cfg.ProxyUsageSecretFile, "proxy-usage-secret-file", os.Getenv("LATTICE_PROXY_USAGE_SECRET_FILE"), "optional file containing bearer secret for -proxy-usage-url")
 	flag.DurationVar(&cfg.ProxyUsageTimeout, "proxy-usage-timeout", envDuration("LATTICE_PROXY_USAGE_TIMEOUT", 3*time.Second), "timeout for -proxy-usage-url and -proxy-usage-xray-api")
 	flag.StringVar(&cfg.ProxyUsageXrayAPI, "proxy-usage-xray-api", os.Getenv("LATTICE_PROXY_USAGE_XRAY_API"), "optional loopback host:port of the xray API inbound; the agent runs `xray api statsquery` against it each interval (no new dependency; see ADR-003)")
+	flag.StringVar(&cfg.SingBoxStatsAPI, "singbox-stats-api", os.Getenv("LATTICE_SINGBOX_STATS_API"), "optional loopback host:port of the sing-box experimental stats API; the agent issues read-only gRPC QueryStats against it each interval (vendored proto; see ADR-004)")
 	flag.StringVar(&cfg.ProxyUsageXrayBin, "proxy-usage-xray-bin", os.Getenv("LATTICE_PROXY_USAGE_XRAY_BIN"), "xray binary for -proxy-usage-xray-api (default \"xray\" resolved on PATH)")
 	flag.StringVar(&cfg.ProxyUsageXrayPattern, "proxy-usage-xray-pattern", os.Getenv("LATTICE_PROXY_USAGE_XRAY_PATTERN"), "optional stat-name filter for -proxy-usage-xray-api (default \"user>>>\")")
 	flag.BoolVar(&cfg.SingBoxDiscover, "singbox-discover", os.Getenv("LATTICE_SINGBOX_DISCOVER") == "1", "report on-box sing-box nodes each interval by running read-only `sb --json list` (adoption bridge; read-only, no node mutation)")
@@ -629,6 +632,7 @@ func reportMetrics(cfg agentConfig) error {
 			ProxyUsageXrayAPI:     cfg.ProxyUsageXrayAPI,
 			ProxyUsageXrayBin:     cfg.ProxyUsageXrayBin,
 			ProxyUsageXrayPattern: cfg.ProxyUsageXrayPattern,
+			SingBoxStatsAPI:       cfg.SingBoxStatsAPI,
 			ReportedAt:            time.Now().UTC(),
 		},
 		"public_ip":     cfg.PublicIP,
@@ -810,8 +814,9 @@ func reportProxyUsage(cfg agentConfig) error {
 	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
 	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
 	hasXray := strings.TrimSpace(cfg.ProxyUsageXrayAPI) != ""
+	hasSingBox := strings.TrimSpace(cfg.SingBoxStatsAPI) != ""
 	configured := 0
-	for _, on := range []bool{hasFile, hasURL, hasXray} {
+	for _, on := range []bool{hasFile, hasURL, hasXray, hasSingBox} {
 		if on {
 			configured++
 		}
@@ -820,7 +825,7 @@ func reportProxyUsage(cfg agentConfig) error {
 		return nil
 	}
 	if configured > 1 {
-		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, or proxy-usage-xray-api")
+		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, proxy-usage-xray-api, or singbox-stats-api")
 	}
 	var (
 		snapshot model.ProxyUsageSnapshot
@@ -836,6 +841,12 @@ func reportProxyUsage(cfg agentConfig) error {
 		snapshot, err = proxyusage.LoadHTTP(context.Background(), proxyusage.HTTPSource{
 			URL:     cfg.ProxyUsageURL,
 			Secret:  cfg.ProxyUsageSecret,
+			Timeout: cfg.ProxyUsageTimeout,
+		}, cfg.NodeID)
+	case hasSingBox:
+		source = "singbox-stats"
+		snapshot, err = proxyusage.LoadSingBoxStats(context.Background(), proxyusage.SingBoxStatsSource{
+			APIAddr: cfg.SingBoxStatsAPI,
 			Timeout: cfg.ProxyUsageTimeout,
 		}, cfg.NodeID)
 	default:
@@ -931,15 +942,16 @@ func validateProxyUsageConfig(cfg agentConfig) error {
 	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
 	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
 	hasXray := strings.TrimSpace(cfg.ProxyUsageXrayAPI) != ""
+	hasSingBox := strings.TrimSpace(cfg.SingBoxStatsAPI) != ""
 	hasSecretFile := strings.TrimSpace(cfg.ProxyUsageSecretFile) != ""
 	configured := 0
-	for _, on := range []bool{hasFile, hasURL, hasXray} {
+	for _, on := range []bool{hasFile, hasURL, hasXray, hasSingBox} {
 		if on {
 			configured++
 		}
 	}
 	if configured > 1 {
-		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, or proxy-usage-xray-api")
+		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, proxy-usage-xray-api, or singbox-stats-api")
 	}
 	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" && hasSecretFile {
 		return fmt.Errorf("configure either proxy-usage-secret or proxy-usage-secret-file, not both")
@@ -966,6 +978,13 @@ func validateProxyUsageConfig(cfg agentConfig) error {
 			Binary:  cfg.ProxyUsageXrayBin,
 			APIAddr: cfg.ProxyUsageXrayAPI,
 			Pattern: cfg.ProxyUsageXrayPattern,
+		}); err != nil {
+			return err
+		}
+	}
+	if hasSingBox {
+		if err := proxyusage.ValidateSingBoxStatsSource(proxyusage.SingBoxStatsSource{
+			APIAddr: cfg.SingBoxStatsAPI,
 		}); err != nil {
 			return err
 		}
