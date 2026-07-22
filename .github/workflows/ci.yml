@@ -34,10 +34,9 @@ jobs:
         working-directory: lattice-node-agent
         run: go test -race -cover ./...
       - name: gosec
-        working-directory: lattice-node-agent
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec ./...
+          gosec ./lattice-node-agent/...
       - name: govulncheck
         working-directory: lattice-node-agent
         run: |
