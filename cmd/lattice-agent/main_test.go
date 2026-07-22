@@ -24,8 +24,8 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.2.9" {
-		t.Fatalf("version = %q, want 0.2.9", version)
+	if version != "0.3.3-alpha.1" {
+		t.Fatalf("version = %q, want 0.3.3-alpha.1", version)
 	}
 }
 
@@ -34,11 +34,11 @@ func TestCompatibilityPayloadIsEmbedded(t *testing.T) {
 	if got.ServerMin == "" || got.DashboardMin == "" || got.Channel == "" {
 		t.Fatalf("compatibility metadata must be embedded: %+v", got)
 	}
-	if got.Channel != "stable" {
-		t.Fatalf("compatibility channel = %q, want stable", got.Channel)
+	if got.Channel != "alpha" {
+		t.Fatalf("compatibility channel = %q, want alpha", got.Channel)
 	}
-	if got.ServerMin != "v0.2.1" || got.DashboardMin != "v0.2.1" {
-		t.Fatalf("compatibility floor = %+v, want coordinated v0.2.1", got)
+	if got.ServerMin != "v0.2.2-alpha.2" || got.DashboardMin != "v0.2.2-alpha.7" {
+		t.Fatalf("compatibility floor = %+v, want coordinated design-15 alpha", got)
 	}
 }
 

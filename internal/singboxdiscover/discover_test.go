@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -425,6 +429,57 @@ func TestDiscoverSidecarCorruptLogsAndContinues(t *testing.T) {
 	}
 }
 
+func TestDiscoverSidecarReadPermissionErrorLogsAndContinues(t *testing.T) {
+	var logs []string
+	src := Source{
+		MetaPath:     "/etc/sing-box/lattice-metadata.json",
+		runner:       listOnlyRunner(t, sidecarTestList),
+		runtimeFiles: func() []string { return nil },
+		readFile: func(string) ([]byte, error) {
+			return nil, os.ErrPermission
+		},
+		Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	}
+	inv, err := Discover(context.Background(), src, "node-permission")
+	if err != nil || inv.Nodes[0].LineUUID != "" {
+		t.Fatalf("unreadable sidecar must return only base inventory: inv=%+v err=%v", inv, err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "permission") {
+		t.Fatalf("permission error must be surfaced once, got %v", logs)
+	}
+}
+
+func TestDiscoverSidecarInvalidV2IsRejectedAtomically(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"wrong schema", `{"schema":"lattice.singbox-metadata.v3","inbounds":[]}`},
+		{"bad uuid", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"vless-31001","line_uuid":"not-a-uuid"}]}`},
+		{"duplicate tag", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"vless-31001","line_uuid":"11111111-1111-4111-8111-111111111111"},{"tag":"vless-31001","line_uuid":"22222222-2222-4222-8222-222222222222"}]}`},
+		{"self chain", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"vless-31001","line_uuid":"11111111-1111-4111-8111-111111111111","chain":{"downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}}]}`},
+		{"local cycle", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"a","line_uuid":"11111111-1111-4111-8111-111111111111","chain":{"downstream_line_uuid":"22222222-2222-4222-8222-222222222222"}},{"tag":"b","line_uuid":"22222222-2222-4222-8222-222222222222","chain":{"downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs []string
+			src := Source{
+				MetaPath:     "/meta.json",
+				runner:       listOnlyRunner(t, sidecarTestList),
+				runtimeFiles: func() []string { return nil },
+				readFile:     func(string) ([]byte, error) { return []byte(tc.raw), nil },
+				Logf:         func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+			}
+			inv, err := Discover(context.Background(), src, "node-invalid")
+			if err != nil || inv.Nodes[0].LineUUID != "" || inv.Nodes[0].DownstreamLineUUID != "" {
+				t.Fatalf("invalid v2 must be rejected as a whole: inv=%+v err=%v", inv, err)
+			}
+			if len(logs) != 1 || !strings.Contains(logs[0], "invalid") {
+				t.Fatalf("invalid v2 must be surfaced once, got %v", logs)
+			}
+		})
+	}
+}
+
 func TestDiscoverSidecarV1Ignored(t *testing.T) {
 	var logs []string
 	src := Source{
@@ -512,7 +567,7 @@ func TestPrimaryPathEnrichesFromInspect(t *testing.T) {
 
 func TestInspectUnavailableFallsBackToConfig(t *testing.T) {
 	var logs []string
-	inspectCalls := 0
+	var inspectCalls atomic.Int32
 	files := map[string]string{
 		"/etc/sing-box/config.json": `{
 			"inbounds":[{"tag":"Trojan-41001.json","type":"trojan","listen":"::","listen_port":41001,"_lattice":{"line_id":"line-uuid-a"}}],
@@ -528,7 +583,7 @@ func TestInspectUnavailableFallsBackToConfig(t *testing.T) {
 			case "provision":
 				return []byte(`{}`), nil
 			}
-			inspectCalls++
+			inspectCalls.Add(1)
 			return nil, errors.New("sb: unknown command inspect") // old sb build
 		},
 		runtimeFiles: func() []string { return []string{"/etc/sing-box/config.json"} },
@@ -543,8 +598,8 @@ func TestInspectUnavailableFallsBackToConfig(t *testing.T) {
 	if n.OutboundRef != "exit-hk" || n.OutboundServer != "198.51.100.9" || n.LineID != "line-uuid-a" {
 		t.Fatalf("config join must still enrich when inspect is unavailable: %+v", n)
 	}
-	if inspectCalls != 1 {
-		t.Fatalf("first inspect failure must stop further inspect calls, got %d", inspectCalls)
+	if inspectCalls.Load() != 1 {
+		t.Fatalf("first inspect failure must stop further inspect calls, got %d", inspectCalls.Load())
 	}
 	if len(logs) != 1 || !strings.Contains(logs[0], "inspect unavailable") {
 		t.Fatalf("inspect degradation must be logged once, got %v", logs)
@@ -558,7 +613,7 @@ func TestInspectBudgetTruncates(t *testing.T) {
 		rows = append(rows, fmt.Sprintf(`{"name":%q,"protocol":"vless","port":"31001"}`, name))
 	}
 	listJSON := `{"ok":true,"count":5,"nodes":[` + strings.Join(rows, ",") + `]}`
-	inspectCalls := 0
+	var inspectCalls atomic.Int32
 	src := Source{
 		MaxInspect: 3,
 		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
@@ -569,7 +624,7 @@ func TestInspectBudgetTruncates(t *testing.T) {
 			case "provision":
 				return []byte(`{}`), nil
 			}
-			inspectCalls++
+			inspectCalls.Add(1)
 			return []byte(`{"ok":true,"line":{"tag":"` + last + `","outbound":{"tag":"direct","protocol":"direct"}}}`), nil
 		},
 		runtimeFiles: func() []string { return nil },
@@ -578,13 +633,66 @@ func TestInspectBudgetTruncates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
-	if inspectCalls != 3 {
-		t.Fatalf("inspect calls must be bounded by MaxInspect=3, got %d", inspectCalls)
+	if inspectCalls.Load() != 3 {
+		t.Fatalf("inspect calls must be bounded by MaxInspect=3, got %d", inspectCalls.Load())
 	}
 	for i, n := range inv.Nodes {
 		enriched := n.OutboundRef == "direct"
 		if (i < 3) != enriched {
 			t.Fatalf("only the first 3 lines may be inspect-enriched: node %d %+v", i, n)
 		}
+	}
+}
+
+func TestInspectUsesAggregateDeadlineAndBoundedConcurrency(t *testing.T) {
+	var rows []string
+	for i := 0; i < 17; i++ {
+		rows = append(rows, fmt.Sprintf(`{"name":"n%d.json","protocol":"vless","port":"31001"}`, i))
+	}
+	listJSON := `{"ok":true,"count":17,"nodes":[` + strings.Join(rows, ",") + `]}`
+	var mu sync.Mutex
+	active, peak := 0, 0
+	src := Source{
+		Timeout:    120 * time.Millisecond,
+		MaxInspect: 17,
+		runner: func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+			last := args[len(args)-1]
+			switch last {
+			case "list":
+				return []byte(listJSON), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			mu.Lock()
+			active++
+			if active > peak {
+				peak = active
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				active--
+				mu.Unlock()
+			}()
+			select {
+			case <-time.After(40 * time.Millisecond):
+				return []byte(`{"ok":true,"line":{"outbound":{"tag":"direct"}}}`), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		runtimeFiles: func() []string { return nil },
+	}
+	started := time.Now()
+	_, err := Discover(context.Background(), src, "node-deadline")
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if elapsed > 280*time.Millisecond {
+		t.Fatalf("inspect aggregate deadline exceeded: %v", elapsed)
+	}
+	if peak < 2 || peak > maxInspectWorkers {
+		t.Fatalf("inspect concurrency peak = %d, want 2..%d", peak, maxInspectWorkers)
 	}
 }

@@ -33,10 +33,10 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.2.9"
-var compatServerMin = "v0.2.1"
-var compatDashboardMin = "v0.2.1"
-var compatChannel = "stable"
+var version = "0.3.3-alpha.1"
+var compatServerMin = "v0.2.2-alpha.2"
+var compatDashboardMin = "v0.2.2-alpha.7"
+var compatChannel = "alpha"
 
 type agentCompatibility struct {
 	ServerMin    string `json:"server_min"`

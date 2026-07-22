@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -33,7 +35,9 @@ const (
 	defaultMetaPath = "/etc/sing-box/lattice-metadata.json"
 	// maxInspectCalls bounds the per-line `sb --json inspect <name>` enrichment
 	// so a large fleet cannot stretch the discovery cycle.
-	maxInspectCalls = 64
+	maxInspectCalls            = 64
+	maxInspectWorkers          = 4
+	defaultInspectTotalTimeout = 2 * time.Second
 )
 
 // Source configures on-box sing-box discovery.
@@ -307,8 +311,8 @@ type sbInspectLine struct {
 // enrichSingBoxNodesFromInspect fills the per-line fields `sb --json list`
 // omits (outbound tag/type, _lattice identity, user roster) by calling
 // `sb --json inspect <name>` once per line. Bounded in call count
-// (Source.MaxInspect, default maxInspectCalls) and in per-call time (the source
-// timeout), so it cannot stretch the discovery cycle. If the FIRST inspect call
+// (Source.MaxInspect, default maxInspectCalls), concurrency, and one aggregate
+// deadline, so it cannot stretch the discovery cycle. If the FIRST inspect call
 // fails or returns non-JSON, the deployed sb predates the subcommand and the
 // remaining lines are left to the config join instead. Fill-only-empty: a value
 // sb already provided is never overwritten.
@@ -317,9 +321,13 @@ func enrichSingBoxNodesFromInspect(ctx context.Context, source Source, run func(
 	if maxInspect <= 0 {
 		maxInspect = maxInspectCalls
 	}
-	calls := 0
+	type candidate struct {
+		index int
+		name  string
+	}
+	candidates := make([]candidate, 0, maxInspect)
 	for i := range nodes {
-		if calls >= maxInspect {
+		if len(candidates) >= maxInspect {
 			break
 		}
 		name := strings.TrimSpace(nodes[i].Name)
@@ -331,28 +339,32 @@ func enrichSingBoxNodesFromInspect(ctx context.Context, source Source, run func(
 		if nodes[i].OutboundRef != "" && nodes[i].LineID != "" && nodes[i].UserKnown {
 			continue
 		}
-		calls++
-		inspectCtx, cancel := context.WithTimeout(ctx, timeout)
-		out, err := run(inspectCtx, binary, append(append([]string(nil), base...), "inspect", name)...)
-		cancel()
+		candidates = append(candidates, candidate{index: i, name: name})
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	totalTimeout := timeout
+	if totalTimeout <= 0 || totalTimeout > defaultInspectTotalTimeout {
+		totalTimeout = defaultInspectTotalTimeout
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+
+	inspect := func(c candidate) (sbInspectLine, error) {
+		out, err := run(inspectCtx, binary, append(append([]string(nil), base...), "inspect", c.name)...)
 		if err != nil {
-			if calls == 1 {
-				logf(source, "sing-box inspect unavailable (%v); continuing without per-line inspect enrichment", boundedErr(err))
-				return
-			}
-			continue
+			return sbInspectLine{}, err
 		}
 		var resp struct {
 			Line sbInspectLine `json:"line"`
 		}
 		if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
-			if calls == 1 {
-				logf(source, "sing-box inspect output undecodable (%v); continuing without per-line inspect enrichment", boundedErr(err))
-				return
-			}
-			continue
+			return sbInspectLine{}, fmt.Errorf("decode inspect: %w", err)
 		}
-		line := resp.Line
+		return resp.Line, nil
+	}
+	apply := func(i int, line sbInspectLine) {
 		if nodes[i].ListenHost == "" {
 			nodes[i].ListenHost = strings.TrimSpace(line.ListenHost)
 		}
@@ -374,6 +386,61 @@ func enrichSingBoxNodesFromInspect(ctx context.Context, source Source, run func(
 		if !nodes[i].UserKnown && line.Users != nil {
 			nodes[i].UserCount = len(line.Users)
 			nodes[i].UserKnown = true
+		}
+	}
+
+	// Probe once before launching workers. Old sb builds lack `inspect`; this
+	// keeps their one-call degradation behavior while allowing supported builds
+	// to enrich the remaining fleet concurrently under one discovery deadline.
+	first, err := inspect(candidates[0])
+	if err != nil {
+		logf(source, "sing-box inspect unavailable (%v); continuing without per-line inspect enrichment", boundedErr(err))
+		return
+	}
+	apply(candidates[0].index, first)
+	if len(candidates) == 1 {
+		return
+	}
+
+	jobs := make(chan candidate)
+	type result struct {
+		candidate candidate
+		line      sbInspectLine
+		err       error
+	}
+	results := make(chan result, len(candidates)-1)
+	workers := maxInspectWorkers
+	if workers > len(candidates)-1 {
+		workers = len(candidates) - 1
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for c := range jobs {
+				line, err := inspect(c)
+				results <- result{candidate: c, line: line, err: err}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, c := range candidates[1:] {
+			select {
+			case jobs <- c:
+			case <-inspectCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for r := range results {
+		if r.err == nil {
+			apply(r.candidate.index, r.line)
 		}
 	}
 }
@@ -413,7 +480,11 @@ func applySingBoxSidecar(source Source, nodes []model.SingBoxNode) {
 	}
 	raw, err := readFn(metaPath)
 	if err != nil {
-		return // no sidecar on this node: nothing to annotate
+		if errors.Is(err, os.ErrNotExist) {
+			return // no sidecar on this node: nothing to annotate
+		}
+		logf(source, "sing-box sidecar %s unreadable (%v); reporting base inventory", metaPath, boundedErr(err))
+		return
 	}
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
@@ -424,8 +495,12 @@ func applySingBoxSidecar(source Source, nodes []model.SingBoxNode) {
 		logf(source, "sing-box sidecar %s unreadable (%v); reporting base inventory", metaPath, boundedErr(err))
 		return
 	}
-	if meta.Schema != "lattice.singbox-metadata.v2" || len(meta.Inbounds) == 0 {
+	if meta.Schema == "" {
 		return // legacy v1 flat sidecar: no per-line annotations
+	}
+	if err := validateSingBoxSidecar(meta); err != nil {
+		logf(source, "sing-box sidecar %s invalid (%v); reporting base inventory", metaPath, boundedErr(err))
+		return
 	}
 	type sidecarLine struct {
 		lineUUID           string
@@ -455,6 +530,71 @@ func applySingBoxSidecar(source Source, nodes []model.SingBoxNode) {
 			nodes[i].DownstreamLineUUID = entry.downstreamLineUUID
 		}
 	}
+}
+
+func validateSingBoxSidecar(meta singBoxSidecar) error {
+	if meta.Schema != "lattice.singbox-metadata.v2" {
+		return fmt.Errorf("unsupported schema %q", meta.Schema)
+	}
+	byTag := make(map[string]struct{}, len(meta.Inbounds))
+	byUUID := make(map[string]struct{}, len(meta.Inbounds))
+	next := make(map[string]string, len(meta.Inbounds))
+	for _, in := range meta.Inbounds {
+		tag := strings.TrimSpace(in.Tag)
+		lineUUID := strings.ToLower(strings.TrimSpace(in.LineUUID))
+		if tag == "" || !isUUIDv4(lineUUID) {
+			return fmt.Errorf("inbound has invalid tag or line_uuid")
+		}
+		if _, exists := byTag[tag]; exists {
+			return fmt.Errorf("duplicate inbound tag %q", tag)
+		}
+		if _, exists := byUUID[lineUUID]; exists {
+			return fmt.Errorf("duplicate line_uuid %q", lineUUID)
+		}
+		byTag[tag] = struct{}{}
+		byUUID[lineUUID] = struct{}{}
+		if in.Chain != nil && in.Chain.DownstreamLineUUID != nil {
+			downstream := strings.ToLower(strings.TrimSpace(*in.Chain.DownstreamLineUUID))
+			if !isUUIDv4(downstream) {
+				return fmt.Errorf("inbound %q has invalid downstream_line_uuid", tag)
+			}
+			if downstream == lineUUID {
+				return fmt.Errorf("inbound %q has a self-referential chain", tag)
+			}
+			next[lineUUID] = downstream
+		}
+	}
+	for start := range next {
+		seen := map[string]struct{}{}
+		for current := start; current != ""; current = next[current] {
+			if _, local := byUUID[current]; !local {
+				break // a declared cross-node edge cannot be validated locally
+			}
+			if _, repeated := seen[current]; repeated {
+				return fmt.Errorf("sidecar contains a local chain cycle")
+			}
+			seen[current] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func isUUIDv4(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value[14] != '4' {
+		return false
+	}
+	if value[19] != '8' && value[19] != '9' && value[19] != 'a' && value[19] != 'b' {
+		return false
+	}
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // logf routes a best-effort degradation note through the source's Logf seam
