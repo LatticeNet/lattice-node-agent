@@ -107,7 +107,12 @@ func TestGRPCQueryStatsEndToEnd(t *testing.T) {
 	}}
 	listener := bufconn.Listen(1 << 20)
 	server := grpc.NewServer()
-	singboxstats.RegisterStatsServiceServer(server, fake)
+	// sing-box aliases the generated service name for V2Ray client
+	// compatibility. Register the fake under that runtime name so this test
+	// catches clients that only work against the unaliased generated package.
+	desc := singboxstats.StatsService_ServiceDesc
+	desc.ServiceName = "v2ray.core.app.stats.command.StatsService"
+	server.RegisterService(&desc, fake)
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
 		server.Stop()

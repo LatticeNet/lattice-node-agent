@@ -15,6 +15,10 @@ import (
 const (
 	defaultSingBoxStatsPattern = "user>>>"
 	defaultSingBoxStatsTimeout = 5 * time.Second
+	// sing-box rewrites its generated StatsService descriptor at runtime to
+	// the V2Ray-compatible service name. The protobuf messages keep the local
+	// experimental.v2rayapi package, but clients must invoke this aliased path.
+	singBoxStatsQueryMethod = "/v2ray.core.app.stats.command.StatsService/QueryStats"
 )
 
 // SingBoxStatsSource collects per-user usage from sing-box's experimental
@@ -125,9 +129,11 @@ func grpcQueryStats(ctx context.Context, addr, pattern string) ([]nameValue, err
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
-	resp, err := singboxstats.NewStatsServiceClient(conn).QueryStats(ctx, &singboxstats.QueryStatsRequest{
+	request := &singboxstats.QueryStatsRequest{
 		Patterns: []string{pattern},
-	})
+	}
+	resp := new(singboxstats.QueryStatsResponse)
+	err = conn.Invoke(ctx, singBoxStatsQueryMethod, request, resp)
 	if err != nil {
 		return nil, err
 	}
