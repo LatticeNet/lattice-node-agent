@@ -2,7 +2,7 @@ module github.com/LatticeNet/lattice-node-agent
 
 go 1.26
 
-require github.com/LatticeNet/lattice-sdk v0.2.17
+require github.com/LatticeNet/lattice-sdk v0.2.18-0.20260722123932-4a318f246d23
 
 require github.com/creack/pty v1.1.24
 

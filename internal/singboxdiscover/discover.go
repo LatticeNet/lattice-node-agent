@@ -11,13 +11,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -27,6 +30,14 @@ const (
 	defaultBinary  = "sb"
 	defaultTimeout = 8 * time.Second
 	maxOutputBytes = 1 << 20 // 1 MiB
+	// defaultMetaPath is the design-15 sidecar written by the server/sb next to
+	// (never inside) the sing-box -C directory; sing-box itself never reads it.
+	defaultMetaPath = "/etc/sing-box/lattice-metadata.json"
+	// maxInspectCalls bounds the per-line `sb --json inspect <name>` enrichment
+	// so a large fleet cannot stretch the discovery cycle.
+	maxInspectCalls            = 64
+	maxInspectWorkers          = 4
+	defaultInspectTotalTimeout = 2 * time.Second
 )
 
 // Source configures on-box sing-box discovery.
@@ -39,6 +50,14 @@ type Source struct {
 	Addr string
 	// Timeout bounds each sb invocation; default 8s.
 	Timeout time.Duration
+	// MetaPath is the design-15 sidecar path; default
+	// /etc/sing-box/lattice-metadata.json (LATTICE_SINGBOX_META in the agent).
+	MetaPath string
+	// MaxInspect bounds per-line `sb --json inspect` enrichment calls; default 64.
+	MaxInspect int
+	// Logf receives best-effort degradation notes (unavailable inspect, corrupt
+	// sidecar); default log.Printf. Discovery never fails on these.
+	Logf func(format string, args ...any)
 	// Now is a test seam.
 	Now func() time.Time
 	// runner is a test seam; production uses runBoundedCommand.
@@ -110,10 +129,16 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 		inv.Nodes = listResp.Nodes
 	}
 	// `sb --json list` emits only per-inbound fields — no outbound/routing and no
-	// `_lattice`. Best-effort enrich from the on-box config (matched by inbound
-	// tag) so the primary path also carries chain/line data; never overwrites a
-	// value sb already provided, and silently skips if the config is unreadable.
+	// `_lattice`. Best-effort enrich, first via per-line `sb --json inspect
+	// <name>` (bounded; sb builds predating the subcommand degrade silently),
+	// then from the on-box config (matched by inbound tag), which also resolves
+	// the outbound server/port that inspect does not carry. Neither overwrites a
+	// value sb already provided; both skip quietly when their source is missing.
+	enrichSingBoxNodesFromInspect(ctx, source, run, binary, base, timeout, inv.Nodes)
 	enrichSingBoxNodesFromConfig(source, inv.Nodes)
+	// design-15 sidecar annotations (line_uuid + declared chain edges), joined by
+	// inbound tag. Read-only: a missing/corrupt file never fails discovery.
+	applySingBoxSidecar(source, inv.Nodes)
 
 	// Best-effort core version/health; a failure here must not fail discovery.
 	provCtx, cancel2 := context.WithTimeout(ctx, timeout)
@@ -144,6 +169,9 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 	if inv.Nodes == nil {
 		inv.Nodes = []model.SingBoxNode{}
 	}
+	// The sidecar joins by inbound tag, so the config-fallback path annotates
+	// exactly like the primary path.
+	applySingBoxSidecar(source, inv.Nodes)
 	return inv, nil
 }
 
@@ -259,6 +287,324 @@ func enrichSingBoxNodesFromConfig(source Source, nodes []model.SingBoxNode) {
 			}
 		}
 	}
+}
+
+// sbInspectLine mirrors the `sb --json inspect <name>` line object (core.sh
+// line_json_obj): outbound tag/protocol, user roster, and the _lattice identity
+// that the plain list omits. The outbound server/port is NOT part of this
+// shape — the config join resolves those from the outbound tag.
+type sbInspectLine struct {
+	Tag        string            `json:"tag"`
+	ListenHost string            `json:"listen_host"`
+	ListenPort int               `json:"listen_port"`
+	Users      []json.RawMessage `json:"users"`
+	Outbound   struct {
+		Tag      string `json:"tag"`
+		Protocol string `json:"protocol"`
+	} `json:"outbound"`
+	Metadata struct {
+		LineID   string `json:"line_id"`
+		NodeUUID string `json:"node_uuid"`
+	} `json:"metadata"`
+}
+
+// enrichSingBoxNodesFromInspect fills the per-line fields `sb --json list`
+// omits (outbound tag/type, _lattice identity, user roster) by calling
+// `sb --json inspect <name>` once per line. Bounded in call count
+// (Source.MaxInspect, default maxInspectCalls), concurrency, and one aggregate
+// deadline, so it cannot stretch the discovery cycle. If the FIRST inspect call
+// fails or returns non-JSON, the deployed sb predates the subcommand and the
+// remaining lines are left to the config join instead. Fill-only-empty: a value
+// sb already provided is never overwritten.
+func enrichSingBoxNodesFromInspect(ctx context.Context, source Source, run func(context.Context, string, ...string) ([]byte, error), binary string, base []string, timeout time.Duration, nodes []model.SingBoxNode) {
+	maxInspect := source.MaxInspect
+	if maxInspect <= 0 {
+		maxInspect = maxInspectCalls
+	}
+	type candidate struct {
+		index int
+		name  string
+	}
+	candidates := make([]candidate, 0, maxInspect)
+	for i := range nodes {
+		if len(candidates) >= maxInspect {
+			break
+		}
+		name := strings.TrimSpace(nodes[i].Name)
+		if name == "" {
+			continue
+		}
+		// A newer sb already emits these fields in the list; don't spend an
+		// inspect call re-reading them.
+		if nodes[i].OutboundRef != "" && nodes[i].LineID != "" && nodes[i].UserKnown {
+			continue
+		}
+		candidates = append(candidates, candidate{index: i, name: name})
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	totalTimeout := timeout
+	if totalTimeout <= 0 || totalTimeout > defaultInspectTotalTimeout {
+		totalTimeout = defaultInspectTotalTimeout
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, totalTimeout)
+	defer cancel()
+
+	inspect := func(c candidate) (sbInspectLine, error) {
+		out, err := run(inspectCtx, binary, append(append([]string(nil), base...), "inspect", c.name)...)
+		if err != nil {
+			return sbInspectLine{}, err
+		}
+		var resp struct {
+			Line sbInspectLine `json:"line"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(out), &resp); err != nil {
+			return sbInspectLine{}, fmt.Errorf("decode inspect: %w", err)
+		}
+		return resp.Line, nil
+	}
+	apply := func(i int, line sbInspectLine) {
+		if nodes[i].ListenHost == "" {
+			nodes[i].ListenHost = strings.TrimSpace(line.ListenHost)
+		}
+		if nodes[i].Port == "" && line.ListenPort > 0 {
+			nodes[i].Port = strconv.Itoa(line.ListenPort)
+		}
+		if nodes[i].OutboundRef == "" {
+			nodes[i].OutboundRef = strings.TrimSpace(line.Outbound.Tag)
+		}
+		if nodes[i].OutboundType == "" {
+			nodes[i].OutboundType = strings.TrimSpace(line.Outbound.Protocol)
+		}
+		if nodes[i].LineID == "" {
+			nodes[i].LineID = strings.TrimSpace(line.Metadata.LineID)
+		}
+		if nodes[i].NodeIdentityUUID == "" {
+			nodes[i].NodeIdentityUUID = strings.TrimSpace(line.Metadata.NodeUUID)
+		}
+		if !nodes[i].UserKnown && line.Users != nil {
+			nodes[i].UserCount = len(line.Users)
+			nodes[i].UserKnown = true
+		}
+	}
+
+	// Probe once before launching workers. Old sb builds lack `inspect`; this
+	// keeps their one-call degradation behavior while allowing supported builds
+	// to enrich the remaining fleet concurrently under one discovery deadline.
+	first, err := inspect(candidates[0])
+	if err != nil {
+		logf(source, "sing-box inspect unavailable (%v); continuing without per-line inspect enrichment", boundedErr(err))
+		return
+	}
+	apply(candidates[0].index, first)
+	if len(candidates) == 1 {
+		return
+	}
+
+	jobs := make(chan candidate)
+	type result struct {
+		candidate candidate
+		line      sbInspectLine
+		err       error
+	}
+	results := make(chan result, len(candidates)-1)
+	workers := maxInspectWorkers
+	if workers > len(candidates)-1 {
+		workers = len(candidates) - 1
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for c := range jobs {
+				line, err := inspect(c)
+				results <- result{candidate: c, line: line, err: err}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, c := range candidates[1:] {
+			select {
+			case jobs <- c:
+			case <-inspectCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for r := range results {
+		if r.err == nil {
+			apply(r.candidate.index, r.line)
+		}
+	}
+}
+
+// singBoxSidecar mirrors the design-15 sidecar (lattice.singbox-metadata.v2).
+// Only the join fields are decoded; unknown keys are the writer's business.
+// v1 sidecars (flat object, no schema marker / inbounds array) carry no
+// per-line data: they are accepted and ignored, exactly like a missing file.
+type singBoxSidecar struct {
+	Schema   string `json:"schema"`
+	Inbounds []struct {
+		Tag      string `json:"tag"`
+		LineUUID string `json:"line_uuid"`
+		Chain    *struct {
+			DownstreamLineUUID *string `json:"downstream_line_uuid"`
+		} `json:"chain"`
+	} `json:"inbounds"`
+}
+
+// applySingBoxSidecar annotates discovered nodes with the design-15 line
+// identity (line_uuid) and the declared chain edge (downstream_line_uuid,
+// null in the file means single-exit and stays empty), joined by inbound tag
+// (node.Name == sidecar inbounds[].tag). Degrades quietly: a missing file or a
+// legacy v1 sidecar leaves every field empty; a corrupt file is logged and
+// skipped. The sidecar is a read-only annotation and must never fail discovery.
+func applySingBoxSidecar(source Source, nodes []model.SingBoxNode) {
+	if len(nodes) == 0 {
+		return
+	}
+	metaPath := strings.TrimSpace(source.MetaPath)
+	if metaPath == "" {
+		metaPath = defaultMetaPath
+	}
+	readFn := source.readFile
+	if readFn == nil {
+		readFn = os.ReadFile
+	}
+	raw, err := readFn(metaPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return // no sidecar on this node: nothing to annotate
+		}
+		logf(source, "sing-box sidecar %s unreadable (%v); reporting base inventory", metaPath, boundedErr(err))
+		return
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return
+	}
+	var meta singBoxSidecar
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		logf(source, "sing-box sidecar %s unreadable (%v); reporting base inventory", metaPath, boundedErr(err))
+		return
+	}
+	if meta.Schema == "" {
+		return // legacy v1 flat sidecar: no per-line annotations
+	}
+	if err := validateSingBoxSidecar(meta); err != nil {
+		logf(source, "sing-box sidecar %s invalid (%v); reporting base inventory", metaPath, boundedErr(err))
+		return
+	}
+	type sidecarLine struct {
+		lineUUID           string
+		downstreamLineUUID string
+	}
+	byTag := map[string]sidecarLine{}
+	for _, in := range meta.Inbounds {
+		tag := strings.TrimSpace(in.Tag)
+		if tag == "" {
+			continue
+		}
+		entry := sidecarLine{lineUUID: strings.TrimSpace(in.LineUUID)}
+		if in.Chain != nil && in.Chain.DownstreamLineUUID != nil {
+			entry.downstreamLineUUID = strings.TrimSpace(*in.Chain.DownstreamLineUUID)
+		}
+		byTag[tag] = entry
+	}
+	for i := range nodes {
+		entry, ok := byTag[strings.TrimSpace(nodes[i].Name)]
+		if !ok {
+			continue
+		}
+		if nodes[i].LineUUID == "" {
+			nodes[i].LineUUID = entry.lineUUID
+		}
+		if nodes[i].DownstreamLineUUID == "" {
+			nodes[i].DownstreamLineUUID = entry.downstreamLineUUID
+		}
+	}
+}
+
+func validateSingBoxSidecar(meta singBoxSidecar) error {
+	if meta.Schema != "lattice.singbox-metadata.v2" {
+		return fmt.Errorf("unsupported schema %q", meta.Schema)
+	}
+	byTag := make(map[string]struct{}, len(meta.Inbounds))
+	byUUID := make(map[string]struct{}, len(meta.Inbounds))
+	next := make(map[string]string, len(meta.Inbounds))
+	for _, in := range meta.Inbounds {
+		tag := strings.TrimSpace(in.Tag)
+		lineUUID := strings.ToLower(strings.TrimSpace(in.LineUUID))
+		if tag == "" || !isUUIDv4(lineUUID) {
+			return fmt.Errorf("inbound has invalid tag or line_uuid")
+		}
+		if _, exists := byTag[tag]; exists {
+			return fmt.Errorf("duplicate inbound tag %q", tag)
+		}
+		if _, exists := byUUID[lineUUID]; exists {
+			return fmt.Errorf("duplicate line_uuid %q", lineUUID)
+		}
+		byTag[tag] = struct{}{}
+		byUUID[lineUUID] = struct{}{}
+		if in.Chain != nil && in.Chain.DownstreamLineUUID != nil {
+			downstream := strings.ToLower(strings.TrimSpace(*in.Chain.DownstreamLineUUID))
+			if !isUUIDv4(downstream) {
+				return fmt.Errorf("inbound %q has invalid downstream_line_uuid", tag)
+			}
+			if downstream == lineUUID {
+				return fmt.Errorf("inbound %q has a self-referential chain", tag)
+			}
+			next[lineUUID] = downstream
+		}
+	}
+	for start := range next {
+		seen := map[string]struct{}{}
+		for current := start; current != ""; current = next[current] {
+			if _, local := byUUID[current]; !local {
+				break // a declared cross-node edge cannot be validated locally
+			}
+			if _, repeated := seen[current]; repeated {
+				return fmt.Errorf("sidecar contains a local chain cycle")
+			}
+			seen[current] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func isUUIDv4(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value[14] != '4' {
+		return false
+	}
+	if value[19] != '8' && value[19] != '9' && value[19] != 'a' && value[19] != 'b' {
+		return false
+	}
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// logf routes a best-effort degradation note through the source's Logf seam
+// (default log.Printf). Used only for non-fatal enrichment/annotation gaps.
+func logf(source Source, format string, args ...any) {
+	if source.Logf != nil {
+		source.Logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
 }
 
 func singBoxRuntimeConfigFiles() []string {

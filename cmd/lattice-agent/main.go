@@ -33,10 +33,10 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.2.9"
-var compatServerMin = "v0.2.1"
-var compatDashboardMin = "v0.2.1"
-var compatChannel = "stable"
+var version = "0.3.3-alpha.1"
+var compatServerMin = "v0.2.2-alpha.2"
+var compatDashboardMin = "v0.2.2-alpha.7"
+var compatChannel = "alpha"
 
 type agentCompatibility struct {
 	ServerMin    string `json:"server_min"`
@@ -138,6 +138,7 @@ type agentConfig struct {
 	ProxyUsageXrayPattern string
 	SingBoxDiscover       bool
 	SingBoxBin            string
+	SingBoxMeta           string
 	LogStateDir           string
 }
 
@@ -225,6 +226,7 @@ func main() {
 	flag.StringVar(&cfg.ProxyUsageXrayPattern, "proxy-usage-xray-pattern", os.Getenv("LATTICE_PROXY_USAGE_XRAY_PATTERN"), "optional stat-name filter for -proxy-usage-xray-api (default \"user>>>\")")
 	flag.BoolVar(&cfg.SingBoxDiscover, "singbox-discover", os.Getenv("LATTICE_SINGBOX_DISCOVER") == "1", "report on-box sing-box nodes each interval by running read-only `sb --json list` (adoption bridge; read-only, no node mutation)")
 	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
+	flag.StringVar(&cfg.SingBoxMeta, "singbox-meta", env("LATTICE_SINGBOX_META", ""), "design-15 sing-box sidecar metadata path for -singbox-discover (default /etc/sing-box/lattice-metadata.json)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.BoolVar(&printCompat, "compat-json", false, "print embedded server/dashboard compatibility metadata and exit")
@@ -887,8 +889,9 @@ func reportSingBoxInventory(cfg agentConfig) error {
 		return nil
 	}
 	inv, derr := singboxdiscover.Discover(context.Background(), singboxdiscover.Source{
-		Binary: cfg.SingBoxBin,
-		Addr:   cfg.PublicIP,
+		Binary:   cfg.SingBoxBin,
+		Addr:     cfg.PublicIP,
+		MetaPath: cfg.SingBoxMeta,
 	}, cfg.NodeID)
 	// Always post what we have (ok list OR error status); the post error, if any,
 	// is combined with any discovery error for the caller's log.

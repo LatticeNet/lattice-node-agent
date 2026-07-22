@@ -45,3 +45,8 @@ if grep -Fq -- "github.com/LatticeNet/lattice-sdk@v0.2.0" "$workflow"; then
   echo "release workflow must not pin a stale lattice-sdk workspace replace" >&2
   exit 1
 fi
+
+if grep -Fq -- "checkout lattice-sdk" "$workflow" || grep -Fq -- "go work init ./lattice-sdk" "$workflow"; then
+  echo "release workflow must build the SDK version pinned in go.mod" >&2
+  exit 1
+fi

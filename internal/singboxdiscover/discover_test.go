@@ -3,8 +3,13 @@ package singboxdiscover
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -292,4 +297,402 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// --- design-15: per-line inspect enrichment + sidecar (lattice.singbox-metadata.v2) ---
+//
+// testdata/{v2-valid-full,v2-valid-minimal,v1-legacy-upgrade}.json are verbatim
+// copies of lattice/docs/contracts/fixtures/ (design-15 S0); the schema there is
+// the arbiter.
+
+// sidecarTestList is a list row the way a NEWER sb emits it (outbound_ref,
+// line_id, user_known already set), so discovery skips the per-line inspect
+// call and the test isolates the sidecar join.
+const sidecarTestList = `{"ok":true,"count":1,"nodes":[
+	{"name":"vless-31001","protocol":"vless","port":"31001","line_id":"l","outbound_ref":"direct","user_known":true}
+]}`
+
+// listOnlyRunner answers list/provision and fails the test on anything else,
+// which also proves no inspect call is spent on already-enriched rows.
+func listOnlyRunner(t *testing.T, listJSON string) func(context.Context, string, ...string) ([]byte, error) {
+	t.Helper()
+	return func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		switch args[len(args)-1] {
+		case "list":
+			return []byte(listJSON), nil
+		case "provision":
+			return []byte(`{}`), nil
+		}
+		t.Fatalf("unexpected command: %v", args)
+		return nil, nil
+	}
+}
+
+func TestDiscoverAppliesSidecarV2(t *testing.T) {
+	listJSON := `{"ok":true,"count":3,"nodes":[
+		{"name":"vless-31001","protocol":"vless","port":"31001","line_id":"l1","outbound_ref":"direct","user_known":true},
+		{"name":"vless-8468","protocol":"vless","port":"8468","line_id":"l2","outbound_ref":"direct","user_known":true},
+		{"name":"trojan-9999","protocol":"trojan","port":"9999","line_id":"l3","outbound_ref":"direct","user_known":true}
+	]}`
+	src := Source{
+		MetaPath:     "testdata/v2-valid-full.json",
+		runner:       listOnlyRunner(t, listJSON),
+		runtimeFiles: func() []string { return nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-hk")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	byName := map[string]model.SingBoxNode{}
+	for _, n := range inv.Nodes {
+		byName[n.Name] = n
+	}
+	// Tag hit with a declared chain edge: both identities join.
+	relay := byName["vless-31001"]
+	if relay.LineUUID != "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d" ||
+		relay.DownstreamLineUUID != "1eec4b5a-9c2f-4a1b-8d3e-5f6a7b8c9d0e" {
+		t.Fatalf("declared chain join wrong: %+v", relay)
+	}
+	// Tag hit with chain.downstream_line_uuid null: single-exit, stays empty.
+	single := byName["vless-8468"]
+	if single.LineUUID != "2af49c3e-1d5b-4e7a-8c9d-0e1f2a3b4c5d" || single.DownstreamLineUUID != "" {
+		t.Fatalf("null downstream_line_uuid must stay empty: %+v", single)
+	}
+	// Tag miss: the sidecar must not invent annotations.
+	if n := byName["trojan-9999"]; n.LineUUID != "" || n.DownstreamLineUUID != "" {
+		t.Fatalf("unlisted tag must stay unannotated: %+v", n)
+	}
+}
+
+func TestDiscoverAppliesSidecarV2Minimal(t *testing.T) {
+	listJSON := `{"ok":true,"count":1,"nodes":[
+		{"name":"trojan-41001","protocol":"trojan","port":"41001","line_id":"l","outbound_ref":"direct","user_known":true}
+	]}`
+	src := Source{
+		MetaPath:     "testdata/v2-valid-minimal.json",
+		runner:       listOnlyRunner(t, listJSON),
+		runtimeFiles: func() []string { return nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-aaitr")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	n := inv.Nodes[0]
+	if n.LineUUID != "7c3d8e2f-5a4b-4c6d-9e0f-1a2b3c4d5e6f" || n.DownstreamLineUUID != "" {
+		t.Fatalf("minimal sidecar (no chain block) join wrong: %+v", n)
+	}
+}
+
+func TestDiscoverSidecarMissingIsSilent(t *testing.T) {
+	var logs []string
+	src := Source{
+		MetaPath:     "/nonexistent/lattice-metadata.json",
+		runner:       listOnlyRunner(t, sidecarTestList),
+		runtimeFiles: func() []string { return nil },
+		Logf:         func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	}
+	inv, err := Discover(context.Background(), src, "node-nometa")
+	if err != nil {
+		t.Fatalf("missing sidecar must not fail discovery: %v", err)
+	}
+	if inv.Nodes[0].LineUUID != "" || inv.Nodes[0].DownstreamLineUUID != "" {
+		t.Fatalf("missing sidecar must omit the fields: %+v", inv.Nodes[0])
+	}
+	if len(logs) != 0 {
+		t.Fatalf("missing sidecar must stay silent, got %v", logs)
+	}
+}
+
+func TestDiscoverSidecarCorruptLogsAndContinues(t *testing.T) {
+	var logs []string
+	src := Source{
+		MetaPath:     "/etc/sing-box/lattice-metadata.json",
+		runner:       listOnlyRunner(t, sidecarTestList),
+		runtimeFiles: func() []string { return nil },
+		readFile: func(path string) ([]byte, error) {
+			if path == "/etc/sing-box/lattice-metadata.json" {
+				return []byte(`{"schema":"lattice.singbox-metadata.v2","inbounds":[broken`), nil
+			}
+			return nil, errors.New("unexpected read: " + path)
+		},
+		Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	}
+	inv, err := Discover(context.Background(), src, "node-corrupt")
+	if err != nil {
+		t.Fatalf("corrupt sidecar must not fail discovery: %v", err)
+	}
+	if inv.Status != "ok" || inv.Nodes[0].LineUUID != "" {
+		t.Fatalf("corrupt sidecar must report the base inventory: %+v", inv)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "sidecar") {
+		t.Fatalf("corrupt sidecar must be logged once, got %v", logs)
+	}
+}
+
+func TestDiscoverSidecarReadPermissionErrorLogsAndContinues(t *testing.T) {
+	var logs []string
+	src := Source{
+		MetaPath:     "/etc/sing-box/lattice-metadata.json",
+		runner:       listOnlyRunner(t, sidecarTestList),
+		runtimeFiles: func() []string { return nil },
+		readFile: func(string) ([]byte, error) {
+			return nil, os.ErrPermission
+		},
+		Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	}
+	inv, err := Discover(context.Background(), src, "node-permission")
+	if err != nil || inv.Nodes[0].LineUUID != "" {
+		t.Fatalf("unreadable sidecar must return only base inventory: inv=%+v err=%v", inv, err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "permission") {
+		t.Fatalf("permission error must be surfaced once, got %v", logs)
+	}
+}
+
+func TestDiscoverSidecarInvalidV2IsRejectedAtomically(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"wrong schema", `{"schema":"lattice.singbox-metadata.v3","inbounds":[]}`},
+		{"bad uuid", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"vless-31001","line_uuid":"not-a-uuid"}]}`},
+		{"duplicate tag", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"vless-31001","line_uuid":"11111111-1111-4111-8111-111111111111"},{"tag":"vless-31001","line_uuid":"22222222-2222-4222-8222-222222222222"}]}`},
+		{"self chain", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"vless-31001","line_uuid":"11111111-1111-4111-8111-111111111111","chain":{"downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}}]}`},
+		{"local cycle", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"a","line_uuid":"11111111-1111-4111-8111-111111111111","chain":{"downstream_line_uuid":"22222222-2222-4222-8222-222222222222"}},{"tag":"b","line_uuid":"22222222-2222-4222-8222-222222222222","chain":{"downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs []string
+			src := Source{
+				MetaPath:     "/meta.json",
+				runner:       listOnlyRunner(t, sidecarTestList),
+				runtimeFiles: func() []string { return nil },
+				readFile:     func(string) ([]byte, error) { return []byte(tc.raw), nil },
+				Logf:         func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+			}
+			inv, err := Discover(context.Background(), src, "node-invalid")
+			if err != nil || inv.Nodes[0].LineUUID != "" || inv.Nodes[0].DownstreamLineUUID != "" {
+				t.Fatalf("invalid v2 must be rejected as a whole: inv=%+v err=%v", inv, err)
+			}
+			if len(logs) != 1 || !strings.Contains(logs[0], "invalid") {
+				t.Fatalf("invalid v2 must be surfaced once, got %v", logs)
+			}
+		})
+	}
+}
+
+func TestDiscoverSidecarV1Ignored(t *testing.T) {
+	var logs []string
+	src := Source{
+		MetaPath:     "testdata/v1-legacy-upgrade.json",
+		runner:       listOnlyRunner(t, sidecarTestList),
+		runtimeFiles: func() []string { return nil },
+		Logf:         func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	}
+	inv, err := Discover(context.Background(), src, "node-v1")
+	if err != nil {
+		t.Fatalf("v1 sidecar must not fail discovery: %v", err)
+	}
+	// v1 is a flat per-node shape with no inbounds array: nothing to join.
+	if inv.Nodes[0].LineUUID != "" || inv.Nodes[0].DownstreamLineUUID != "" {
+		t.Fatalf("v1 sidecar carries no per-line data: %+v", inv.Nodes[0])
+	}
+	if len(logs) != 0 {
+		t.Fatalf("v1 sidecar is an accepted legacy shape, not an error: %v", logs)
+	}
+}
+
+func TestPrimaryPathEnrichesFromInspect(t *testing.T) {
+	var inspectNames []string
+	files := map[string]string{
+		// inspect reports only the outbound tag/protocol; the config join below
+		// resolves the tag to the downstream server:port.
+		"/etc/sing-box/config.json": `{
+			"inbounds":[],
+			"outbounds":[{"tag":"[openjobs]-qqpw-vds1-vless","type":"vless","server":"198.51.100.9","server_port":443}]
+		}`,
+	}
+	src := Source{
+		Addr: "203.0.113.5",
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			last := args[len(args)-1]
+			switch last {
+			case "list":
+				return []byte(`{"ok":true,"count":1,"nodes":[{"name":"VLESS-31001.json","protocol":"vless","port":"31001"}]}`), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			if len(args) >= 2 && args[len(args)-2] == "inspect" {
+				inspectNames = append(inspectNames, last)
+				// Shape per core.sh line_json_obj.
+				return []byte(`{"ok":true,"line":{
+					"core":"sing-box",
+					"tag":"VLESS-31001.json",
+					"type":"vless",
+					"listen_host":"::",
+					"listen_port":31001,
+					"users":[{"name":"u_0123456789abcdef","uuid":"redacted"},{"name":"u_fedcba9876543210","uuid":"redacted"}],
+					"outbound":{"tag":"[openjobs]-qqpw-vds1-vless","protocol":"vless"},
+					"metadata":{"line_id":"line-uuid-a","node_uuid":"node-uuid-a"}
+				}}`), nil
+			}
+			return nil, errors.New("unexpected command: " + strings.Join(args, " "))
+		},
+		runtimeFiles: func() []string { return []string{"/etc/sing-box/config.json"} },
+		readFile:     func(path string) ([]byte, error) { return []byte(files[path]), nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-inspect")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(inv.Nodes) != 1 {
+		t.Fatalf("unexpected inventory: %+v", inv)
+	}
+	n := inv.Nodes[0]
+	if n.OutboundRef != "[openjobs]-qqpw-vds1-vless" || n.OutboundType != "vless" {
+		t.Fatalf("inspect outbound enrichment wrong: %+v", n)
+	}
+	if n.OutboundServer != "198.51.100.9" || n.OutboundPort != "443" {
+		t.Fatalf("config join must resolve the server/port inspect omits: %+v", n)
+	}
+	if n.LineID != "line-uuid-a" || n.NodeIdentityUUID != "node-uuid-a" {
+		t.Fatalf("inspect identity enrichment wrong: %+v", n)
+	}
+	if n.ListenHost != "::" || !n.UserKnown || n.UserCount != 2 {
+		t.Fatalf("inspect listen/user enrichment wrong: %+v", n)
+	}
+	if len(inspectNames) != 1 || inspectNames[0] != "VLESS-31001.json" {
+		t.Fatalf("inspect must be called once per bare line by name, got %v", inspectNames)
+	}
+}
+
+func TestInspectUnavailableFallsBackToConfig(t *testing.T) {
+	var logs []string
+	var inspectCalls atomic.Int32
+	files := map[string]string{
+		"/etc/sing-box/config.json": `{
+			"inbounds":[{"tag":"Trojan-41001.json","type":"trojan","listen":"::","listen_port":41001,"_lattice":{"line_id":"line-uuid-a"}}],
+			"outbounds":[{"tag":"exit-hk","type":"trojan","server":"198.51.100.9","server_port":8443}],
+			"route":{"rules":[{"inbound":["Trojan-41001.json"],"action":"route","outbound":"exit-hk"}]}
+		}`,
+	}
+	src := Source{
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			switch args[len(args)-1] {
+			case "list":
+				return []byte(`{"ok":true,"count":1,"nodes":[{"name":"Trojan-41001.json","protocol":"trojan","port":"41001"}]}`), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			inspectCalls.Add(1)
+			return nil, errors.New("sb: unknown command inspect") // old sb build
+		},
+		runtimeFiles: func() []string { return []string{"/etc/sing-box/config.json"} },
+		readFile:     func(path string) ([]byte, error) { return []byte(files[path]), nil },
+		Logf:         func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	}
+	inv, err := Discover(context.Background(), src, "node-oldsb")
+	if err != nil {
+		t.Fatalf("old sb without inspect must not fail discovery: %v", err)
+	}
+	n := inv.Nodes[0]
+	if n.OutboundRef != "exit-hk" || n.OutboundServer != "198.51.100.9" || n.LineID != "line-uuid-a" {
+		t.Fatalf("config join must still enrich when inspect is unavailable: %+v", n)
+	}
+	if inspectCalls.Load() != 1 {
+		t.Fatalf("first inspect failure must stop further inspect calls, got %d", inspectCalls.Load())
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "inspect unavailable") {
+		t.Fatalf("inspect degradation must be logged once, got %v", logs)
+	}
+}
+
+func TestInspectBudgetTruncates(t *testing.T) {
+	names := []string{"n1.json", "n2.json", "n3.json", "n4.json", "n5.json"}
+	var rows []string
+	for _, name := range names {
+		rows = append(rows, fmt.Sprintf(`{"name":%q,"protocol":"vless","port":"31001"}`, name))
+	}
+	listJSON := `{"ok":true,"count":5,"nodes":[` + strings.Join(rows, ",") + `]}`
+	var inspectCalls atomic.Int32
+	src := Source{
+		MaxInspect: 3,
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			last := args[len(args)-1]
+			switch last {
+			case "list":
+				return []byte(listJSON), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			inspectCalls.Add(1)
+			return []byte(`{"ok":true,"line":{"tag":"` + last + `","outbound":{"tag":"direct","protocol":"direct"}}}`), nil
+		},
+		runtimeFiles: func() []string { return nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-fleet")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if inspectCalls.Load() != 3 {
+		t.Fatalf("inspect calls must be bounded by MaxInspect=3, got %d", inspectCalls.Load())
+	}
+	for i, n := range inv.Nodes {
+		enriched := n.OutboundRef == "direct"
+		if (i < 3) != enriched {
+			t.Fatalf("only the first 3 lines may be inspect-enriched: node %d %+v", i, n)
+		}
+	}
+}
+
+func TestInspectUsesAggregateDeadlineAndBoundedConcurrency(t *testing.T) {
+	var rows []string
+	for i := 0; i < 17; i++ {
+		rows = append(rows, fmt.Sprintf(`{"name":"n%d.json","protocol":"vless","port":"31001"}`, i))
+	}
+	listJSON := `{"ok":true,"count":17,"nodes":[` + strings.Join(rows, ",") + `]}`
+	var mu sync.Mutex
+	active, peak := 0, 0
+	src := Source{
+		Timeout:    120 * time.Millisecond,
+		MaxInspect: 17,
+		runner: func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+			last := args[len(args)-1]
+			switch last {
+			case "list":
+				return []byte(listJSON), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			mu.Lock()
+			active++
+			if active > peak {
+				peak = active
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				active--
+				mu.Unlock()
+			}()
+			select {
+			case <-time.After(40 * time.Millisecond):
+				return []byte(`{"ok":true,"line":{"outbound":{"tag":"direct"}}}`), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		runtimeFiles: func() []string { return nil },
+	}
+	started := time.Now()
+	_, err := Discover(context.Background(), src, "node-deadline")
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if elapsed > 280*time.Millisecond {
+		t.Fatalf("inspect aggregate deadline exceeded: %v", elapsed)
+	}
+	if peak < 2 || peak > maxInspectWorkers {
+		t.Fatalf("inspect concurrency peak = %d, want 2..%d", peak, maxInspectWorkers)
+	}
 }

@@ -1,0 +1,35 @@
+{
+  "schema": "lattice.singbox-metadata.v2",
+  "node_id": "hk-hub-01",
+  "node_uuid": "3f8a2c1e-7b4d-4e5f-9a0b-1c2d3e4f5a6b",
+  "updated_at": "2026-07-17T04:00:00Z",
+  "writer": "lattice-server",
+  "inbounds": [
+    {
+      "tag": "vless-31001",
+      "line_uuid": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "line_hash_id": "line_0123456789abcdef01234567",
+      "comment": "hk hub fan-out to qqpw",
+      "chain": {
+        "downstream_line_uuid": "1eec4b5a-9c2f-4a1b-8d3e-5f6a7b8c9d0e",
+        "downstream_node": "qqpw"
+      }
+    },
+    {
+      "tag": "vless-8468",
+      "line_uuid": "2af49c3e-1d5b-4e7a-8c9d-0e1f2a3b4c5d",
+      "line_hash_id": "line_abcdef0123456789abcdef01",
+      "chain": {
+        "downstream_line_uuid": null
+      }
+    }
+  ],
+  "reserved": {
+    "in_config_key": "_lattice",
+    "fields": {
+      "line_uuid": "string",
+      "node_uuid": "string",
+      "line_hash_id": "string"
+    }
+  }
+}

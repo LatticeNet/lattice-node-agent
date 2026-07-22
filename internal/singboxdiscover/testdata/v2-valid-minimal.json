@@ -1,0 +1,12 @@
+{
+  "schema": "lattice.singbox-metadata.v2",
+  "node_id": "aaitr-01",
+  "updated_at": "2026-07-17T04:00:00Z",
+  "writer": "sb",
+  "inbounds": [
+    {
+      "tag": "trojan-41001",
+      "line_uuid": "7c3d8e2f-5a4b-4c6d-9e0f-1a2b3c4d5e6f"
+    }
+  ]
+}
