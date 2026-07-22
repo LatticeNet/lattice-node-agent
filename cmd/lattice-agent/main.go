@@ -632,6 +632,7 @@ func reportMetrics(cfg agentConfig) error {
 			ProxyUsageXrayAPI:     cfg.ProxyUsageXrayAPI,
 			ProxyUsageXrayBin:     cfg.ProxyUsageXrayBin,
 			ProxyUsageXrayPattern: cfg.ProxyUsageXrayPattern,
+			SingBoxStatsAPI:       cfg.SingBoxStatsAPI,
 			ReportedAt:            time.Now().UTC(),
 		},
 		"public_ip":     cfg.PublicIP,
