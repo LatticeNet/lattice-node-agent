@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
@@ -61,6 +62,7 @@ const (
 	defaultDebugMaxLineBytes  = 4096
 	defaultDebugMaxBatchLines = 100
 	debugSinkMaxLines         = 1000
+	guardRealityReportTimeout = 10 * time.Second
 )
 
 type agentConfig struct {
@@ -68,6 +70,7 @@ type agentConfig struct {
 	NodeID              string
 	Token               string
 	Interval            time.Duration
+	ReportGuardReality  bool
 	AllowExec           bool
 	AllowRoot           bool
 	NoExec              bool
@@ -179,6 +182,7 @@ func main() {
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
 	flag.DurationVar(&cfg.Interval, "interval", 10*time.Second, "metrics interval")
+	flag.BoolVar(&cfg.ReportGuardReality, "report-guard-reality", os.Getenv("LATTICE_REPORT_GUARD_REALITY") == "1", "report read-only NetGuard reality each interval")
 	flag.BoolVar(&cfg.AllowExec, "allow-exec", os.Getenv("LATTICE_AGENT_ALLOW_EXEC") == "1", "allow bounded task execution")
 	// -allow-root-exec opts in to running operator scripts while the agent is
 	// uid 0. Without it, a root agent refuses tasks rather than executing
@@ -303,7 +307,7 @@ func main() {
 		log.Printf("warning: terminal sessions disabled because agent is running as root without -allow-root-exec")
 		cfg.AllowTerminal = false
 	}
-	debugf(cfg, "debug enabled: node=%s server=%s interval=%s allow_exec=%v allow_root_exec=%v allow_terminal=%v ssh_alerts=%v", cfg.NodeID, cfg.Server, cfg.Interval, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.SSHAlerts)
+	debugf(cfg, "debug enabled: node=%s server=%s interval=%s report_guard_reality=%v allow_exec=%v allow_root_exec=%v allow_terminal=%v ssh_alerts=%v", cfg.NodeID, cfg.Server, cfg.Interval, cfg.ReportGuardReality, cfg.AllowExec, cfg.AllowRoot, cfg.AllowTerminal, cfg.SSHAlerts)
 	// Probe interpreter availability once at startup so operators learn early
 	// which allowlisted interpreters are missing, rather than only discovering it
 	// when a task fails. Non-fatal; task-time resolution is unchanged.
@@ -331,7 +335,7 @@ func main() {
 	} else {
 		applyAgentConfig(&cfg, agentCfg)
 	}
-	log.Printf("lattice-agent connected node=%s server=%s allow_exec=%v allow_root_exec=%v task_cgroup=%v task_work_root=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.AllowExec, cfg.AllowRoot, cfg.taskCgroupConfig().Root != "", strings.TrimSpace(cfg.TaskWorkRoot) != "", cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
+	log.Printf("lattice-agent connected node=%s server=%s report_guard_reality=%v allow_exec=%v allow_root_exec=%v task_cgroup=%v task_work_root=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.ReportGuardReality, cfg.AllowExec, cfg.AllowRoot, cfg.taskCgroupConfig().Root != "", strings.TrimSpace(cfg.TaskWorkRoot) != "", cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
 	}
@@ -379,6 +383,11 @@ func main() {
 		if err := flushDebugEvents(cfg); err != nil {
 			log.Printf("debug event report error: %v", err)
 		}
+		reportCtx, cancelReport := context.WithTimeout(context.Background(), guardRealityReportTimeout)
+		if err := reportGuardReality(reportCtx, cfg, guardreality.Collect); err != nil {
+			log.Printf("guard reality error: %v", err)
+		}
+		cancelReport()
 		<-ticker.C
 	}
 }
@@ -643,6 +652,24 @@ func reportMetrics(cfg agentConfig) error {
 		"metrics":       m,
 		"host_facts":    facts,
 	}, nil)
+}
+
+type guardRealityCollector func(context.Context, guardreality.Source, string) (model.GuardNodeReality, error)
+
+func reportGuardReality(ctx context.Context, cfg agentConfig, collect guardRealityCollector) error {
+	if !cfg.ReportGuardReality {
+		return nil
+	}
+	reality, err := collect(ctx, guardreality.Source{}, cfg.NodeID)
+	if err != nil {
+		return fmt.Errorf("collect guard reality: %w", err)
+	}
+	if err := postAgentJSONContext(ctx, cfg, "/api/agent/guard-reality", map[string]any{
+		"reality": reality,
+	}, nil); err != nil {
+		return fmt.Errorf("report guard reality: %w", err)
+	}
+	return nil
 }
 
 // lastPublicProbe throttles outbound IP-echo requests so the agent does not hit
@@ -1053,12 +1080,16 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 }
 
 func postAgentJSON(cfg agentConfig, path string, payload map[string]any, out any) error {
+	return postAgentJSONContext(context.Background(), cfg, path, payload, out)
+}
+
+func postAgentJSONContext(ctx context.Context, cfg agentConfig, path string, payload map[string]any, out any) error {
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	payload["node_id"] = cfg.NodeID
 	debugf(cfg, "agent post start: path=%s keys=%s", path, strings.Join(payloadKeys(payload), ","))
-	if err := postJSON(cfg.Server+path, cfg.Token, payload, out); err != nil {
+	if err := postJSONContext(ctx, cfg.Server+path, cfg.Token, payload, out); err != nil {
 		debugf(cfg, "agent post failed: path=%s err=%v", path, err)
 		return err
 	}
@@ -1207,11 +1238,15 @@ func postAgentDebugBatch(cfg agentConfig, batch model.AgentDebugBatch) error {
 }
 
 func postJSON(url string, bearerToken string, payload any, out any) error {
+	return postJSONContext(context.Background(), url, bearerToken, payload, out)
+}
+
+func postJSONContext(ctx context.Context, url string, bearerToken string, payload any, out any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
