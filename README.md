@@ -20,6 +20,16 @@ memory/swap, platform, kernel, hostname, boot time, virtualization hint). They
 are collected with stdlib and local platform files such as `/proc` and
 `/etc/os-release`; missing fields are left empty and never block the agent.
 
+NetGuard reality reporting is opt-in. Enable `-report-guard-reality` or set
+`LATTICE_REPORT_GUARD_REALITY=1` to collect one complete read-only snapshot per
+agent interval and post it to `/api/agent/guard-reality`. Collection invokes
+local `ss`, `ip`, and `nft` commands with bounded output and a shared 10-second
+collection-and-report deadline. If any step fails, the agent logs the failure
+and sends no partial snapshot. Core task, monitor, and log-source polling runs
+before this optional report, so a degraded collector cannot delay that work in
+the current cycle. Reported facts are low-trust input for display, drift, and
+suggestions only. They never mutate nftables or author policy.
+
 ## Run
 
 ```sh
