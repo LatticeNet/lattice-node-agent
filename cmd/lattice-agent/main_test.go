@@ -24,8 +24,8 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.3-alpha.2" {
-		t.Fatalf("version = %q, want 0.3.3-alpha.2", version)
+	if version != "0.3.3" {
+		t.Fatalf("version = %q, want 0.3.3", version)
 	}
 }
 
@@ -34,9 +34,12 @@ func TestCompatibilityPayloadIsEmbedded(t *testing.T) {
 	if got.ServerMin == "" || got.DashboardMin == "" || got.Channel == "" {
 		t.Fatalf("compatibility metadata must be embedded: %+v", got)
 	}
-	if got.Channel != "alpha" {
-		t.Fatalf("compatibility channel = %q, want alpha", got.Channel)
+	if got.Channel != "stable" {
+		t.Fatalf("compatibility channel = %q, want stable", got.Channel)
 	}
+	// The floors stay on design-15 prerelease coordinates on purpose: no stable
+	// server or dashboard satisfies this agent yet (stable server is still v0.2.1),
+	// so naming a stable floor here would be a claim the ecosystem cannot back.
 	if got.ServerMin != "v0.2.2-alpha.2" || got.DashboardMin != "v0.2.2-alpha.7" {
 		t.Fatalf("compatibility floor = %+v, want coordinated design-15 alpha", got)
 	}
