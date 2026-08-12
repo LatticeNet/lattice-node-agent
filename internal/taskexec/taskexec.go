@@ -29,8 +29,13 @@ var allowedInterpreters = map[string]string{
 // because applyResourceLimits is a no-op there.
 const (
 	// maxFileSizeBytes caps the size of any single file the task may write,
-	// preventing a runaway script from filling the disk.
-	maxFileSizeBytes = 8 * 1024 * 1024 // 8 MiB
+	// preventing a runaway script from filling the disk. It must still fit the
+	// largest legitimate payload a task downloads — the agent's own release
+	// binary (~tens of MiB): the 2026-08-12 fleet upgrade died to SIGXFSZ
+	// (exit 153) on 18 nodes when this was 8 MiB. The server-side update script
+	// also lifts the cap itself, so this value only guards non-update tasks and
+	// future agents whose update already ran.
+	maxFileSizeBytes = 256 * 1024 * 1024 // 256 MiB
 	// maxProcessHeadroom is the extra number of processes/threads a task may
 	// add above the agent user's current Linux-wide usage. RLIMIT_NPROC is
 	// scoped to the real UID rather than the task process tree, so using a fixed
