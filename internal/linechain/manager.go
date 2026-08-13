@@ -32,6 +32,7 @@ type Document struct {
 	Version                int     `json:"version"`
 	Operation              string  `json:"operation"`
 	ConfigDir              string  `json:"config_dir"`
+	FragmentBasename       string  `json:"fragment_basename,omitempty"`
 	FragmentPath           string  `json:"fragment_path"`
 	SidecarPath            string  `json:"sidecar_path"`
 	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
@@ -244,6 +245,22 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	var d Document
 	if err := dec.Decode(&d); err != nil {
 		return fmt.Errorf("decode linechain document: %w", err)
+	}
+	// Artifact locations are agent-owned. The server may provide only the
+	// deterministic basename; full paths are derived from the locally resolved
+	// sing-box layout and cannot redirect writes.
+	if d.FragmentBasename != "" {
+		if filepath.Base(d.FragmentBasename) != d.FragmentBasename || strings.Contains(d.FragmentBasename, "..") || !strings.HasPrefix(d.FragmentBasename, "lattice-linechain-") || filepath.Ext(d.FragmentBasename) != ".json" {
+			return fmt.Errorf("fragment_basename is invalid")
+		}
+		if d.FragmentPath != "" && filepath.Clean(d.FragmentPath) != filepath.Join(m.configDir, d.FragmentBasename) {
+			return fmt.Errorf("fragment_path is not agent-owned")
+		}
+		d.FragmentPath = filepath.Join(m.configDir, d.FragmentBasename)
+		if d.SidecarPath != "" && filepath.Clean(d.SidecarPath) != filepath.Clean(m.sidecarPath) {
+			return fmt.Errorf("sidecar_path is not agent-owned")
+		}
+		d.SidecarPath = m.sidecarPath
 	}
 	if err := m.validateDocument(d); err != nil {
 		return err
@@ -614,7 +631,7 @@ func validateParents(path string) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		if (!info.IsDir() && info.Mode()&os.ModeSymlink == 0) || (dir == filepath.Dir(path) && info.Mode()&os.ModeSymlink != 0) {
 			return fmt.Errorf("artifact parent must be a real directory")
 		}
 		if dir == filepath.Dir(path) && !ownedPath(info) {
