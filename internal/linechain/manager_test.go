@@ -16,7 +16,7 @@ import (
 func TestApplyCreateResolveAndCleanup(t *testing.T) {
 	m, dir := testManager(t)
 	configDir := filepath.Join(dir, "conf")
-	fragmentPath := filepath.Join(configDir, "lattice-linechain-chain.json")
+	fragmentPath := filepath.Join(configDir, "lattice-linechain-0123456789abcdef0123.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
 	mustMkdir(t, filepath.Dir(fragmentPath))
 	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
@@ -27,7 +27,7 @@ func TestApplyCreateResolveAndCleanup(t *testing.T) {
 	}
 	fragment := `{"outbounds":[{"type":"direct","tag":"chain"}]}`
 	sidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	doc := Document{Version: 1, Operation: "create", ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar}
+	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &fragment, Sidecar: &sidecar}
 	applyDoc(t, m, doc, "task-a", "lease-a")
 	result, err := m.ResolveAfterRun(context.Background(), model.Task{ID: "task-a", LeaseID: "lease-a"}, model.TaskResult{TaskID: "task-a", LeaseID: "lease-a", ExitCode: 0, FinishedAt: time.Now().UTC()})
 	if err != nil || result.ExitCode != 0 {
@@ -49,7 +49,7 @@ func TestApplyRejectsUnexpectedExistingAndSymlink(t *testing.T) {
 	m, dir := testManager(t)
 	mustMkdir(t, filepath.Join(dir, "conf"))
 	configDir := filepath.Join(dir, "conf")
-	fragmentPath := filepath.Join(configDir, "lattice-linechain-chain.json")
+	fragmentPath := filepath.Join(configDir, "lattice-linechain-0123456789abcdef0123.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
 	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestApplyRejectsUnexpectedExistingAndSymlink(t *testing.T) {
 	}
 	desired := "new"
 	desiredSidecar := "{}"
-	doc := Document{Version: 1, Operation: "create", ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &desired, Sidecar: &desiredSidecar}
+	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &desired, Sidecar: &desiredSidecar}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "unexpected existing") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 	m, dir := testManager(t)
 	mustMkdir(t, filepath.Join(dir, "conf"))
 	configDir := filepath.Join(dir, "conf")
-	fragmentPath := filepath.Join(configDir, "lattice-linechain-chain.json")
+	fragmentPath := filepath.Join(configDir, "lattice-linechain-0123456789abcdef0123.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
 	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 		}
 	}
 	newFragment, newSidecar := "new-fragment", "new-sidecar"
-	doc := Document{Version: 1, Operation: "replace", ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, PreviousFragmentSHA256: digest([]byte(oldFragment)), PreviousSidecarSHA256: digest([]byte(oldSidecar)), Fragment: &newFragment, Sidecar: &newSidecar}
+	doc := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: digest([]byte(oldFragment)), Fragment: &newFragment, Sidecar: &newSidecar}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "check failed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 func TestRecoveryProducesStableFailureAndCleansAfterCompletion(t *testing.T) {
 	m, dir := testManager(t)
 	mustMkdir(t, filepath.Join(dir, "conf"))
-	fragmentPath := filepath.Join(dir, "conf", "lattice-linechain-chain.json")
+	fragmentPath := filepath.Join(dir, "conf", "lattice-linechain-0123456789abcdef0123.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
 	if err := m.ConfigureLayout(filepath.Join(dir, "conf"), sidecarPath); err != nil {
 		t.Fatal(err)
@@ -174,7 +174,8 @@ func TestValidateDocumentBindsOwnedPaths(t *testing.T) {
 	if err := m.ConfigureLayout(configDir, filepath.Join(root, "lattice-metadata.json")); err != nil {
 		t.Fatal(err)
 	}
-	valid := BindDocument(Document{Version: 1, Operation: "create", ConfigDir: configDir, FragmentPath: filepath.Join(configDir, "lattice-linechain-a.json"), SidecarPath: filepath.Join(root, "lattice-metadata.json"), Fragment: &fragment, Sidecar: &sidecar})
+	basename := "lattice-linechain-0123456789abcdef0123.json"
+	valid := BindDocument(Document{Version: 2, Operation: "create", ConfigDir: configDir, FragmentBasename: basename, FragmentPath: filepath.Join(configDir, basename), SidecarPath: filepath.Join(root, "lattice-metadata.json"), Fragment: &fragment, Sidecar: &sidecar})
 	if err := m.validateDocument(valid); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +228,11 @@ func applyDoc(t *testing.T, m *Manager, d Document, task, lease string) {
 }
 func applyDocErr(m *Manager, d Document, task, lease string) error {
 	d = BindDocument(d)
-	b, _ := json.Marshal(d)
+	b, _ := json.Marshal(wireDocumentV2{
+		Version: d.Version, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		PreviousFragmentSHA256: d.PreviousFragmentSHA256, Fragment: d.Fragment, Sidecar: d.Sidecar,
+		FragmentSHA256: d.FragmentSHA256, SidecarSHA256: d.SidecarSHA256, CombinedSHA256: d.CombinedSHA256,
+	})
 	return m.Apply(context.Background(), strings.NewReader(string(b)), task, lease)
 }
 func assertFile(t *testing.T, p, want string) {

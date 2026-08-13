@@ -47,6 +47,21 @@ type Document struct {
 	CombinedSHA256         string  `json:"combined_sha256"`
 }
 
+// wireDocumentV2 is the only server-controlled shape accepted by Apply.
+// Host paths and the ordinary-writer sidecar predecessor are intentionally not
+// representable on the wire; Apply derives paths from the local layout.
+type wireDocumentV2 struct {
+	Version                int     `json:"version"`
+	Operation              string  `json:"operation"`
+	FragmentBasename       string  `json:"fragment_basename"`
+	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
+	Fragment               *string `json:"fragment,omitempty"`
+	Sidecar                *string `json:"sidecar,omitempty"`
+	FragmentSHA256         string  `json:"fragment_sha256,omitempty"`
+	SidecarSHA256          string  `json:"sidecar_sha256,omitempty"`
+	CombinedSHA256         string  `json:"combined_sha256"`
+}
+
 // BindDocument computes the deterministic desired artifact binding.
 func BindDocument(d Document) Document {
 	d.FragmentSHA256 = digestPtr(d.Fragment)
@@ -245,28 +260,21 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	}
 	dec := json.NewDecoder(io.LimitReader(r, maxDocumentSize+1))
 	dec.DisallowUnknownFields()
-	var d Document
-	if err := dec.Decode(&d); err != nil {
+	var wire wireDocumentV2
+	if err := dec.Decode(&wire); err != nil {
 		return fmt.Errorf("decode linechain document: %w", err)
 	}
-	if d.Version == 2 && (d.ConfigDir != "" || d.FragmentPath != "" || d.SidecarPath != "") {
-		return fmt.Errorf("v2 documents must not contain server-supplied paths")
+	if wire.Version != 2 {
+		return fmt.Errorf("unsupported linechain document version %d", wire.Version)
 	}
-	// Artifact locations are agent-owned. The server may provide only the
-	// deterministic basename; full paths are derived from the locally resolved
-	// sing-box layout and cannot redirect writes.
-	if d.FragmentBasename != "" {
-		if filepath.Base(d.FragmentBasename) != d.FragmentBasename || !linechainBasenameRE.MatchString(d.FragmentBasename) {
-			return fmt.Errorf("fragment_basename is invalid")
-		}
-		if d.FragmentPath != "" && filepath.Clean(d.FragmentPath) != filepath.Join(m.configDir, d.FragmentBasename) {
-			return fmt.Errorf("fragment_path is not agent-owned")
-		}
-		d.FragmentPath = filepath.Join(m.configDir, d.FragmentBasename)
-		if d.SidecarPath != "" && filepath.Clean(d.SidecarPath) != filepath.Clean(m.sidecarPath) {
-			return fmt.Errorf("sidecar_path is not agent-owned")
-		}
-		d.SidecarPath = m.sidecarPath
+	if filepath.Base(wire.FragmentBasename) != wire.FragmentBasename || !linechainBasenameRE.MatchString(wire.FragmentBasename) {
+		return fmt.Errorf("fragment_basename is invalid")
+	}
+	d := Document{
+		Version: wire.Version, Operation: wire.Operation, ConfigDir: m.configDir,
+		FragmentBasename: wire.FragmentBasename, FragmentPath: filepath.Join(m.configDir, wire.FragmentBasename), SidecarPath: m.sidecarPath,
+		PreviousFragmentSHA256: wire.PreviousFragmentSHA256, Fragment: wire.Fragment, Sidecar: wire.Sidecar,
+		FragmentSHA256: wire.FragmentSHA256, SidecarSHA256: wire.SidecarSHA256, CombinedSHA256: wire.CombinedSHA256,
 	}
 	if err := m.validateDocument(d); err != nil {
 		return err
@@ -287,11 +295,8 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	if err := requirePrevious("fragment", fragmentOld, fragmentHad, d.PreviousFragmentSHA256); err != nil {
 		return err
 	}
-	if err := requirePrevious("sidecar", sidecarOld, sidecarHad, d.PreviousSidecarSHA256); err != nil {
-		return err
-	}
 	j := journal{Version: journalVersion, TaskID: taskID, LeaseID: leaseID, FragmentPath: d.FragmentPath, SidecarPath: d.SidecarPath,
-		FragmentOld: digest(fragmentOld), SidecarOld: digest(sidecarOld), FragmentHadOld: fragmentHad, SidecarHadOld: sidecarHad,
+		FragmentOld: digestMaybe(fragmentOld, fragmentHad), SidecarOld: digestMaybe(sidecarOld, sidecarHad), FragmentHadOld: fragmentHad, SidecarHadOld: sidecarHad,
 		FragmentNew: digestPtr(d.Fragment), SidecarNew: digestPtr(d.Sidecar), Phase: "prepared"}
 	if err := m.writeBackup(path+".fragment.old", fragmentOld, fragmentHad); err != nil {
 		return err
@@ -324,23 +329,23 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 }
 
 func (m *Manager) validateDocument(d Document) error {
-	if d.Version != journalVersion && d.Version != 2 {
+	if d.Version != 2 {
 		return fmt.Errorf("unsupported linechain document version %d", d.Version)
 	}
-	if d.Version == 2 && d.FragmentBasename == "" {
+	if d.FragmentBasename == "" {
 		return fmt.Errorf("v2 fragment_basename is required")
 	}
 	switch d.Operation {
 	case "create":
-		if d.PreviousFragmentSHA256 != "" || d.PreviousSidecarSHA256 != "" || d.Fragment == nil || d.Sidecar == nil {
+		if d.PreviousFragmentSHA256 != "" || d.Fragment == nil || d.Sidecar == nil {
 			return fmt.Errorf("create document has inconsistent old/desired shape")
 		}
 	case "replace":
-		if d.PreviousFragmentSHA256 == "" || d.PreviousSidecarSHA256 == "" || d.Fragment == nil || d.Sidecar == nil {
+		if d.PreviousFragmentSHA256 == "" || d.Fragment == nil || d.Sidecar == nil {
 			return fmt.Errorf("replace document has inconsistent old/desired shape")
 		}
 	case "remove":
-		if d.PreviousFragmentSHA256 == "" || d.PreviousSidecarSHA256 == "" || d.Fragment != nil || d.Sidecar == nil {
+		if d.PreviousFragmentSHA256 == "" || d.Fragment != nil || d.Sidecar == nil {
 			return fmt.Errorf("remove document has inconsistent old/desired shape")
 		}
 	default:
@@ -385,7 +390,7 @@ func (m *Manager) validateDocument(d Document) error {
 	if err := validateParents(d.SidecarPath); err != nil {
 		return err
 	}
-	for _, want := range []string{d.PreviousFragmentSHA256, d.PreviousSidecarSHA256} {
+	for _, want := range []string{d.PreviousFragmentSHA256} {
 		if want != "" && !validSHA(want) {
 			return fmt.Errorf("previous artifact digest is invalid")
 		}
