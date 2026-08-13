@@ -399,7 +399,7 @@ func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
 			return testResponse(http.StatusNotFound, ""), nil
 		}
 	})}
-	cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}
+	cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret", LinechainReady: true}
 	if err := runTasks(cfg, runner, outbox, manager); err == nil {
 		t.Fatal("cleanup failure should remain readiness-visible")
 	}
