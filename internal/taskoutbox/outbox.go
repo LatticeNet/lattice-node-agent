@@ -35,6 +35,7 @@ type Entry struct {
 	Version            int               `json:"version"`
 	State              string            `json:"state"`
 	Task               model.Task        `json:"task"`
+	DurableProtocol    string            `json:"durable_protocol,omitempty"`
 	Result             *model.TaskResult `json:"result,omitempty"`
 	ExecutionStartedAt time.Time         `json:"execution_started_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
@@ -157,6 +158,15 @@ func (s *Store) Close() error {
 // must not be executed again. A true result means this call published the new
 // lease journal, even if a subsequent directory sync reported an error.
 func (s *Store) Begin(task model.Task) (committed bool, err error) {
+	return s.begin(task, "")
+}
+
+// BeginWithProtocol records the leased delivery discriminator for recovery.
+func (s *Store) BeginWithProtocol(task model.Task, protocol string) (bool, error) {
+	return s.begin(task, protocol)
+}
+
+func (s *Store) begin(task model.Task, protocol string) (committed bool, err error) {
 	if strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.LeaseID) == "" {
 		return false, fmt.Errorf("task id and lease id are required for durable execution")
 	}
@@ -181,6 +191,7 @@ func (s *Store) Begin(task model.Task) (committed bool, err error) {
 		Version:            entryVersion,
 		State:              stateLeased,
 		Task:               task,
+		DurableProtocol:    protocol,
 		ExecutionStartedAt: now,
 		UpdatedAt:          now,
 	})
