@@ -250,6 +250,9 @@ func (s *Store) RecoverInterrupted(nodeID string) error {
 		if entry.State != stateLeased {
 			continue
 		}
+		if entry.DurableProtocol == "linechain-e3-v1" {
+			return fmt.Errorf("leased E3 task %s requires linechain journal recovery before generic outbox recovery", entry.Task.ID)
+		}
 		now := time.Now().UTC()
 		result := model.TaskResult{
 			TaskID:     entry.Task.ID,
