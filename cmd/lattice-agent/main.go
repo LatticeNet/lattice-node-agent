@@ -1218,7 +1218,10 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 	debugf(cfg, "tasks fetched: count=%d", len(tasks))
 	for _, leased := range tasks {
 		task := leased.Task
-		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v1" {
+		if err := validateDurablePair(leased, manager, cfg.LinechainReady); err != nil {
+			return err
+		}
+		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v1" && leased.DurableProtocol != "netguard-v1" {
 			return fmt.Errorf("unsupported durable protocol %q", leased.DurableProtocol)
 		}
 		if !leased.DurableResult {
@@ -1321,6 +1324,22 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 	return nil
 }
 
+func validateDurablePair(task leasedAgentTask, manager *linechain.Manager, ready bool) error {
+	if !task.DurableResult {
+		if task.DurableProtocol != "" {
+			return fmt.Errorf("non-durable task has protocol %q", task.DurableProtocol)
+		}
+		return nil
+	}
+	if task.DurableProtocol != "linechain-e3-v1" && task.DurableProtocol != "netguard-v1" {
+		return fmt.Errorf("durable task has unsupported protocol %q", task.DurableProtocol)
+	}
+	if task.DurableProtocol == "linechain-e3-v1" && (manager == nil || !ready) {
+		return fmt.Errorf("linechain task received while durable linechain is unavailable")
+	}
+	return nil
+}
+
 func isLinechainTask(task leasedAgentTask) bool {
 	return task.DurableResult && task.DurableProtocol == "linechain-e3-v1"
 }
@@ -1361,7 +1380,7 @@ func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain boo
 		// Pending entries predate typed lease metadata; retain only the exact
 		// helper namespace marker during cleanup recovery. Live classification is
 		// always driven by durable_protocol on the leased response.
-		if retain && false {
+		if retain && entry.DurableProtocol == "linechain-e3-v1" {
 			continue
 		}
 		if err := outbox.Remove(entry); err != nil {

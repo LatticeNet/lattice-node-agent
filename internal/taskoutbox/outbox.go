@@ -177,7 +177,7 @@ func (s *Store) begin(task model.Task, protocol string) (committed bool, err err
 	key := entryKey(task.ID, task.LeaseID)
 	for _, entry := range entries {
 		if entry.Task.ID == task.ID {
-			if entry.key == key && reflect.DeepEqual(entry.Task, task) {
+			if entry.key == key && reflect.DeepEqual(entry.Task, task) && entry.DurableProtocol == protocol {
 				return false, nil
 			}
 			return false, fmt.Errorf("task %s was redelivered with a different lease or content", task.ID)
