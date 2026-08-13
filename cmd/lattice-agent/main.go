@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -31,6 +33,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
+	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -63,7 +66,13 @@ const (
 	defaultDebugMaxBatchLines = 100
 	debugSinkMaxLines         = 1000
 	guardRealityReportTimeout = 10 * time.Second
+	guardManagedSHACapability = "netguard-managed-sha-v1"
+	agentCapabilitiesHeader   = "X-Lattice-Agent-Capabilities"
 )
+
+func reportedCapabilities() []string {
+	return []string{guardManagedSHACapability}
+}
 
 type agentConfig struct {
 	Server              string
@@ -144,6 +153,7 @@ type agentConfig struct {
 	SingBoxBin            string
 	SingBoxMeta           string
 	LogStateDir           string
+	TaskOutboxDir         string
 }
 
 type agentRuntimePayload struct {
@@ -178,6 +188,7 @@ func main() {
 	var cfg agentConfig
 	var printVersion bool
 	var printCompat bool
+	var printGuardManagedSHA bool
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
@@ -235,8 +246,10 @@ func main() {
 	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
 	flag.StringVar(&cfg.SingBoxMeta, "singbox-meta", env("LATTICE_SINGBOX_META", ""), "design-15 sing-box sidecar metadata path for -singbox-discover (default /etc/sing-box/lattice-metadata.json)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
+	flag.StringVar(&cfg.TaskOutboxDir, "task-outbox-dir", os.Getenv("LATTICE_TASK_OUTBOX_DIR"), "base directory for durable task-result journals (default: log state dir, or the user cache directory for manual runs)")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.BoolVar(&printCompat, "compat-json", false, "print embedded server/dashboard compatibility metadata and exit")
+	flag.BoolVar(&printGuardManagedSHA, "guard-managed-sha", false, "print the canonical SHA-256 of the managed lattice_guard nft table and exit")
 	flag.Parse()
 	if printVersion {
 		fmt.Println(version)
@@ -245,6 +258,12 @@ func main() {
 	if printCompat {
 		if err := json.NewEncoder(os.Stdout).Encode(compatibilityPayload()); err != nil {
 			log.Fatalf("compatibility encode failed: %v", err)
+		}
+		return
+	}
+	if printGuardManagedSHA {
+		if err := writeGuardManagedSHA(context.Background(), os.Stdout, guardreality.CollectManagedTableSHA); err != nil {
+			log.Fatalf("guard managed SHA collection failed: %v", err)
 		}
 		return
 	}
@@ -303,6 +322,22 @@ func main() {
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
 	}
+	outboxDir, err := taskResultOutboxDir(cfg)
+	if err != nil {
+		log.Fatalf("task result outbox path failed: %v", err)
+	}
+	taskResults, err := taskoutbox.Open(outboxDir)
+	if err != nil {
+		log.Fatalf("task result outbox initialization failed: %v", err)
+	}
+	defer taskResults.Close()
+	agentBinary, err := os.Executable()
+	if err != nil {
+		log.Fatalf("resolve lattice-agent executable failed: %v", err)
+	}
+	if !filepath.IsAbs(agentBinary) {
+		log.Fatalf("resolved lattice-agent executable is not absolute: %q", agentBinary)
+	}
 	if cfg.AllowTerminal && os.Geteuid() == 0 && !cfg.AllowRoot {
 		log.Printf("warning: terminal sessions disabled because agent is running as root without -allow-root-exec")
 		cfg.AllowTerminal = false
@@ -318,6 +353,7 @@ func main() {
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
 		"compatibility":        compatibilityPayload(),
+		"capabilities":         reportedCapabilities(),
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
 		"internal_ip":          cfg.InternalIP,
@@ -343,7 +379,10 @@ func main() {
 		go runTerminalLoop(context.Background(), cfg)
 	}
 
-	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(), WorkdirRoot: cfg.TaskWorkRoot}
+	runner := taskexec.Runner{
+		AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(),
+		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary,
+	}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
@@ -366,7 +405,7 @@ func main() {
 		if err := reportSingBoxInventory(cfg); err != nil {
 			log.Printf("singbox discover error: %v", err)
 		}
-		if err := runTasks(cfg, runner); err != nil {
+		if err := runTasks(cfg, runner, taskResults); err != nil {
 			log.Printf("task poll error: %v", err)
 		}
 		if assigned, err := fetchMonitors(cfg); err != nil {
@@ -390,6 +429,20 @@ func main() {
 		cancelReport()
 		<-ticker.C
 	}
+}
+
+var guardManagedSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func writeGuardManagedSHA(ctx context.Context, out io.Writer, collect func(context.Context, guardreality.Source) (string, error)) error {
+	sha, err := collect(ctx, guardreality.Source{})
+	if err != nil {
+		return err
+	}
+	if !guardManagedSHARe.MatchString(sha) {
+		return fmt.Errorf("collector returned invalid managed table SHA")
+	}
+	_, err = fmt.Fprintln(out, sha)
+	return err
 }
 
 // monitorManager keeps one goroutine per assigned monitor, each probing on its
@@ -624,6 +677,7 @@ func reportMetrics(cfg agentConfig) error {
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version":       version,
 		"compatibility": compatibilityPayload(),
+		"capabilities":  reportedCapabilities(),
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,
@@ -1046,12 +1100,37 @@ func resolveProxyUsageSecret(cfg *agentConfig) error {
 	return nil
 }
 
-func runTasks(cfg agentConfig, runner taskexec.Runner) error {
+type taskRunner interface {
+	Run(model.Task) model.TaskResult
+}
+
+type taskResultOutbox interface {
+	Begin(model.Task) (bool, error)
+	Complete(model.TaskResult) (bool, error)
+	ConfirmDurability() error
+	RecoverInterrupted(string) error
+	Pending() ([]taskoutbox.Entry, error)
+	Remove(taskoutbox.Entry) error
+}
+
+type leasedAgentTask struct {
+	model.Task
+	DurableResult bool `json:"durable_result"`
+}
+
+func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error {
+	if err := outbox.RecoverInterrupted(cfg.NodeID); err != nil {
+		return fmt.Errorf("recover interrupted task results: %w", err)
+	}
+	if err := flushTaskResults(cfg, outbox); err != nil {
+		return err
+	}
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/tasks?node_id=%s", cfg.Server, cfg.NodeID), nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set(agentCapabilitiesHeader, strings.Join(reportedCapabilities(), ","))
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -1060,23 +1139,118 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 	if resp.StatusCode != http.StatusOK {
 		return agentHTTPError(resp, "fetch tasks")
 	}
-	var tasks []model.Task
+	var tasks []leasedAgentTask
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return err
 	}
 	debugf(cfg, "tasks fetched: count=%d", len(tasks))
-	for _, task := range tasks {
+	for _, leased := range tasks {
+		task := leased.Task
+		if !leased.DurableResult {
+			debugf(cfg, "task start without durable-result protocol: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
+			result := runner.Run(task)
+			result.NodeID = cfg.NodeID
+			if result.FinishedAt.IsZero() {
+				result.FinishedAt = time.Now().UTC()
+			}
+			if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": result}, nil); err != nil {
+				return fmt.Errorf("post task result %s: %w", task.ID, err)
+			}
+			continue
+		}
+		committed, err := outbox.Begin(task)
+		if err != nil {
+			journalErr := fmt.Errorf("journal task lease %s before execution: %w", task.ID, err)
+			if committed {
+				// The lease journal is visible but its directory durability is
+				// uncertain. Do not post a different direct result: the next poll
+				// will recover this exact journal as an unknown outcome.
+				return journalErr
+			}
+			// No host code ran, so it is safe to make one best-effort terminal
+			// report even though durable retry storage is unavailable. This avoids
+			// silently stranding the server lease while preserving the fail-closed
+			// rule that an unjournaled task is never executed.
+			failure := model.TaskResult{
+				TaskID: task.ID, LeaseID: task.LeaseID, NodeID: cfg.NodeID, ExitCode: -1,
+				Error:      "task was not executed because its durable lease journal could not be written",
+				FinishedAt: time.Now().UTC(),
+			}
+			if postErr := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": failure}, nil); postErr != nil {
+				return fmt.Errorf("%v; report unexecuted task: %w", journalErr, postErr)
+			}
+			return journalErr
+		}
+		if !committed {
+			// The server intentionally redelivers an unacknowledged lease when a
+			// prior task-poll response may have been lost. An exact existing journal
+			// is the execution authority, so the duplicate response is a no-op.
+			debugf(cfg, "task lease already journaled: id=%s", task.ID)
+			continue
+		}
 		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
 		result := runner.Run(task)
 		result.NodeID = cfg.NodeID
 		debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
-		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{
-			"result": result,
-		}, nil); err != nil {
+		completed, completeErr := outbox.Complete(result)
+		if completeErr != nil {
+			journalErr := fmt.Errorf("journal task result %s before upload: %w", task.ID, completeErr)
+			if completed {
+				// Rename published the exact result even though directory durability
+				// was uncertain. Confirm the local transition before allowing the
+				// server to commit the result; otherwise a crash could expose the old
+				// leased journal and synthesize a conflicting unknown-outcome result.
+				if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
+					return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
+				}
+				if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
+					return fmt.Errorf("%v; upload confirmed task result: %w", journalErr, flushErr)
+				}
+			}
+			return journalErr
+		}
+		if err := flushTaskResults(cfg, outbox); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func flushTaskResults(cfg agentConfig, outbox taskResultOutbox) error {
+	pending, err := outbox.Pending()
+	if err != nil {
+		return fmt.Errorf("read pending task results: %w", err)
+	}
+	for _, entry := range pending {
+		if entry.Result == nil {
+			return fmt.Errorf("pending task result %s is empty", entry.Task.ID)
+		}
+		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{
+			"result": *entry.Result,
+		}, nil); err != nil {
+			return fmt.Errorf("flush durable task result %s: %w", entry.Task.ID, err)
+		}
+		if err := outbox.Remove(entry); err != nil {
+			return fmt.Errorf("remove acknowledged task result %s: %w", entry.Task.ID, err)
+		}
+	}
+	return nil
+}
+
+func taskResultOutboxDir(cfg agentConfig) (string, error) {
+	base := strings.TrimSpace(cfg.TaskOutboxDir)
+	if base == "" {
+		base = strings.TrimSpace(cfg.LogStateDir)
+	}
+	if base == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(cacheDir, "lattice-agent")
+	}
+	nodeHash := sha256.Sum256([]byte(cfg.Server + "\x00" + cfg.NodeID))
+	return filepath.Join(base, "task-outbox", fmt.Sprintf("%x", nodeHash[:])), nil
 }
 
 func postAgentJSON(cfg agentConfig, path string, payload map[string]any, out any) error {
