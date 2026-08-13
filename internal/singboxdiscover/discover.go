@@ -179,8 +179,8 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 // It is used by recovery/E2E verification after the same bounded layout resolver
 // has established file authority.
 func DiscoverRuntimeFiles(nodeID string, files []string, metaPath string) (model.SingBoxInventory, error) {
-	copyFiles:=append([]string(nil),files...)
-	return discoverRuntimeConfig(Source{MetaPath:metaPath,runtimeFiles:func()[]string{return copyFiles}},nodeID,time.Now().UTC())
+	copyFiles := append([]string(nil), files...)
+	return discoverRuntimeConfig(Source{MetaPath: metaPath, runtimeFiles: func() []string { return copyFiles }}, nodeID, time.Now().UTC())
 }
 
 // loadSingBoxRuntimeConfigFiles locates and reads the on-box sing-box config

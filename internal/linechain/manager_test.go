@@ -109,8 +109,12 @@ func TestRecoveryProducesStableFailureAndCleansAfterCompletion(t *testing.T) {
 	mustMkdir(t, filepath.Join(dir, "conf"))
 	fragmentPath := filepath.Join(dir, "conf", "lattice-linechain-chain.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
-	if err:=m.ConfigureLayout(filepath.Join(dir,"conf"),sidecarPath);err!=nil{t.Fatal(err)}
-	if err:=m.ConfigureCommands("true",[]string{"true"},[]string{"true"});err!=nil{t.Fatal(err)}
+	if err := m.ConfigureLayout(filepath.Join(dir, "conf"), sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
 	j := journal{Version: 1, TaskID: "task-a", LeaseID: "lease-a", FragmentPath: fragmentPath, SidecarPath: sidecarPath, Phase: "prepared"}
 	path := m.journalPath(j.TaskID, j.LeaseID)
 	if err := writeJSON(path, j); err != nil {
