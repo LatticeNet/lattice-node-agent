@@ -318,8 +318,11 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 }
 
 func (m *Manager) validateDocument(d Document) error {
-	if d.Version != journalVersion {
+	if d.Version != journalVersion && d.Version != 2 {
 		return fmt.Errorf("unsupported linechain document version %d", d.Version)
+	}
+	if d.Version == 2 && d.FragmentBasename == "" {
+		return fmt.Errorf("v2 fragment_basename is required")
 	}
 	switch d.Operation {
 	case "create":
