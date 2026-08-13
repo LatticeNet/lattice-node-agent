@@ -308,6 +308,15 @@ func (s *Store) Pending() ([]Entry, error) {
 	return pending, nil
 }
 
+// Snapshot returns a bounded copy of every leased and completed entry.
+func (s *Store) Snapshot() ([]Entry, error) {
+	entries, err := s.readAll()
+	if err != nil {
+		return nil, err
+	}
+	return append([]Entry(nil), entries...), nil
+}
+
 // Remove atomically unlinks an acknowledged outbox entry and syncs the
 // directory so the acknowledgement survives a crash.
 func (s *Store) Remove(entry Entry) error {

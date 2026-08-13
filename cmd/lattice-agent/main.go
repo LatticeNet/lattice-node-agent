@@ -1175,6 +1175,10 @@ type taskResultOutbox interface {
 	Remove(taskoutbox.Entry) error
 }
 
+type taskResultOutboxSnapshot interface {
+	Snapshot() ([]taskoutbox.Entry, error)
+}
+
 type leasedAgentTask struct {
 	model.Task
 	DurableResult   bool   `json:"durable_result"`
@@ -1187,6 +1191,9 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		manager = managers[0]
 	}
 	if manager != nil {
+		if err := crossCheckLinechainAuthority(manager, outbox); err != nil {
+			return err
+		}
 		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
 			return err
 		}
@@ -1319,6 +1326,47 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		}
 		if err := flushTaskResults(cfg, outbox); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func crossCheckLinechainAuthority(manager *linechain.Manager, outbox taskResultOutbox) error {
+	typed, ok := outbox.(taskResultOutboxSnapshot)
+	if !ok {
+		return nil
+	}
+	entries, err := typed.Snapshot()
+	if err != nil {
+		return err
+	}
+	refs, err := manager.Snapshot()
+	if err != nil {
+		return err
+	}
+	journals := map[string]struct{}{}
+	for _, ref := range refs {
+		journals[ref.TaskID+"\x00"+ref.LeaseID] = struct{}{}
+	}
+	matchedE3 := map[string]struct{}{}
+	for _, entry := range entries {
+		key := entry.Task.ID + "\x00" + entry.Task.LeaseID
+		_, hasJournal := journals[key]
+		if hasJournal && entry.DurableProtocol != "linechain-e3-v1" {
+			return fmt.Errorf("linechain journal %s has mismatched outbox protocol", entry.Task.ID)
+		}
+		if hasJournal && entry.DurableProtocol == "linechain-e3-v1" {
+			matchedE3[key] = struct{}{}
+		}
+		if entry.State == "leased" && entry.DurableProtocol == "linechain-e3-v1" {
+			if !hasJournal {
+				return fmt.Errorf("leased E3 outbox %s lacks exact linechain journal", entry.Task.ID)
+			}
+		}
+	}
+	for key := range journals {
+		if _, ok := matchedE3[key]; !ok {
+			return fmt.Errorf("linechain journal lacks exact leased E3 outbox: %q", key)
 		}
 	}
 	return nil

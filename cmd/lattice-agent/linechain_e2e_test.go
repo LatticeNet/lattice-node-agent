@@ -114,8 +114,9 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
   "route":{"rules":[{"inbound":["source-b"],"outbound":"chain-to-a"}]}
 }
 `, observer.Port(), uuidA, realityPublic)
-	sidecar := fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}]}
+	sidecar := fmt.Sprintf(`{"inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}],"schema":"lattice.singbox-metadata.v2"}
 `, lineUUIDB, lineUUIDA)
+	sidecar = canonicalJSONString(t, sidecar)
 
 	m := openE2EManager(t, bin, root, bDir, sidecarPath, txnDir, bPort)
 	defer m.Close()
@@ -187,12 +188,12 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	// Simulate the ordinary independent metadata writer changing unrelated
 	// sidecar bytes. The declared edge remains intact, and remove must tolerate
 	// this non-E3 sidecar drift instead of applying a stale sidecar CAS.
-	resyncedSidecar := fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","generated_by":"ordinary-resync","inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}]}
+	resyncedSidecar := fmt.Sprintf(`{"generated_by":"ordinary-resync","inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}],"schema":"lattice.singbox-metadata.v2"}
 `, lineUUIDB, lineUUIDA)
 	writeFile(t, sidecarPath, resyncedSidecar)
 	assertChainedInventory(t, bDir, fragmentPath, sidecarPath, lineUUIDB, lineUUIDA, observer.Port())
 
-	removedSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}
+	removedSidecar := `{"inbounds":[],"schema":"lattice.singbox-metadata.v2"}
 `
 	removeDoc := bindE2EDocument("remove", basename, digestText(fragment), nil, &removedSidecar)
 	applyAndResolve(t, m, marshalE2EDocument(t, removeDoc), "remove-task", "remove-lease")
@@ -288,6 +289,19 @@ func marshalE2EDocument(t *testing.T, d e2eDocument) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func canonicalJSONString(t *testing.T, raw string) string {
+	t.Helper()
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(append(b, '\n'))
 }
 
 func openE2EManager(t *testing.T, bin, root, configDir, sidecarPath, txnDir string, bPort int) *linechain.Manager {
