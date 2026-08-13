@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -42,13 +43,18 @@ type Entry struct {
 
 // Store is a bounded, file-backed task result outbox.
 type Store struct {
-	dir     string
-	syncDir func(string) error
-	lock    *os.File
+	dir                   string
+	syncDir               func(string) error
+	lock                  *os.File
+	durabilityUnconfirmed bool
 }
 
 // Open creates or validates a private outbox directory.
 func Open(dir string) (*Store, error) {
+	return openWithSync(dir, syncDir)
+}
+
+func openWithSync(dir string, syncDirectory func(string) error) (*Store, error) {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return nil, fmt.Errorf("task result outbox directory is empty")
@@ -56,7 +62,10 @@ func Open(dir string) (*Store, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, fmt.Errorf("task result outbox directory must be absolute: %q", dir)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if syncDirectory == nil {
+		syncDirectory = syncDir
+	}
+	if err := makeDurablePrivateDir(dir, syncDirectory); err != nil {
 		return nil, fmt.Errorf("create task result outbox: %w", err)
 	}
 	info, err := os.Lstat(dir)
@@ -73,7 +82,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{dir: dir, syncDir: syncDir, lock: lock}
+	store := &Store{dir: dir, syncDir: syncDirectory, lock: lock}
 	if err := store.cleanupTemps(); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -83,6 +92,54 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// makeDurablePrivateDir creates every missing path component with private
+// permissions and fsyncs its parent immediately after publication. It also
+// re-confirms the deepest visible component so a retry cannot mistake a prior
+// sync-failed mkdir for a crash-durable directory entry.
+func makeDurablePrivateDir(dir string, syncDirectory func(string) error) error {
+	dir = filepath.Clean(dir)
+	missing := []string{}
+	current := dir
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return fmt.Errorf("path component must be a real directory: %s", current)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect directory %s: %w", current, err)
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			return fmt.Errorf("no existing parent for task result outbox: %s", dir)
+		}
+		current = parent
+	}
+
+	// Confirm the deepest existing component before extending it. A prior Open
+	// may have created exactly this component and then failed its parent fsync;
+	// creation proceeds only one confirmed component at a time, so this retry
+	// closes that ambiguity without trusting mere directory visibility.
+	if parent := filepath.Dir(current); parent != current {
+		if err := syncDirectory(parent); err != nil {
+			return fmt.Errorf("confirm existing directory %s: %w", current, err)
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		path := missing[i]
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return fmt.Errorf("create private directory %s: %w", path, err)
+		}
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return fmt.Errorf("sync parent after creating %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // Close releases this process's exclusive ownership of the outbox.
@@ -95,9 +152,10 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Begin durably records a task lease before any task code is executed. The
-// committed return value reports whether the final journal path was published,
-// even if a subsequent directory sync reported an error.
+// Begin durably records a task lease before any task code is executed. A false,
+// nil result means the exact executable task and lease are already journaled and
+// must not be executed again. A true result means this call published the new
+// lease journal, even if a subsequent directory sync reported an error.
 func (s *Store) Begin(task model.Task) (committed bool, err error) {
 	if strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.LeaseID) == "" {
 		return false, fmt.Errorf("task id and lease id are required for durable execution")
@@ -106,14 +164,17 @@ func (s *Store) Begin(task model.Task) (committed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	if len(entries) >= maxEntries {
-		return false, ErrCapacity
-	}
 	key := entryKey(task.ID, task.LeaseID)
 	for _, entry := range entries {
-		if entry.key == key {
-			return false, fmt.Errorf("task lease is already journaled: %s", task.ID)
+		if entry.Task.ID == task.ID {
+			if entry.key == key && reflect.DeepEqual(entry.Task, task) {
+				return false, nil
+			}
+			return false, fmt.Errorf("task %s was redelivered with a different lease or content", task.ID)
 		}
+	}
+	if len(entries) >= maxEntries {
+		return false, ErrCapacity
 	}
 	now := time.Now().UTC()
 	return s.writeNew(key, Entry{
@@ -145,9 +206,28 @@ func (s *Store) Complete(result model.TaskResult) (committed bool, err error) {
 	return s.write(key, entry)
 }
 
+// ConfirmDurability retries the directory sync that makes a published journal
+// transition crash-durable. A completed result must not be exposed to the
+// server after Complete reports committed=true with an error until this call
+// succeeds.
+func (s *Store) ConfirmDurability() error {
+	if err := s.syncDir(s.dir); err != nil {
+		return fmt.Errorf("confirm task result outbox durability: %w", err)
+	}
+	s.durabilityUnconfirmed = false
+	return nil
+}
+
 // RecoverInterrupted turns every pre-execution/unknown-outcome lease journal
 // into an honest synthetic result. It never re-runs the task.
 func (s *Store) RecoverInterrupted(nodeID string) error {
+	// runTasks always calls recovery before Pending. Re-confirm the journal
+	// directory on every cycle so a completed entry that was published by a
+	// prior recovery attempt but whose directory fsync failed can never be
+	// uploaded merely because it is visible after the failed call.
+	if err := s.ConfirmDurability(); err != nil {
+		return fmt.Errorf("confirm task result outbox before recovery: %w", err)
+	}
 	entries, err := s.readAll()
 	if err != nil {
 		return err
@@ -169,8 +249,19 @@ func (s *Store) RecoverInterrupted(nodeID string) error {
 		entry.State = stateDone
 		entry.Result = &result
 		entry.UpdatedAt = now
-		if _, err := s.write(entry.key, entry); err != nil {
-			return fmt.Errorf("recover interrupted task %s: %w", entry.Task.ID, err)
+		committed, writeErr := s.write(entry.key, entry)
+		if writeErr == nil {
+			continue
+		}
+		if !committed {
+			return fmt.Errorf("recover interrupted task %s: %w", entry.Task.ID, writeErr)
+		}
+		// The unknown-outcome result is visible after rename, but it must not
+		// escape through Pending until its directory entry is crash-durable.
+		// Try immediately; if this also fails, the next recovery cycle's leading
+		// confirmation blocks upload and preserves the exact published result.
+		if confirmErr := s.ConfirmDurability(); confirmErr != nil {
+			return fmt.Errorf("recover interrupted task %s: %v; confirm published recovery: %w", entry.Task.ID, writeErr, confirmErr)
 		}
 	}
 	return nil
@@ -178,6 +269,9 @@ func (s *Store) RecoverInterrupted(nodeID string) error {
 
 // Pending returns completed results in deterministic oldest-first order.
 func (s *Store) Pending() ([]Entry, error) {
+	if s.durabilityUnconfirmed {
+		return nil, fmt.Errorf("task result outbox durability is unconfirmed")
+	}
 	entries, err := s.readAll()
 	if err != nil {
 		return nil, err
@@ -206,7 +300,11 @@ func (s *Store) Remove(entry Entry) error {
 	if err := os.Remove(s.path(entry.key)); err != nil {
 		return fmt.Errorf("remove acknowledged task result: %w", err)
 	}
-	return s.syncDir(s.dir)
+	if err := s.syncDir(s.dir); err != nil {
+		s.durabilityUnconfirmed = true
+		return err
+	}
+	return nil
 }
 
 func (s *Store) readAll() ([]Entry, error) {
@@ -363,6 +461,7 @@ func (s *Store) writeEntry(key string, entry Entry, createOnly bool) (bool, erro
 			return false, fmt.Errorf("publish new task result journal: %w", err)
 		}
 		if err := os.Remove(tmpPath); err != nil {
+			s.durabilityUnconfirmed = true
 			return true, fmt.Errorf("remove published task result temp file: %w", err)
 		}
 	} else if err := os.Rename(tmpPath, finalPath); err != nil {
@@ -370,8 +469,10 @@ func (s *Store) writeEntry(key string, entry Entry, createOnly bool) (bool, erro
 		return false, fmt.Errorf("publish task result journal: %w", err)
 	}
 	if err := s.syncDir(s.dir); err != nil {
+		s.durabilityUnconfirmed = true
 		return true, fmt.Errorf("sync task result outbox: %w", err)
 	}
+	s.durabilityUnconfirmed = false
 	return true, nil
 }
 

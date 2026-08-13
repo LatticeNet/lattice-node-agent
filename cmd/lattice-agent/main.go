@@ -1107,9 +1107,15 @@ type taskRunner interface {
 type taskResultOutbox interface {
 	Begin(model.Task) (bool, error)
 	Complete(model.TaskResult) (bool, error)
+	ConfirmDurability() error
 	RecoverInterrupted(string) error
 	Pending() ([]taskoutbox.Entry, error)
 	Remove(taskoutbox.Entry) error
+}
+
+type leasedAgentTask struct {
+	model.Task
+	DurableResult bool `json:"durable_result"`
 }
 
 func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error {
@@ -1133,12 +1139,25 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error
 	if resp.StatusCode != http.StatusOK {
 		return agentHTTPError(resp, "fetch tasks")
 	}
-	var tasks []model.Task
+	var tasks []leasedAgentTask
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return err
 	}
 	debugf(cfg, "tasks fetched: count=%d", len(tasks))
-	for _, task := range tasks {
+	for _, leased := range tasks {
+		task := leased.Task
+		if !leased.DurableResult {
+			debugf(cfg, "task start without durable-result protocol: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
+			result := runner.Run(task)
+			result.NodeID = cfg.NodeID
+			if result.FinishedAt.IsZero() {
+				result.FinishedAt = time.Now().UTC()
+			}
+			if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": result}, nil); err != nil {
+				return fmt.Errorf("post task result %s: %w", task.ID, err)
+			}
+			continue
+		}
 		committed, err := outbox.Begin(task)
 		if err != nil {
 			journalErr := fmt.Errorf("journal task lease %s before execution: %w", task.ID, err)
@@ -1162,12 +1181,33 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error
 			}
 			return journalErr
 		}
+		if !committed {
+			// The server intentionally redelivers an unacknowledged lease when a
+			// prior task-poll response may have been lost. An exact existing journal
+			// is the execution authority, so the duplicate response is a no-op.
+			debugf(cfg, "task lease already journaled: id=%s", task.ID)
+			continue
+		}
 		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
 		result := runner.Run(task)
 		result.NodeID = cfg.NodeID
 		debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
-		if _, err := outbox.Complete(result); err != nil {
-			return fmt.Errorf("journal task result %s before upload: %w", task.ID, err)
+		completed, completeErr := outbox.Complete(result)
+		if completeErr != nil {
+			journalErr := fmt.Errorf("journal task result %s before upload: %w", task.ID, completeErr)
+			if completed {
+				// Rename published the exact result even though directory durability
+				// was uncertain. Confirm the local transition before allowing the
+				// server to commit the result; otherwise a crash could expose the old
+				// leased journal and synthesize a conflicting unknown-outcome result.
+				if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
+					return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
+				}
+				if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
+					return fmt.Errorf("%v; upload confirmed task result: %w", journalErr, flushErr)
+				}
+			}
+			return journalErr
 		}
 		if err := flushTaskResults(cfg, outbox); err != nil {
 			return err
