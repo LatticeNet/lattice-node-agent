@@ -170,7 +170,9 @@ type Runner struct {
 	AgentBinary string
 	// LinechainTxnDir is the private transaction root passed only to trusted
 	// server-authored helper invocations.
-	LinechainTxnDir string
+	LinechainTxnDir      string
+	LinechainConfigDir   string
+	LinechainSidecarPath string
 	// getUID returns the effective uid of the agent process. It is a field so
 	// tests can simulate "running as root" without actually being root. When
 	// nil it defaults to os.Geteuid.
@@ -398,6 +400,9 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	}
 	if filepath.IsAbs(r.LinechainTxnDir) {
 		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_TXN_DIR="+r.LinechainTxnDir)
+	}
+	if filepath.IsAbs(r.LinechainConfigDir) && filepath.IsAbs(r.LinechainSidecarPath) {
+		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_CONFIG_DIR="+r.LinechainConfigDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+r.LinechainSidecarPath)
 	}
 
 	var stdout, stderr cappedBuffer

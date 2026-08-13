@@ -19,10 +19,15 @@ func TestApplyCreateResolveAndCleanup(t *testing.T) {
 	fragmentPath := filepath.Join(configDir, "lattice-linechain-chain.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
 	mustMkdir(t, filepath.Dir(fragmentPath))
+	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
 	fragment := `{"outbounds":[{"type":"direct","tag":"chain"}]}`
 	sidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	doc := Document{Version: 1, ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar,
-		SingBoxBinary: "true", CheckArgs: []string{}, RestartCommand: []string{"true"}, VerifyCommand: []string{"true"}}
+	doc := Document{Version: 1, Operation: "create", ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar}
 	applyDoc(t, m, doc, "task-a", "lease-a")
 	result, err := m.ResolveAfterRun(context.Background(), model.Task{ID: "task-a", LeaseID: "lease-a"}, model.TaskResult{TaskID: "task-a", LeaseID: "lease-a", ExitCode: 0, FinishedAt: time.Now().UTC()})
 	if err != nil || result.ExitCode != 0 {
@@ -46,11 +51,18 @@ func TestApplyRejectsUnexpectedExistingAndSymlink(t *testing.T) {
 	configDir := filepath.Join(dir, "conf")
 	fragmentPath := filepath.Join(configDir, "lattice-linechain-chain.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
+	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(fragmentPath, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	desired := "new"
-	doc := Document{Version: 1, ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &desired, RestartCommand: []string{"true"}, VerifyCommand: []string{"true"}, SingBoxBinary: "true"}
+	desiredSidecar := "{}"
+	doc := Document{Version: 1, Operation: "create", ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &desired, Sidecar: &desiredSidecar}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "unexpected existing") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -71,6 +83,12 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 	configDir := filepath.Join(dir, "conf")
 	fragmentPath := filepath.Join(configDir, "lattice-linechain-chain.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
+	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("false", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
 	oldFragment, oldSidecar := "old-fragment", "old-sidecar"
 	for path, data := range map[string]string{fragmentPath: oldFragment, sidecarPath: oldSidecar} {
 		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
@@ -78,7 +96,7 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 		}
 	}
 	newFragment, newSidecar := "new-fragment", "new-sidecar"
-	doc := Document{Version: 1, ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, PreviousFragmentSHA256: digest([]byte(oldFragment)), PreviousSidecarSHA256: digest([]byte(oldSidecar)), Fragment: &newFragment, Sidecar: &newSidecar, SingBoxBinary: "false", RestartCommand: []string{"true"}, VerifyCommand: []string{"true"}}
+	doc := Document{Version: 1, Operation: "replace", ConfigDir: configDir, FragmentPath: fragmentPath, SidecarPath: sidecarPath, PreviousFragmentSHA256: digest([]byte(oldFragment)), PreviousSidecarSHA256: digest([]byte(oldSidecar)), Fragment: &newFragment, Sidecar: &newSidecar}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "check failed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -91,6 +109,8 @@ func TestRecoveryProducesStableFailureAndCleansAfterCompletion(t *testing.T) {
 	mustMkdir(t, filepath.Join(dir, "conf"))
 	fragmentPath := filepath.Join(dir, "conf", "lattice-linechain-chain.json")
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
+	if err:=m.ConfigureLayout(filepath.Join(dir,"conf"),sidecarPath);err!=nil{t.Fatal(err)}
+	if err:=m.ConfigureCommands("true",[]string{"true"},[]string{"true"});err!=nil{t.Fatal(err)}
 	j := journal{Version: 1, TaskID: "task-a", LeaseID: "lease-a", FragmentPath: fragmentPath, SidecarPath: sidecarPath, Phase: "prepared"}
 	path := m.journalPath(j.TaskID, j.LeaseID)
 	if err := writeJSON(path, j); err != nil {
@@ -141,23 +161,27 @@ func TestOpenRecoversStaleLockFile(t *testing.T) {
 }
 
 func TestValidateDocumentBindsOwnedPaths(t *testing.T) {
+	m, _ := testManager(t)
 	root := t.TempDir()
 	configDir := filepath.Join(root, "conf")
 	mustMkdir(t, configDir)
 	fragment := "{}"
 	sidecar := "{}"
-	valid := Document{Version: 1, ConfigDir: configDir, FragmentPath: filepath.Join(configDir, "lattice-linechain-a.json"), SidecarPath: filepath.Join(root, "lattice-metadata.json"), Fragment: &fragment, Sidecar: &sidecar}
-	if err := validateDocument(valid); err != nil {
+	if err := m.ConfigureLayout(configDir, filepath.Join(root, "lattice-metadata.json")); err != nil {
+		t.Fatal(err)
+	}
+	valid := BindDocument(Document{Version: 1, Operation: "create", ConfigDir: configDir, FragmentPath: filepath.Join(configDir, "lattice-linechain-a.json"), SidecarPath: filepath.Join(root, "lattice-metadata.json"), Fragment: &fragment, Sidecar: &sidecar})
+	if err := m.validateDocument(valid); err != nil {
 		t.Fatal(err)
 	}
 	invalid := valid
 	invalid.FragmentPath = filepath.Join(root, "outside.json")
-	if err := validateDocument(invalid); err == nil {
+	if err := m.validateDocument(invalid); err == nil {
 		t.Fatal("outside fragment accepted")
 	}
 	invalid = valid
 	invalid.SidecarPath = filepath.Join(root, "other.json")
-	if err := validateDocument(invalid); err == nil {
+	if err := m.validateDocument(invalid); err == nil {
 		t.Fatal("unowned sidecar accepted")
 	}
 }
@@ -198,6 +222,7 @@ func applyDoc(t *testing.T, m *Manager, d Document, task, lease string) {
 	}
 }
 func applyDocErr(m *Manager, d Document, task, lease string) error {
+	d = BindDocument(d)
 	b, _ := json.Marshal(d)
 	return m.Apply(context.Background(), strings.NewReader(string(b)), task, lease)
 }

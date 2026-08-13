@@ -285,7 +285,7 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 					return testResponse(http.StatusNotFound, ""), nil
 				}
 			})}
-			cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}
+			cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret", LinechainReady: true}
 
 			if err := runTasks(cfg, runner, store); err == nil {
 				t.Fatal("first result upload should fail")
@@ -310,14 +310,18 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 }
 
 type linechainTaskRunner struct {
-	manager *linechain.Manager
-	doc     []byte
-	calls   int
+	manager    *linechain.Manager
+	doc        []byte
+	calls      int
+	afterApply func()
 }
 
 func (r *linechainTaskRunner) Run(task model.Task) model.TaskResult {
 	r.calls++
 	err := r.manager.Apply(context.Background(), bytes.NewReader(r.doc), task.ID, task.LeaseID)
+	if err == nil && r.afterApply != nil {
+		r.afterApply()
+	}
 	result := model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
 	if err != nil {
 		result.ExitCode = -1
@@ -345,18 +349,33 @@ func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
 	if err := os.Mkdir(conf, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := manager.ConfigureLayout(conf, filepath.Join(root, "lattice-metadata.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
 	fragmentPath := filepath.Join(conf, "lattice-linechain-chain.json")
 	sidecarPath := filepath.Join(root, "lattice-metadata.json")
 	fragment := "{\"outbounds\":[]}"
 	sidecar := "{\"schema\":\"lattice.singbox-metadata.v2\",\"inbounds\":[]}"
-	doc, err := json.Marshal(linechain.Document{Version: 1, ConfigDir: conf, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar, SingBoxBinary: "true", RestartCommand: []string{"true"}, VerifyCommand: []string{"true"}})
+	docValue := linechain.BindDocument(linechain.Document{Version: 1, Operation: "create", ConfigDir: conf, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar})
+	doc, err := json.Marshal(docValue)
 	if err != nil {
 		t.Fatal(err)
 	}
 	task := model.Task{ID: "task-chain", LeaseID: "lease-chain", Interpreter: "sh", Script: `"$LATTICE_AGENT_BIN" -linechain-apply`, TimeoutSec: 10, OutputLimit: 1024}
-	runner := &linechainTaskRunner{manager: manager, doc: doc}
+	runner := &linechainTaskRunner{manager: manager, doc: doc, afterApply: func() {
+		manager.ConfigureCleanupForTest(func(path string) error {
+			if strings.HasSuffix(path, ".json") {
+				return errors.New("injected cleanup failure")
+			}
+			return os.Remove(path)
+		}, nil)
+	}}
 	fetches := 0
 	posts := 0
+	var posted []model.TaskResult
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/api/agent/tasks":
@@ -368,19 +387,30 @@ func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
 			return testResponse(http.StatusOK, "[]"), nil
 		case "/api/agent/task-result":
 			posts++
+			var body struct {
+				Result model.TaskResult `json:"result"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			posted = append(posted, body.Result)
 			return testResponse(http.StatusOK, `{"ok":true}`), nil
 		default:
 			return testResponse(http.StatusNotFound, ""), nil
 		}
 	})}
 	cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}
+	if err := runTasks(cfg, runner, outbox, manager); err == nil {
+		t.Fatal("cleanup failure should remain readiness-visible")
+	}
+	if pending, err := outbox.Pending(); err != nil || len(pending) != 1 {
+		t.Fatalf("completed result not retained: %+v %v", pending, err)
+	}
+	manager.ConfigureCleanupForTest(nil, nil)
 	if err := runTasks(cfg, runner, outbox, manager); err != nil {
 		t.Fatal(err)
 	}
-	if err := runTasks(cfg, runner, outbox, manager); err != nil {
-		t.Fatal(err)
-	}
-	if runner.calls != 1 || posts != 1 {
+	if runner.calls != 1 || posts != 2 || len(posted) != 2 || !reflect.DeepEqual(posted[0], posted[1]) {
 		t.Fatalf("runner calls=%d posts=%d", runner.calls, posts)
 	}
 	if entries, err := os.ReadDir(txnDir); err != nil {

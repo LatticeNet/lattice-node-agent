@@ -76,6 +76,13 @@ func reportedCapabilities() []string {
 	return []string{durableTaskResultCapability, guardManagedSHACapability}
 }
 
+func capabilitiesFor(linechainReady bool) []string {
+	if linechainReady {
+		return reportedCapabilities()
+	}
+	return []string{guardManagedSHACapability}
+}
+
 type agentConfig struct {
 	Server              string
 	NodeID              string
@@ -157,6 +164,7 @@ type agentConfig struct {
 	LogStateDir           string
 	TaskOutboxDir         string
 	LinechainTxnDir       string
+	LinechainReady        bool
 }
 
 type agentRuntimePayload struct {
@@ -283,6 +291,9 @@ func main() {
 			log.Fatalf("linechain transaction manager failed: %v", err)
 		}
 		defer manager.Close()
+		if err := manager.ConfigureLayout(os.Getenv("LATTICE_LINECHAIN_CONFIG_DIR"), os.Getenv("LATTICE_LINECHAIN_SIDECAR_PATH")); err != nil {
+			log.Fatalf("linechain local layout failed: %v", err)
+		}
 		if err := manager.Apply(context.Background(), os.Stdin, os.Getenv("LATTICE_TASK_ID"), os.Getenv("LATTICE_TASK_LEASE_ID")); err != nil {
 			log.Fatalf("linechain apply failed: %v", err)
 		}
@@ -361,8 +372,24 @@ func main() {
 		log.Fatalf("linechain transaction manager initialization failed: %v", err)
 	}
 	defer linechainManager.Close()
-	if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
-		log.Fatalf("linechain recovery blocked readiness: %v", err)
+	linechainConfigDir, linechainSidecarPath, layoutErr := singboxdiscover.ResolveRuntimeLayout(cfg.SingBoxMeta)
+	if layoutErr != nil {
+		log.Printf("warning: durable linechain tasks disabled: %v", layoutErr)
+	} else if err := linechainManager.ConfigureLayout(linechainConfigDir, linechainSidecarPath); err != nil {
+		log.Printf("warning: durable linechain tasks disabled: %v", err)
+	} else {
+		cfg.LinechainReady = true
+	}
+	for {
+		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err == nil {
+			break
+		} else {
+			log.Printf("linechain recovery blocked readiness: %v", err)
+			if uploadErr := flushTaskResultsRetain(cfg, taskResults, true); uploadErr != nil {
+				log.Printf("linechain terminal result upload error: %v", uploadErr)
+			}
+			time.Sleep(cfg.Interval)
+		}
 	}
 	agentBinary, err := os.Executable()
 	if err != nil {
@@ -386,7 +413,7 @@ func main() {
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
 		"compatibility":        compatibilityPayload(),
-		"capabilities":         reportedCapabilities(),
+		"capabilities":         capabilitiesFor(cfg.LinechainReady),
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
 		"internal_ip":          cfg.InternalIP,
@@ -414,7 +441,7 @@ func main() {
 
 	runner := taskexec.Runner{
 		AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(),
-		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary, LinechainTxnDir: linechainDir,
+		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary, LinechainTxnDir: linechainDir, LinechainConfigDir: linechainConfigDir, LinechainSidecarPath: linechainSidecarPath,
 	}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
@@ -423,6 +450,9 @@ func main() {
 	for {
 		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
 			log.Printf("linechain recovery blocked cycle: %v", err)
+			if uploadErr := flushTaskResultsRetain(cfg, taskResults, true); uploadErr != nil {
+				log.Printf("linechain terminal result upload error: %v", uploadErr)
+			}
 			<-ticker.C
 			continue
 		}
@@ -715,7 +745,7 @@ func reportMetrics(cfg agentConfig) error {
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version":       version,
 		"compatibility": compatibilityPayload(),
-		"capabilities":  reportedCapabilities(),
+		"capabilities":  capabilitiesFor(cfg.LinechainReady),
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,
@@ -1163,6 +1193,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 	}
 	if manager != nil {
 		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
+			_ = flushTaskResultsRetain(cfg, outbox, true)
 			return err
 		}
 	}
@@ -1177,7 +1208,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	req.Header.Set(agentCapabilitiesHeader, strings.Join(reportedCapabilities(), ","))
+	req.Header.Set(agentCapabilitiesHeader, strings.Join(capabilitiesFor(cfg.LinechainReady), ","))
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -1258,7 +1289,10 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 				}
 				if manager != nil && isLinechainTask(task) {
 					if cleanupErr := manager.Cleanup(task.ID, task.LeaseID); cleanupErr != nil {
-						return fmt.Errorf("%v; cleanup confirmed linechain task: %w", journalErr, cleanupErr)
+						if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
+							return fmt.Errorf("%v; cleanup confirmed linechain task: %v; upload stable result: %w", journalErr, cleanupErr, uploadErr)
+						}
+						return fmt.Errorf("%v; cleanup confirmed linechain task: %w; result remains replayable", journalErr, cleanupErr)
 					}
 				}
 				if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
@@ -1269,7 +1303,10 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		}
 		if manager != nil && isLinechainTask(task) {
 			if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
-				return fmt.Errorf("cleanup linechain task %s after durable outbox completion: %w", task.ID, err)
+				if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
+					return fmt.Errorf("cleanup linechain task %s: %v; upload stable result: %w", task.ID, err, uploadErr)
+				}
+				return fmt.Errorf("cleanup linechain task %s after durable outbox completion; result remains replayable: %w", task.ID, err)
 			}
 		}
 		if err := flushTaskResults(cfg, outbox); err != nil {
@@ -1299,6 +1336,10 @@ func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, 
 }
 
 func flushTaskResults(cfg agentConfig, outbox taskResultOutbox) error {
+	return flushTaskResultsRetain(cfg, outbox, false)
+}
+
+func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain bool) error {
 	pending, err := outbox.Pending()
 	if err != nil {
 		return fmt.Errorf("read pending task results: %w", err)
@@ -1311,6 +1352,9 @@ func flushTaskResults(cfg agentConfig, outbox taskResultOutbox) error {
 			"result": *entry.Result,
 		}, nil); err != nil {
 			return fmt.Errorf("flush durable task result %s: %w", entry.Task.ID, err)
+		}
+		if retain && isLinechainTask(entry.Task) {
+			continue
 		}
 		if err := outbox.Remove(entry); err != nil {
 			return fmt.Errorf("remove acknowledged task result %s: %w", entry.Task.ID, err)

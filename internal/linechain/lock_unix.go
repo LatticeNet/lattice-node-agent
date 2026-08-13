@@ -14,16 +14,41 @@ func lockManager(path string) (*os.File, error) {
 		return nil, err
 	}
 	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("open linechain manager lock: invalid file descriptor")
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("inspect linechain manager lock: %w", err)
+	}
+	if err := validateLockInfo(info, os.Geteuid()); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("linechain transaction manager already open: %w", err)
 	}
-	if err := f.Chmod(0o600); err != nil {
-		_ = syscall.Flock(fd, syscall.LOCK_UN)
-		_ = f.Close()
-		return nil, err
-	}
 	return f, nil
+}
+
+func validateLockInfo(info os.FileInfo, effectiveUID int) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("inspect linechain manager lock ownership: unsupported stat data")
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("linechain manager lock must be a regular file")
+	}
+	if stat.Uid != uint32(effectiveUID) {
+		return fmt.Errorf("linechain manager lock must be owned by effective user %d", effectiveUID)
+	}
+	if info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("linechain manager lock permissions are %o, want 600", info.Mode().Perm())
+	}
+	return nil
 }
 
 func unlockManager(f *os.File) error {

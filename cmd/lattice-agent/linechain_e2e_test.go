@@ -45,7 +45,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	sidecarPath := filepath.Join(root, "lattice-metadata.json")
 	fragment := "{\n  \"outbounds\": [{\"type\": \"direct\", \"tag\": \"linechain-direct\"}]\n}\n"
 	sidecar := "{\"schema\":\"lattice.singbox-metadata.v2\",\"inbounds\":[]}\n"
-	doc := linechain.Document{Version: 1, ConfigDir: conf, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar, SingBoxBinary: bin, CheckArgs: []string{"check", "-C", conf}, RestartCommand: []string{"true"}, VerifyCommand: []string{"true"}}
+	doc := linechain.BindDocument(linechain.Document{Version: 1, Operation: "create", ConfigDir: conf, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar})
 	b, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatal(err)
@@ -55,6 +55,12 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
+	if err := m.ConfigureLayout(conf, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands(bin, []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := m.Apply(context.Background(), bytes.NewReader(b), "e2e-task", "e2e-lease"); err != nil {
 		t.Fatal(err)
 	}
