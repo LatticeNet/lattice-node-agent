@@ -126,9 +126,10 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
   "route":{"rules":[{"inbound":["source-b"],"outbound":"chain-to-a"}]}
 }
 `, observer.Port(), uuidA, realityPublic)
-	sidecar := fmt.Sprintf(`{"inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}],"schema":"lattice.singbox-metadata.v2"}
-`, lineUUIDB, lineUUIDA)
-	sidecar = canonicalJSONString(t, sidecar)
+	initialSidecar := canonicalJSONString(t, fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","unknown_root":{"keep":true},"inbounds":[{"tag":"unrelated-before","line_uuid":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","keep":1},{"tag":"source-b","line_uuid":%q,"ordinary":"keep"},{"tag":"unrelated-after","line_uuid":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","keep":2}]}`, lineUUIDB))
+	desiredSidecar := canonicalJSONString(t, fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","unknown_root":{"keep":true},"inbounds":[{"tag":"unrelated-before","line_uuid":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","keep":1},{"tag":"source-b","line_uuid":%q,"ordinary":"keep","chain":{"downstream_line_uuid":%q}},{"tag":"unrelated-after","line_uuid":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","keep":2}]}`, lineUUIDB, lineUUIDA))
+	writeFile(t, sidecarPath, initialSidecar)
+	targetLineUUID := lineUUIDA
 
 	m := openE2EManager(t, bin, root, bDir, sidecarPath, txnDir, bPort)
 	defer m.Close()
@@ -136,7 +137,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	// Crash a real apply helper process group after it publishes both artifacts,
 	// while this test (the agent/supervisor analogue) remains alive. Recovery
 	// must restore and restart B before any inventory, traffic, or result callback.
-	crashDoc := bindE2EDocument("create", basename, "", &fragment, &sidecar)
+	crashDoc := bindE2EDocument("create", basename, "", &fragment, lineUUIDB, "source-b", nil, &targetLineUUID)
 	crashBytes := marshalE2EDocument(t, crashDoc)
 	apply := exec.Command(os.Args[0], "-test.run=^TestLinechainE2EApplyHelper$", "--", root)
 	crashMarker := filepath.Join(root, "restart-blocked")
@@ -174,7 +175,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	}
 	t.Cleanup(stopApply)
 	waitForFileOrProcess(t, crashMarker, applyDone, &applyLog)
-	waitForExactPair(t, fragmentPath, fragment, sidecarPath, sidecar)
+	waitForExactPair(t, fragmentPath, fragment, sidecarPath, desiredSidecar)
 	stopApply()
 
 	order := []string{}
@@ -216,9 +217,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	writeFile(t, sidecarPath, resyncedSidecar)
 	assertChainedInventory(t, bDir, fragmentPath, sidecarPath, lineUUIDB, lineUUIDA, observer.Port())
 
-	removedSidecar := `{"inbounds":[],"schema":"lattice.singbox-metadata.v2"}
-`
-	removeDoc := bindE2EDocument("remove", basename, digestText(fragment), nil, &removedSidecar)
+	removeDoc := bindE2EDocument("remove", basename, digestText(fragment), nil, lineUUIDB, "source-b", &targetLineUUID, nil)
 	applyAndResolve(t, m, marshalE2EDocument(t, removeDoc), "remove-task", "remove-lease")
 	if _, err := os.Stat(fragmentPath); !os.IsNotExist(err) {
 		t.Fatalf("removed fragment still exists: %v", err)
@@ -280,28 +279,45 @@ func TestLinechainE2EActiveHelper(t *testing.T) {
 
 type e2eDocument map[string]any
 
-func bindE2EDocument(operation, basename, previousFragment string, fragment, sidecar *string) e2eDocument {
-	d := e2eDocument{"version": 2, "operation": operation, "fragment_basename": basename}
+type e2eSidecarPatch struct {
+	Schema, SourceLineUUID, SourceInboundTag              string
+	ExpectedDownstreamLineUUID, DesiredDownstreamLineUUID *string
+}
+
+func (p e2eSidecarPatch) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Schema           string  `json:"schema"`
+		SourceLineUUID   string  `json:"source_line_uuid"`
+		SourceInboundTag string  `json:"source_inbound_tag"`
+		Expected         *string `json:"expected_downstream_line_uuid"`
+		Desired          *string `json:"desired_downstream_line_uuid"`
+	}
+	return json.Marshal(wire{p.Schema, p.SourceLineUUID, p.SourceInboundTag, p.ExpectedDownstreamLineUUID, p.DesiredDownstreamLineUUID})
+}
+
+func bindE2EDocument(operation, basename, previousFragment string, fragment *string, sourceUUID, sourceTag string, expected, desired *string) e2eDocument {
+	patch := e2eSidecarPatch{"lattice.singbox-linechain-sidecar-patch.v1", sourceUUID, sourceTag, expected, desired}
+	patchBytes, _ := json.Marshal(patch)
+	var previous *string
 	if previousFragment != "" {
-		d["previous_fragment_sha256"] = previousFragment
+		previous = &previousFragment
 	}
+	var fragmentSHA *string
 	if fragment != nil {
-		d["fragment"] = *fragment
+		value := digestText(*fragment)
+		fragmentSHA = &value
 	}
-	if sidecar != nil {
-		d["sidecar"] = *sidecar
+	patchSHA := digestBytes(patchBytes)
+	type artifact struct {
+		Schema    string  `json:"schema"`
+		Operation string  `json:"operation"`
+		Basename  string  `json:"fragment_basename"`
+		Previous  *string `json:"previous_fragment_sha256"`
+		Fragment  *string `json:"fragment_sha256"`
+		Patch     string  `json:"sidecar_patch_sha256"`
 	}
-	fragmentDigest, sidecarDigest := digestPointer(fragment), digestPointer(sidecar)
-	d["fragment_sha256"], d["sidecar_sha256"] = fragmentDigest, sidecarDigest
-	pair := []byte{}
-	if fragment != nil {
-		pair = append(pair, *fragment...)
-	}
-	pair = append(pair, 0)
-	if sidecar != nil {
-		pair = append(pair, *sidecar...)
-	}
-	d["combined_sha256"] = digestBytes(pair)
+	artifactBytes, _ := json.Marshal(artifact{"lattice.singbox-linechain-artifact.v2", operation, basename, previous, fragmentSHA, patchSHA})
+	d := e2eDocument{"version": 2, "durable_protocol": "linechain-e3-v2", "operation": operation, "fragment_basename": basename, "fragment": fragment, "sidecar_patch": patch, "previous_fragment_sha256": previous, "fragment_sha256": fragmentSHA, "sidecar_patch_sha256": patchSHA, "artifact_sha256": digestBytes(artifactBytes)}
 	return d
 }
 

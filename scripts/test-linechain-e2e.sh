@@ -14,6 +14,21 @@ printf '%s\n' "$version" | grep -Eq '^sing-box version 1\.13\.[0-9]+' || {
 
 probe="$(mktemp -d "${TMPDIR:-/tmp}/lattice-sing-box-check.XXXXXX")"
 e2e_root="$(mktemp -d "${TMPDIR:-/tmp}/lattice-linechain-e2e.XXXXXX")"
+agent_bin="$e2e_root/lattice-agent"
+server_dir="${LATTICE_SERVER_E2E_DIR:-}"
+if [ -z "$server_dir" ]; then
+  for candidate in ../../lattice-server/.wt/worker3-task18-server ../../lattice-server; do
+    if [ -f "$candidate/go.mod" ] && grep -q 'module github.com/LatticeNet/lattice-server' "$candidate/go.mod"; then
+      server_dir="$(cd "$candidate" && pwd -P)"
+      break
+    fi
+  done
+fi
+[ -n "$server_dir" ] && [ -f "$server_dir/go.mod" ] || { echo "LATTICE_SERVER_E2E_DIR must identify the frozen lattice-server worktree" >&2; exit 1; }
+[ "$(git -C "$server_dir" rev-parse 'HEAD^{tree}')" = "67dc25bc6740657449b6c206cf537b22398bc289" ] || {
+  echo "LATTICE_SERVER_E2E_DIR must match the frozen server plus Task21 Reality repair tree" >&2
+  exit 1
+}
 cleanup() {
   status=$?
 	trap - EXIT HUP INT TERM
@@ -49,5 +64,12 @@ cat >"$probe/config.json" <<'JSON'
 JSON
 "$bin" check -C "$probe" >/dev/null 2>&1 || { echo "sing-box 1.13.x config check failed" >&2; exit 1; }
 printf '%s\n' "linechain E2E binary: $(printf '%s\n' "$version" | sed -n '1p')"
+
+go build -trimpath -o "$agent_bin" ./cmd/lattice-agent
+(
+  cd "$server_dir"
+  LATTICE_AGENT_E2E_BIN="$agent_bin" LATTICE_SINGBOX_E2E_BIN="$bin" \
+    go test -tags=linechain_lifecycle_e2e ./internal/server -run '^TestLineChainPersistentServerAgentLifecycleE2E$' -count=1 -v
+)
 
 LATTICE_SINGBOX_E2E_BIN="$bin" LATTICE_LINECHAIN_E2E_ROOT="$e2e_root" go test -tags=linechain_e2e ./cmd/lattice-agent -run '^TestLinechainRealSingBoxE2E$' -count=1 -v
