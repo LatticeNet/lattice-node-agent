@@ -385,9 +385,6 @@ func main() {
 			break
 		} else {
 			log.Printf("linechain recovery blocked readiness: %v", err)
-			if uploadErr := flushTaskResultsRetain(cfg, taskResults, true); uploadErr != nil {
-				log.Printf("linechain terminal result upload error: %v", uploadErr)
-			}
 			time.Sleep(cfg.Interval)
 		}
 	}
@@ -450,9 +447,6 @@ func main() {
 	for {
 		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
 			log.Printf("linechain recovery blocked cycle: %v", err)
-			if uploadErr := flushTaskResultsRetain(cfg, taskResults, true); uploadErr != nil {
-				log.Printf("linechain terminal result upload error: %v", uploadErr)
-			}
 			<-ticker.C
 			continue
 		}
@@ -1194,7 +1188,6 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 	}
 	if manager != nil {
 		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
-			_ = flushTaskResultsRetain(cfg, outbox, true)
 			return err
 		}
 	}
