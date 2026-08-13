@@ -264,7 +264,7 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 					}
 					fetchCalls++
 					if fetchCalls == 1 {
-						data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+						data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 						return testResponse(http.StatusOK, string(data)), nil
 					}
 					return testResponse(http.StatusOK, `[]`), nil
@@ -355,12 +355,15 @@ func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
 	if err := manager.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
-	fragmentPath := filepath.Join(conf, "lattice-linechain-chain.json")
-	sidecarPath := filepath.Join(root, "lattice-metadata.json")
+	fragmentPath := filepath.Join(conf, "lattice-linechain-0123456789abcdef0123.json")
 	fragment := "{\"outbounds\":[]}"
 	sidecar := "{\"schema\":\"lattice.singbox-metadata.v2\",\"inbounds\":[]}"
-	docValue := linechain.BindDocument(linechain.Document{Version: 1, Operation: "create", ConfigDir: conf, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar})
-	doc, err := json.Marshal(docValue)
+	docValue := linechain.BindDocument(linechain.Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &fragment, Sidecar: &sidecar})
+	doc, err := json.Marshal(map[string]any{
+		"version": docValue.Version, "operation": docValue.Operation, "fragment_basename": docValue.FragmentBasename,
+		"fragment": docValue.Fragment, "sidecar": docValue.Sidecar, "fragment_sha256": docValue.FragmentSHA256,
+		"sidecar_sha256": docValue.SidecarSHA256, "combined_sha256": docValue.CombinedSHA256,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +535,7 @@ func TestRunTasksJournalFailurePreventsExecution(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	var reported model.TaskResult
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/api/agent/tasks" {
@@ -569,7 +572,7 @@ func TestRunTasksPublishedJournalFailureDoesNotPostConflictingDirectResult(t *te
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	postCalls := 0
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/api/agent/tasks" {
@@ -596,7 +599,7 @@ func TestRunTasksExactRedeliveryDoesNotExecuteExistingJournal(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must run once"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/api/agent/tasks" {
 			t.Fatalf("unexpected request for already-journaled lease: %s", r.URL.Path)
@@ -688,7 +691,7 @@ func TestRunTasksConfirmsAndUploadsResultPublishedBeforeDirectorySyncFailure(t *
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo once"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	posts := 0
 	var posted model.TaskResult
 	outbox := &completePublishingOutbox{}
@@ -730,7 +733,7 @@ func TestRunTasksDoesNotUploadUnconfirmedPublishedResult(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo once"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	posts := 0
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
