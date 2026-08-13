@@ -1225,6 +1225,9 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 	debugf(cfg, "tasks fetched: count=%d", len(tasks))
 	for _, leased := range tasks {
 		task := leased.Task
+		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v1" {
+			return fmt.Errorf("unsupported durable protocol %q", leased.DurableProtocol)
+		}
 		if !leased.DurableResult {
 			debugf(cfg, "task start without durable-result protocol: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
 			result := runner.Run(task)
@@ -1318,13 +1321,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 }
 
 func isLinechainTask(task leasedAgentTask) bool {
-	if !task.DurableResult {
-		return false
-	}
-	if task.DurableProtocol != "" {
-		return task.DurableProtocol == "linechain-e3-v1"
-	}
-	return isLegacyLinechainTask(task.Task)
+	return task.DurableResult && task.DurableProtocol == "linechain-e3-v1"
 }
 
 func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
@@ -1363,7 +1360,7 @@ func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain boo
 		// Pending entries predate typed lease metadata; retain only the exact
 		// helper namespace marker during cleanup recovery. Live classification is
 		// always driven by durable_protocol on the leased response.
-		if retain && isLegacyLinechainTask(entry.Task) {
+		if retain && false {
 			continue
 		}
 		if err := outbox.Remove(entry); err != nil {
@@ -1371,10 +1368,6 @@ func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain boo
 		}
 	}
 	return nil
-}
-
-func isLegacyLinechainTask(task model.Task) bool {
-	return strings.HasPrefix(task.Script, "# lattice-linechain-e3-v1\n")
 }
 
 func taskResultOutboxDir(cfg agentConfig) (string, error) {
