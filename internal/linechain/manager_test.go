@@ -61,7 +61,7 @@ func TestApplyRejectsUnexpectedExistingAndSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	desired := "new"
-	desiredSidecar := "{}"
+	desiredSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
 	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &desired, Sidecar: &desiredSidecar}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "unexpected existing") {
 		t.Fatalf("unexpected error: %v", err)
@@ -89,13 +89,13 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 	if err := m.ConfigureCommands("false", []string{"true"}, []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
-	oldFragment, oldSidecar := "old-fragment", "old-sidecar"
+	oldFragment, oldSidecar := "old-fragment", `{"ordinary":"old"}`
 	for path, data := range map[string]string{fragmentPath: oldFragment, sidecarPath: oldSidecar} {
 		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	newFragment, newSidecar := "new-fragment", "new-sidecar"
+	newFragment, newSidecar := "new-fragment", `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
 	doc := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: digest([]byte(oldFragment)), Fragment: &newFragment, Sidecar: &newSidecar}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "check failed") {
 		t.Fatalf("unexpected error: %v", err)
@@ -170,12 +170,12 @@ func TestValidateDocumentBindsOwnedPaths(t *testing.T) {
 	configDir := filepath.Join(root, "conf")
 	mustMkdir(t, configDir)
 	fragment := "{}"
-	sidecar := "{}"
+	sidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
 	if err := m.ConfigureLayout(configDir, filepath.Join(root, "lattice-metadata.json")); err != nil {
 		t.Fatal(err)
 	}
 	basename := "lattice-linechain-0123456789abcdef0123.json"
-	valid := BindDocument(Document{Version: 2, Operation: "create", ConfigDir: configDir, FragmentBasename: basename, FragmentPath: filepath.Join(configDir, basename), SidecarPath: filepath.Join(root, "lattice-metadata.json"), Fragment: &fragment, Sidecar: &sidecar})
+	valid := BindDocument(Document{Version: 2, Operation: "create", ConfigDir: m.configDir, FragmentBasename: basename, FragmentPath: filepath.Join(m.configDir, basename), SidecarPath: m.sidecarPath, Fragment: &fragment, Sidecar: &sidecar})
 	if err := m.validateDocument(valid); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +201,79 @@ func TestResolvePreflightFailureWithoutJournal(t *testing.T) {
 	}
 	if got != input {
 		t.Fatalf("preflight result changed: %+v", got)
+	}
+}
+
+func TestApplyRejectsTrailingAndLegacyWireFields(t *testing.T) {
+	m, dir := testManager(t)
+	configDir := filepath.Join(dir, "conf")
+	mustMkdir(t, configDir)
+	if err := m.ConfigureLayout(configDir, filepath.Join(dir, "lattice-metadata.json")); err != nil {
+		t.Fatal(err)
+	}
+	fragment, sidecar := `{}`, `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
+	d := BindDocument(Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, Sidecar: &sidecar})
+	base, _ := json.Marshal(wireDocumentV2{Version: d.Version, Operation: d.Operation, FragmentBasename: d.FragmentBasename, Fragment: d.Fragment, Sidecar: d.Sidecar, FragmentSHA256: d.FragmentSHA256, SidecarSHA256: d.SidecarSHA256, CombinedSHA256: d.CombinedSHA256})
+	for name, raw := range map[string]string{
+		"trailing":              string(base) + ` {}`,
+		"legacy path":           strings.TrimSuffix(string(base), "}") + `,"config_dir":"/tmp"}`,
+		"legacy sidecar digest": strings.TrimSuffix(string(base), "}") + `,"previous_sidecar_sha256":"` + strings.Repeat("0", 64) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := m.Apply(context.Background(), strings.NewReader(raw), "task-"+name, "lease"); err == nil {
+				t.Fatal("invalid wire accepted")
+			}
+		})
+	}
+}
+
+func TestSemanticSidecarOverlayPreservesOrdinaryFields(t *testing.T) {
+	m, dir := testManager(t)
+	configDir := filepath.Join(dir, "conf")
+	mustMkdir(t, configDir)
+	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
+	if err := os.WriteFile(sidecarPath, []byte(`{"ordinary":{"owner":"sb"},"inbounds":[{"tag":"old"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	fragment, sidecar := `{}`, `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"managed"}]}`
+	d := Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, Sidecar: &sidecar}
+	applyDoc(t, m, d, "task-overlay", "lease-overlay")
+	b, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["ordinary"] == nil || got["schema"] != "lattice.singbox-metadata.v2" {
+		t.Fatalf("overlay lost fields: %s", b)
+	}
+}
+
+func TestConfigureLayoutRejectsSymlinkRoot(t *testing.T) {
+	m, dir := testManager(t)
+	realDir := filepath.Join(dir, "real")
+	mustMkdir(t, realDir)
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureLayout(link, filepath.Join(dir, "meta.json")); err == nil {
+		t.Fatal("symlink config root accepted")
+	}
+	badParent := filepath.Join(dir, "bad-parent")
+	if err := os.Symlink(realDir, badParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureLayout(realDir, filepath.Join(badParent, "meta.json")); err == nil {
+		t.Fatal("symlink sidecar root accepted")
 	}
 }
 

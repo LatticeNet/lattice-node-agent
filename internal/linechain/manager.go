@@ -113,6 +113,22 @@ func (m *Manager) ConfigureLayout(configDir, sidecarPath string) error {
 	if !filepath.IsAbs(configDir) || !filepath.IsAbs(sidecarPath) {
 		return fmt.Errorf("linechain layout paths must be absolute")
 	}
+	for label, root := range map[string]string{"config": configDir, "sidecar": filepath.Dir(sidecarPath)} {
+		info, err := os.Lstat(root)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedPath(info) || info.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("linechain %s root is not a trusted private directory", label)
+		}
+	}
+	resolvedConfig, err := filepath.EvalSymlinks(configDir)
+	if err != nil {
+		return fmt.Errorf("resolve linechain config directory: %w", err)
+	}
+	resolvedSidecarParent, err := filepath.EvalSymlinks(filepath.Dir(sidecarPath))
+	if err != nil {
+		return fmt.Errorf("resolve linechain sidecar directory: %w", err)
+	}
+	configDir = filepath.Clean(resolvedConfig)
+	sidecarPath = filepath.Join(filepath.Clean(resolvedSidecarParent), filepath.Base(sidecarPath))
 	if err := validateParents(filepath.Join(configDir, "placeholder")); err != nil {
 		return err
 	}
@@ -264,6 +280,12 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	if err := dec.Decode(&wire); err != nil {
 		return fmt.Errorf("decode linechain document: %w", err)
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); err == nil {
+		return fmt.Errorf("decode linechain document: unexpected trailing data")
+	} else if !errors.Is(err, io.EOF) {
+		return fmt.Errorf("decode linechain document trailing data: %w", err)
+	}
 	if wire.Version != 2 {
 		return fmt.Errorf("unsupported linechain document version %d", wire.Version)
 	}
@@ -279,6 +301,12 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	if err := m.validateDocument(d); err != nil {
 		return err
 	}
+	mergedSidecar, err := mergeSidecar(sidecarCurrent(m.sidecarPath), d.Sidecar)
+	if err != nil {
+		return err
+	}
+	d.Sidecar = mergedSidecar
+	d = BindDocument(d)
 	path := m.journalPath(taskID, leaseID)
 	if _, err := os.Lstat(path); err == nil {
 		return m.recoverOne(ctx, path, nil, "")
@@ -326,6 +354,72 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	}
 	j.Phase = "desired_verified"
 	return writeJSON(path, j)
+}
+
+func sidecarCurrent(path string) *string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	s := string(b)
+	return &s
+}
+
+func mergeSidecar(current, desired *string) (*string, error) {
+	if desired == nil {
+		return nil, nil
+	}
+	merged := map[string]any{}
+	if current != nil {
+		if err := json.Unmarshal([]byte(*current), &merged); err != nil {
+			return nil, fmt.Errorf("decode current semantic sidecar: %w", err)
+		}
+	}
+	want := map[string]any{}
+	if err := json.Unmarshal([]byte(*desired), &want); err != nil {
+		return nil, fmt.Errorf("decode desired semantic sidecar: %w", err)
+	}
+	if want["schema"] != "lattice.singbox-metadata.v2" {
+		return nil, fmt.Errorf("desired semantic sidecar has unsupported schema")
+	}
+	if _, ok := want["inbounds"].([]any); !ok {
+		return nil, fmt.Errorf("desired semantic sidecar inbounds must be an array")
+	}
+	for key, value := range want {
+		merged[key] = value
+	}
+	b, err := json.Marshal(merged)
+	if err != nil {
+		return nil, fmt.Errorf("encode semantic sidecar: %w", err)
+	}
+	b = append(b, '\n')
+	s := string(b)
+	return &s, nil
+}
+
+// JournalRef is the bounded identity needed to cross-check outbox authority.
+type JournalRef struct{ TaskID, LeaseID string }
+
+func (m *Manager) Snapshot() ([]JournalRef, error) {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]JournalRef, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if len(refs) >= 1024 {
+			return nil, fmt.Errorf("linechain journal capacity exceeded")
+		}
+		j, err := readJournal(filepath.Join(m.dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, JournalRef{TaskID: j.TaskID, LeaseID: j.LeaseID})
+	}
+	return refs, nil
 }
 
 func (m *Manager) validateDocument(d Document) error {
