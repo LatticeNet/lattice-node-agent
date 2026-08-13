@@ -82,6 +82,63 @@ func TestCollectPropagatesCommandFailure(t *testing.T) {
 	}
 }
 
+func TestCollectManagedTableSHA(t *testing.T) {
+	collect := func(ruleset string, runnerErr error) (string, []string, error) {
+		calls := []string{}
+		got, err := CollectManagedTableSHA(context.Background(), Source{
+			NFTBinary: "custom-nft",
+			Runner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+				calls = append(calls, name+" "+strings.Join(args, " "))
+				if runnerErr != nil {
+					return nil, runnerErr
+				}
+				return []byte(ruleset), nil
+			},
+		})
+		return got, calls, err
+	}
+
+	first, calls, err := collect(nftFixture("11", "22"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []string{"custom-nft -j list ruleset"}) {
+		t.Fatalf("commands = %#v, want one bounded ruleset read", calls)
+	}
+	second, _, err := collect(nftFixture("99", "100"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == "" || first != second {
+		t.Fatalf("managed hash should be stable across handle churn: %q vs %q", first, second)
+	}
+	changed, _, err := collect(strings.ReplaceAll(nftFixture("11", "22"), `"right": 22`, `"right": 2222`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == first {
+		t.Fatal("managed hash must change when a managed rule changes")
+	}
+
+	missing, _, err := collect(`{"nftables":[{"table":{"family":"ip","name":"filter"}}]}`, nil)
+	if err == nil || missing != "" || !strings.Contains(err.Error(), "managed nft table inet lattice_guard not found") {
+		t.Fatalf("missing table = %q, %v; want fail-closed error", missing, err)
+	}
+	empty, _, err := collect(`{"nftables":[{"table":{"family":"inet","name":"lattice_guard"}}]}`, nil)
+	if err == nil || empty != "" || !strings.Contains(err.Error(), "managed nft table inet lattice_guard is empty") {
+		t.Fatalf("empty managed table = %q, %v; want fail-closed error", empty, err)
+	}
+	malformed, _, err := collect(`{"nftables":`, nil)
+	if err == nil || malformed != "" || !strings.Contains(err.Error(), "parse nft ruleset") {
+		t.Fatalf("malformed ruleset = %q, %v; want fail-closed parse error", malformed, err)
+	}
+	boom := errors.New("nft unavailable")
+	failed, _, err := collect("", boom)
+	if !errors.Is(err, boom) || failed != "" || !strings.Contains(err.Error(), "custom-nft -j list ruleset") {
+		t.Fatalf("runner failure = %q, %v; want contextual fail-closed error", failed, err)
+	}
+}
+
 func TestParseSSListenersSkipsNonNumericPortsAndSorts(t *testing.T) {
 	got, err := ParseSSListeners([]byte(strings.Join([]string{
 		`udp UNCONN 0 0 *:51820 *:* users:(("wg",pid=9,fd=3))`,

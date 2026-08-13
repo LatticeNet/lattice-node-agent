@@ -186,6 +186,21 @@ func TestRunnerPropagatesLeaseID(t *testing.T) {
 	}
 }
 
+func TestRunnerPropagatesAbsoluteAgentBinary(t *testing.T) {
+	agentBinary := filepath.Join(t.TempDir(), "lattice-agent")
+	r := Runner{AllowExec: true, AgentBinary: agentBinary, getUID: nonRootUID}
+	result := r.Run(model.Task{
+		ID:          "task_agent_binary",
+		Interpreter: "sh",
+		Script:      `printf '%s' "$LATTICE_AGENT_BIN"`,
+		TimeoutSec:  5,
+		OutputLimit: 512,
+	})
+	if result.ExitCode != 0 || result.Stdout != agentBinary {
+		t.Fatalf("agent binary env = %#v, want %q", result, agentBinary)
+	}
+}
+
 func TestRunnerSetsPrivateTaskTempEnvironment(t *testing.T) {
 	r := Runner{AllowExec: true, getUID: nonRootUID}
 	result := r.Run(model.Task{
