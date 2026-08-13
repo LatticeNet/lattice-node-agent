@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,13 +28,14 @@ import (
 )
 
 const (
-	linechainE2EBinEnv     = "LATTICE_SINGBOX_E2E_BIN"
-	linechainE2ERootEnv    = "LATTICE_LINECHAIN_E2E_ROOT"
-	linechainE2EConfigEnv  = "LATTICE_LINECHAIN_E2E_CONFIG_DIR"
-	linechainE2ESidecarEnv = "LATTICE_LINECHAIN_E2E_SIDECAR"
-	linechainE2EBPortEnv   = "LATTICE_LINECHAIN_E2E_B_PORT"
-	linechainE2ETaskEnv    = "LATTICE_LINECHAIN_E2E_TASK"
-	linechainE2ELeaseEnv   = "LATTICE_LINECHAIN_E2E_LEASE"
+	linechainE2EBinEnv         = "LATTICE_SINGBOX_E2E_BIN"
+	linechainE2ERootEnv        = "LATTICE_LINECHAIN_E2E_ROOT"
+	linechainE2EConfigEnv      = "LATTICE_LINECHAIN_E2E_CONFIG_DIR"
+	linechainE2ESidecarEnv     = "LATTICE_LINECHAIN_E2E_SIDECAR"
+	linechainE2EBPortEnv       = "LATTICE_LINECHAIN_E2E_B_PORT"
+	linechainE2ETaskEnv        = "LATTICE_LINECHAIN_E2E_TASK"
+	linechainE2ELeaseEnv       = "LATTICE_LINECHAIN_E2E_LEASE"
+	linechainE2ECrashMarkerEnv = "LATTICE_LINECHAIN_E2E_CRASH_MARKER"
 )
 
 // TestLinechainRealSingBoxE2E is invoked by scripts/test-linechain-e2e.sh. The
@@ -42,8 +44,20 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	bin := requireSingBoxE2EBinary(t)
 	root := t.TempDir()
 	origin := startEchoOrigin(t)
-	observer := startTCPObserver(t, origin.String())
 	aPort, bPort, clientPort := freePort(t), freePort(t), freePort(t)
+	observer := startTCPObserver(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)))
+	decoy := httptest.NewTLSServer(nil)
+	t.Cleanup(decoy.Close)
+	decoyAddress := strings.TrimPrefix(decoy.URL, "https://")
+	decoyHost, decoyPortText, err := net.SplitHostPort(decoyAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoyPort, err := strconv.Atoi(decoyPortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realityPrivate, realityPublic := generateRealityKeypair(t, bin)
 	const (
 		uuidA     = "11111111-1111-4111-8111-111111111111"
 		uuidB     = "22222222-2222-4222-8222-222222222222"
@@ -60,11 +74,11 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	mustMkdir(t, clientDir)
 	writeFile(t, filepath.Join(aDir, "config.json"), fmt.Sprintf(`{
   "log":{"level":"error"},
-  "inbounds":[{"type":"vless","tag":"target-a","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q}]}],
+  "inbounds":[{"type":"vless","tag":"target-a","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"e2e.lattice.invalid","reality":{"enabled":true,"handshake":{"server":%q,"server_port":%d},"private_key":%q,"short_id":["0123456789abcdef"]}}}],
   "outbounds":[{"type":"direct","tag":"direct"}],
   "route":{"rules":[{"inbound":["target-a"],"outbound":"direct"}]}
 }
-`, aPort, uuidA))
+`, aPort, uuidA, decoyHost, decoyPort, realityPrivate))
 	writeFile(t, filepath.Join(bDir, "config.json"), fmt.Sprintf(`{
   "log":{"level":"error"},
   "inbounds":[{"type":"vless","tag":"source-b","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q}]}],
@@ -81,6 +95,9 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 `, clientPort, bPort, uuidB))
 
 	startManagedSingBox(t, bin, root, "a", aDir, aPort)
+	if err := verifyManagedSingBox(root, "a", aPort); err != nil {
+		t.Fatalf("managed target A is inactive: %v", err)
+	}
 	startManagedSingBox(t, bin, root, "b", bDir, bPort)
 	startManagedSingBox(t, bin, root, "client", clientDir, clientPort)
 
@@ -93,10 +110,10 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	fragmentPath := filepath.Join(bDir, basename)
 	txnDir := filepath.Join(root, "txn")
 	fragment := fmt.Sprintf(`{
-  "outbounds":[{"type":"vless","tag":"chain-to-a","server":"127.0.0.1","server_port":%d,"uuid":%q}],
+  "outbounds":[{"type":"vless","tag":"chain-to-a","server":"127.0.0.1","server_port":%d,"uuid":%q,"flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"e2e.lattice.invalid","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":%q,"short_id":"0123456789abcdef"}}}],
   "route":{"rules":[{"inbound":["source-b"],"outbound":"chain-to-a"}]}
 }
-`, observer.Port(), uuidA)
+`, observer.Port(), uuidA, realityPublic)
 	sidecar := fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}]}
 `, lineUUIDB, lineUUIDA)
 
@@ -106,9 +123,10 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	// Crash a real apply helper process group after it publishes both artifacts,
 	// while this test (the agent/supervisor analogue) remains alive. Recovery
 	// must restore and restart B before any inventory, traffic, or result callback.
-	crashDoc := bindE2EDocument("create", basename, "", "", &fragment, &sidecar)
+	crashDoc := bindE2EDocument("create", basename, "", &fragment, &sidecar)
 	crashBytes := marshalE2EDocument(t, crashDoc)
 	apply := exec.Command(os.Args[0], "-test.run=^TestLinechainE2EApplyHelper$", "--")
+	crashMarker := filepath.Join(root, "restart-blocked")
 	apply.Env = append(os.Environ(),
 		linechainE2EBinEnv+"="+bin,
 		linechainE2ERootEnv+"="+root,
@@ -117,6 +135,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 		linechainE2EBPortEnv+"="+strconv.Itoa(bPort),
 		linechainE2ETaskEnv+"=crash-task",
 		linechainE2ELeaseEnv+"=crash-lease",
+		linechainE2ECrashMarkerEnv+"="+crashMarker,
 	)
 	apply.Stdin = bytes.NewReader(crashBytes)
 	apply.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -125,11 +144,14 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	if err := apply.Start(); err != nil {
 		t.Fatal(err)
 	}
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- apply.Wait() }()
+	waitForFileOrProcess(t, crashMarker, applyDone, &applyLog)
 	waitForExactPair(t, fragmentPath, fragment, sidecarPath, sidecar)
 	if err := syscall.Kill(-apply.Process.Pid, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill apply helper process group: %v", err)
 	}
-	_ = apply.Wait()
+	<-applyDone
 
 	order := []string{}
 	if err := m.RequireRecovered(context.Background(), func(result model.TaskResult) error {
@@ -153,23 +175,26 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	}
 
 	applyAndResolve(t, m, marshalE2EDocument(t, crashDoc), "create-task", "create-lease")
+	if err := verifyManagedSingBox(root, "a", aPort); err != nil {
+		t.Fatalf("managed target A became inactive after apply: %v", err)
+	}
 	assertSOCKSEcho(t, clientPort, origin)
 	if got := observer.Count(); got == 0 {
 		t.Fatal("traffic did not traverse the B-to-A observer after apply")
 	}
 	assertChainedInventory(t, bDir, fragmentPath, sidecarPath, lineUUIDB, lineUUIDA, observer.Port())
 
-	// An ordinary metadata rewrite is a replace of the same fragment plus an
-	// augmented sidecar. The declared edge must survive the resync exactly.
+	// Simulate the ordinary independent metadata writer changing unrelated
+	// sidecar bytes. The declared edge remains intact, and remove must tolerate
+	// this non-E3 sidecar drift instead of applying a stale sidecar CAS.
 	resyncedSidecar := fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","generated_by":"ordinary-resync","inbounds":[{"tag":"source-b","line_uuid":%q,"chain":{"downstream_line_uuid":%q}}]}
 `, lineUUIDB, lineUUIDA)
-	replaceDoc := bindE2EDocument("replace", basename, digestText(fragment), digestText(sidecar), &fragment, &resyncedSidecar)
-	applyAndResolve(t, m, marshalE2EDocument(t, replaceDoc), "resync-task", "resync-lease")
+	writeFile(t, sidecarPath, resyncedSidecar)
 	assertChainedInventory(t, bDir, fragmentPath, sidecarPath, lineUUIDB, lineUUIDA, observer.Port())
 
 	removedSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}
 `
-	removeDoc := bindE2EDocument("remove", basename, digestText(fragment), digestText(resyncedSidecar), nil, &removedSidecar)
+	removeDoc := bindE2EDocument("remove", basename, digestText(fragment), nil, &removedSidecar)
 	applyAndResolve(t, m, marshalE2EDocument(t, removeDoc), "remove-task", "remove-lease")
 	if _, err := os.Stat(fragmentPath); !os.IsNotExist(err) {
 		t.Fatalf("removed fragment still exists: %v", err)
@@ -206,6 +231,14 @@ func TestLinechainE2ERestartHelper(t *testing.T) {
 	if root == "" {
 		return
 	}
+	if marker := os.Getenv(linechainE2ECrashMarkerEnv); marker != "" {
+		if err := os.WriteFile(marker, []byte("pair_published\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 	if err := restartManagedSingBox(os.Getenv(linechainE2EBinEnv), root, "b", os.Getenv(linechainE2EConfigEnv), mustEnvPort(linechainE2EBPortEnv)); err != nil {
 		t.Fatal(err)
 	}
@@ -223,13 +256,10 @@ func TestLinechainE2EActiveHelper(t *testing.T) {
 
 type e2eDocument map[string]any
 
-func bindE2EDocument(operation, basename, previousFragment, previousSidecar string, fragment, sidecar *string) e2eDocument {
+func bindE2EDocument(operation, basename, previousFragment string, fragment, sidecar *string) e2eDocument {
 	d := e2eDocument{"version": 2, "operation": operation, "fragment_basename": basename}
 	if previousFragment != "" {
 		d["previous_fragment_sha256"] = previousFragment
-	}
-	if previousSidecar != "" {
-		d["previous_sidecar_sha256"] = previousSidecar
 	}
 	if fragment != nil {
 		d["fragment"] = *fragment
@@ -341,6 +371,27 @@ func findInventoryNode(t *testing.T, inv model.SingBoxInventory, name string) mo
 	}
 	t.Fatalf("inventory lacks %q: %+v", name, inv.Nodes)
 	return model.SingBoxNode{}
+}
+
+func generateRealityKeypair(t *testing.T, bin string) (string, string) {
+	t.Helper()
+	out, err := exec.Command(bin, "generate", "reality-keypair").CombinedOutput()
+	if err != nil {
+		t.Fatalf("generate reality keypair: %v: %s", err, out)
+	}
+	var privateKey, publicKey string
+	for _, line := range strings.Split(string(out), "\n") {
+		if value, ok := strings.CutPrefix(line, "PrivateKey: "); ok {
+			privateKey = strings.TrimSpace(value)
+		}
+		if value, ok := strings.CutPrefix(line, "PublicKey: "); ok {
+			publicKey = strings.TrimSpace(value)
+		}
+	}
+	if privateKey == "" || publicKey == "" {
+		t.Fatalf("unexpected reality keypair output: %s", out)
+	}
+	return privateKey, publicKey
 }
 
 func requireSingBoxE2EBinary(t *testing.T) string {
@@ -542,6 +593,23 @@ func waitForPort(port int, timeout time.Duration) error {
 	return fmt.Errorf("port %d did not become ready", port)
 }
 
+func waitForFileOrProcess(t *testing.T, path string, done <-chan error, output *bytes.Buffer) {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("apply helper exited before crash marker: %v: %s", err, output.String())
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for helper signal %s: %s", path, output.String())
+}
+
 func waitForExactPair(t *testing.T, fragmentPath, fragment, sidecarPath, sidecar string) {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
@@ -553,7 +621,9 @@ func waitForExactPair(t *testing.T, fragmentPath, fragment, sidecarPath, sidecar
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("apply helper did not publish the exact pair before crash boundary")
+	f, ferr := os.ReadFile(fragmentPath)
+	s, serr := os.ReadFile(sidecarPath)
+	t.Fatalf("apply helper did not publish exact pair: fragment err=%v got=%q want=%q; sidecar err=%v got=%q want=%q", ferr, f, fragment, serr, s, sidecar)
 }
 
 func mustEnvPort(key string) int {
