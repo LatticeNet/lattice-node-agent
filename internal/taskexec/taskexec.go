@@ -159,6 +159,10 @@ type Runner struct {
 	// When set, it must be an absolute non-group/world-writable directory; task
 	// launch fails before script execution if the root cannot be prepared safely.
 	WorkdirRoot string
+	// AgentBinary is the absolute path of the running lattice-agent executable.
+	// Trusted server-authored scripts use it for one-shot helper modes without
+	// depending on PATH or inheriting the service process environment.
+	AgentBinary string
 	// getUID returns the effective uid of the agent process. It is a field so
 	// tests can simulate "running as root" without actually being root. When
 	// nil it defaults to os.Geteuid.
@@ -380,6 +384,9 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 		"XDG_RUNTIME_DIR=" + dir,
 		"LATTICE_TASK_ID=" + task.ID,
 		"LATTICE_TASK_LEASE_ID=" + task.LeaseID,
+	}
+	if filepath.IsAbs(r.AgentBinary) {
+		cmd.Env = append(cmd.Env, "LATTICE_AGENT_BIN="+r.AgentBinary)
 	}
 
 	var stdout, stderr cappedBuffer

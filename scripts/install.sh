@@ -82,6 +82,7 @@ if [ "$(id -u)" -ne 0 ]; then
       LATTICE_TASK_CGROUP_PIDS_MAX="${LATTICE_TASK_CGROUP_PIDS_MAX:-}" \
       LATTICE_TASK_CGROUP_CPU_MAX="${LATTICE_TASK_CGROUP_CPU_MAX:-}" \
       LATTICE_TASK_WORK_ROOT="${LATTICE_TASK_WORK_ROOT:-}" \
+      LATTICE_TASK_OUTBOX_DIR="${LATTICE_TASK_OUTBOX_DIR:-}" \
       LATTICE_AGENT_ALLOW_TERMINAL="${LATTICE_AGENT_ALLOW_TERMINAL:-}" \
       LATTICE_TERMINAL_TRANSPORT="${LATTICE_TERMINAL_TRANSPORT:-}" \
       LATTICE_IP_MODE="${LATTICE_IP_MODE:-}" LATTICE_IP_RESOLVERS="${LATTICE_IP_RESOLVERS:-}" \
@@ -195,7 +196,7 @@ load_existing_config() {
     LATTICE_AGENT_ALLOW_EXEC LATTICE_AGENT_ALLOW_ROOT_EXEC LATTICE_NO_EXEC \
     LATTICE_TASK_CGROUP_ROOT LATTICE_TASK_CGROUP_MEMORY_MAX \
     LATTICE_TASK_CGROUP_PIDS_MAX LATTICE_TASK_CGROUP_CPU_MAX \
-    LATTICE_TASK_WORK_ROOT \
+    LATTICE_TASK_WORK_ROOT LATTICE_TASK_OUTBOX_DIR \
     LATTICE_AGENT_ALLOW_TERMINAL LATTICE_TERMINAL_TRANSPORT LATTICE_IP_MODE \
     LATTICE_IP_RESOLVERS LATTICE_IP_SCRIPT LATTICE_PUBLIC_IP LATTICE_PUBLIC_IP6 \
     LATTICE_SSH_ALERTS LATTICE_SINGBOX_DISCOVER LATTICE_SINGBOX_BIN \
@@ -298,6 +299,10 @@ apply_service_identity_permissions() {
     chown "$run_user:$run_group" "$LATTICE_TASK_WORK_ROOT" || die "cannot assign $LATTICE_TASK_WORK_ROOT to $run_user:$run_group"
     chmod 0700 "$LATTICE_TASK_WORK_ROOT" 2>/dev/null || true
   fi
+  if [ -n "${task_outbox_leaf:-}" ]; then
+    chown "$run_user:$run_group" "$task_outbox_leaf" || die "cannot assign $task_outbox_leaf to $run_user:$run_group"
+    chmod 0700 "$task_outbox_leaf" 2>/dev/null || true
+  fi
 }
 
 prepare_task_work_root() {
@@ -308,6 +313,46 @@ prepare_task_work_root() {
   esac
   mkdir -p "$LATTICE_TASK_WORK_ROOT" || die "cannot create LATTICE_TASK_WORK_ROOT=$LATTICE_TASK_WORK_ROOT"
   chmod 0700 "$LATTICE_TASK_WORK_ROOT" 2>/dev/null || true
+}
+
+prepare_task_outbox_root() {
+  task_outbox_leaf=""
+  [ -n "${LATTICE_TASK_OUTBOX_DIR:-}" ] || return 0
+  case "$LATTICE_TASK_OUTBOX_DIR" in
+    /|/bin|/boot|/dev|/etc|/lib|/lib32|/lib64|/proc|/root|/sbin|/sys|/usr|/var)
+      die "LATTICE_TASK_OUTBOX_DIR must not be a filesystem or system root: $LATTICE_TASK_OUTBOX_DIR" ;;
+    /*) ;;
+    *) die "LATTICE_TASK_OUTBOX_DIR must be an absolute path" ;;
+  esac
+  [ ! -L "$LATTICE_TASK_OUTBOX_DIR" ] || die "LATTICE_TASK_OUTBOX_DIR must not traverse symlinks: $LATTICE_TASK_OUTBOX_DIR"
+  if [ -e "$LATTICE_TASK_OUTBOX_DIR" ] && [ ! -d "$LATTICE_TASK_OUTBOX_DIR" ]; then
+    die "LATTICE_TASK_OUTBOX_DIR must be a directory: $LATTICE_TASK_OUTBOX_DIR"
+  fi
+  mkdir -p "$LATTICE_TASK_OUTBOX_DIR" || die "cannot create LATTICE_TASK_OUTBOX_DIR=$LATTICE_TASK_OUTBOX_DIR"
+  current="$LATTICE_TASK_OUTBOX_DIR"
+  while [ "$current" != "/" ]; do
+    if [ -L "$current" ]; then
+      root_owned_link="$(find "$current" -prune -user root -print 2>/dev/null || true)"
+      [ "$root_owned_link" = "$current" ] || die "LATTICE_TASK_OUTBOX_DIR must not traverse a non-root-owned symlink: $current"
+    fi
+    current="${current%/*}"
+    [ -n "$current" ] || current="/"
+  done
+  case "$LATTICE_TASK_OUTBOX_DIR/" in
+    "$LATTICE_HOME/"*|"$state_dir/"*) ;;
+    *)
+      secure_base="$(find "$LATTICE_TASK_OUTBOX_DIR" -prune -user root ! -perm -022 -print 2>/dev/null || true)"
+      [ "$secure_base" = "$LATTICE_TASK_OUTBOX_DIR" ] || \
+        die "external LATTICE_TASK_OUTBOX_DIR must be root-owned and not group/world writable: $LATTICE_TASK_OUTBOX_DIR"
+      ;;
+  esac
+  task_outbox_leaf="$LATTICE_TASK_OUTBOX_DIR/task-outbox"
+  if [ -e "$task_outbox_leaf" ] || [ -L "$task_outbox_leaf" ]; then
+    [ ! -L "$task_outbox_leaf" ] && [ -d "$task_outbox_leaf" ] || die "task outbox leaf must be a real directory: $task_outbox_leaf"
+  else
+    mkdir "$task_outbox_leaf" || die "cannot create task outbox leaf=$task_outbox_leaf"
+  fi
+  chmod 0700 "$task_outbox_leaf" || die "cannot secure task outbox leaf=$task_outbox_leaf"
 }
 
 # ---- service helpers (systemd / openrc / launchd) --------------------------
@@ -375,6 +420,7 @@ fi
 [ -w "$LATTICE_HOME" ] || die "$LATTICE_HOME is not writable"
 mkdir -p "$state_dir"
 prepare_task_work_root
+prepare_task_outbox_root
 chmod 0750 "$LATTICE_HOME" 2>/dev/null || true
 apply_service_identity_permissions
 
@@ -428,6 +474,7 @@ LATTICE_TASK_CGROUP_MEMORY_MAX=$(quote_env "${LATTICE_TASK_CGROUP_MEMORY_MAX:-53
 LATTICE_TASK_CGROUP_PIDS_MAX=$(quote_env "${LATTICE_TASK_CGROUP_PIDS_MAX:-64}")
 LATTICE_TASK_CGROUP_CPU_MAX=$(quote_env "${LATTICE_TASK_CGROUP_CPU_MAX:-100000 100000}")
 LATTICE_TASK_WORK_ROOT=$(quote_env "${LATTICE_TASK_WORK_ROOT:-}")
+LATTICE_TASK_OUTBOX_DIR=$(quote_env "${LATTICE_TASK_OUTBOX_DIR:-}")
 LATTICE_AGENT_ALLOW_TERMINAL=$(quote_env "${LATTICE_AGENT_ALLOW_TERMINAL:-0}")
 LATTICE_TERMINAL_TRANSPORT=$(quote_env "${LATTICE_TERMINAL_TRANSPORT:-poll}")
 LATTICE_IP_MODE=$(quote_env "${LATTICE_IP_MODE:-auto}")
@@ -519,6 +566,7 @@ EOF
     <key>LATTICE_TASK_CGROUP_PIDS_MAX</key><string>$(xml_escape "${LATTICE_TASK_CGROUP_PIDS_MAX:-64}")</string>
     <key>LATTICE_TASK_CGROUP_CPU_MAX</key><string>$(xml_escape "${LATTICE_TASK_CGROUP_CPU_MAX:-100000 100000}")</string>
     <key>LATTICE_TASK_WORK_ROOT</key><string>$(xml_escape "${LATTICE_TASK_WORK_ROOT:-}")</string>
+    <key>LATTICE_TASK_OUTBOX_DIR</key><string>$(xml_escape "${LATTICE_TASK_OUTBOX_DIR:-}")</string>
     <key>LATTICE_AGENT_ALLOW_TERMINAL</key><string>$(xml_escape "${LATTICE_AGENT_ALLOW_TERMINAL:-0}")</string>
     <key>LATTICE_TERMINAL_TRANSPORT</key><string>$(xml_escape "${LATTICE_TERMINAL_TRANSPORT:-poll}")</string>
     <key>LATTICE_IP_MODE</key><string>$(xml_escape "${LATTICE_IP_MODE:-auto}")</string>
