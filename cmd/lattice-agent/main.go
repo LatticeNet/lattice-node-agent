@@ -1183,7 +1183,8 @@ type taskResultOutbox interface {
 
 type leasedAgentTask struct {
 	model.Task
-	DurableResult bool `json:"durable_result"`
+	DurableResult   bool   `json:"durable_result"`
+	DurableProtocol string `json:"durable_protocol,omitempty"`
 }
 
 func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, managers ...*linechain.Manager) error {
@@ -1269,7 +1270,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
 		result := runner.Run(task)
 		result.NodeID = cfg.NodeID
-		if manager != nil && isLinechainTask(task) {
+		if manager != nil && isLinechainTask(leased) {
 			result, err = manager.ResolveAfterRun(context.Background(), task, result)
 			if err != nil {
 				return fmt.Errorf("resolve linechain task %s: %w", task.ID, err)
@@ -1287,7 +1288,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 				if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
 					return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
 				}
-				if manager != nil && isLinechainTask(task) {
+				if manager != nil && isLinechainTask(leased) {
 					if cleanupErr := manager.Cleanup(task.ID, task.LeaseID); cleanupErr != nil {
 						if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
 							return fmt.Errorf("%v; cleanup confirmed linechain task: %v; upload stable result: %w", journalErr, cleanupErr, uploadErr)
@@ -1301,7 +1302,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 			}
 			return journalErr
 		}
-		if manager != nil && isLinechainTask(task) {
+		if manager != nil && isLinechainTask(leased) {
 			if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
 				if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
 					return fmt.Errorf("cleanup linechain task %s: %v; upload stable result: %w", task.ID, err, uploadErr)
@@ -1316,9 +1317,14 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 	return nil
 }
 
-func isLinechainTask(task model.Task) bool {
-	const marker = "# lattice-linechain-e3-v1\n"
-	return strings.HasPrefix(task.Script, marker) && strings.Contains(task.Script, "-linechain-apply") && strings.Contains(task.Script, "LATTICE_LINECHAIN_TXN_DIR")
+func isLinechainTask(task leasedAgentTask) bool {
+	if !task.DurableResult {
+		return false
+	}
+	if task.DurableProtocol != "" {
+		return task.DurableProtocol == "linechain-e3-v1"
+	}
+	return isLegacyLinechainTask(task.Task)
 }
 
 func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
@@ -1354,7 +1360,10 @@ func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain boo
 		}, nil); err != nil {
 			return fmt.Errorf("flush durable task result %s: %w", entry.Task.ID, err)
 		}
-		if retain && isLinechainTask(entry.Task) {
+		// Pending entries predate typed lease metadata; retain only the exact
+		// helper namespace marker during cleanup recovery. Live classification is
+		// always driven by durable_protocol on the leased response.
+		if retain && isLegacyLinechainTask(entry.Task) {
 			continue
 		}
 		if err := outbox.Remove(entry); err != nil {
@@ -1362,6 +1371,10 @@ func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain boo
 		}
 	}
 	return nil
+}
+
+func isLegacyLinechainTask(task model.Task) bool {
+	return strings.HasPrefix(task.Script, "# lattice-linechain-e3-v1\n")
 }
 
 func taskResultOutboxDir(cfg agentConfig) (string, error) {
