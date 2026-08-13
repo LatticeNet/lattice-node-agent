@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -21,6 +22,19 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type countingTaskRunner struct {
+	calls  int
+	result model.TaskResult
+}
+
+func (r *countingTaskRunner) Run(task model.Task) model.TaskResult {
+	r.calls++
+	result := r.result
+	result.TaskID = task.ID
+	result.LeaseID = task.LeaseID
+	return result
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
@@ -223,6 +237,272 @@ func TestPostJSONReturnsStructuredServerDiagnostics(t *testing.T) {
 	requireErrorContains(t, err, "task_result_conflict")
 	requireErrorContains(t, err, "task already finished")
 	requireErrorContains(t, err, "request_id=req-task")
+}
+
+func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
+	for _, firstStatus := range []int{http.StatusInternalServerError, http.StatusConflict} {
+		t.Run(http.StatusText(firstStatus), func(t *testing.T) {
+			oldClient := httpClient
+			defer func() { httpClient = oldClient }()
+
+			store, err := taskoutbox.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo ok", TimeoutSec: 10, OutputLimit: 1024}
+			runner := &countingTaskRunner{result: model.TaskResult{ExitCode: 0, Stdout: "ok", StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}}
+			postCalls := 0
+			fetchCalls := 0
+			var posted []model.TaskResult
+			httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				switch r.URL.Path {
+				case "/api/agent/tasks":
+					if r.Header.Get(agentCapabilitiesHeader) != guardManagedSHACapability {
+						return testResponse(http.StatusBadRequest, "missing lease-time capability"), nil
+					}
+					fetchCalls++
+					if fetchCalls == 1 {
+						data, _ := json.Marshal([]model.Task{task})
+						return testResponse(http.StatusOK, string(data)), nil
+					}
+					return testResponse(http.StatusOK, `[]`), nil
+				case "/api/agent/task-result":
+					postCalls++
+					var body struct {
+						Result model.TaskResult `json:"result"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Fatal(err)
+					}
+					posted = append(posted, body.Result)
+					if postCalls == 1 {
+						return testResponse(firstStatus, `{"error":{"code":"retry","message":"retry same lease"}}`), nil
+					}
+					return testResponse(http.StatusOK, `{"ok":true}`), nil
+				default:
+					return testResponse(http.StatusNotFound, ""), nil
+				}
+			})}
+			cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}
+
+			if err := runTasks(cfg, runner, store); err == nil {
+				t.Fatal("first result upload should fail")
+			}
+			if pending, err := store.Pending(); err != nil || len(pending) != 1 {
+				t.Fatalf("pending after failed upload = %+v, err=%v", pending, err)
+			}
+			if err := runTasks(cfg, runner, store); err != nil {
+				t.Fatal(err)
+			}
+			if runner.calls != 1 {
+				t.Fatalf("runner calls = %d, want 1", runner.calls)
+			}
+			if postCalls != 2 || len(posted) != 2 || !reflect.DeepEqual(posted[0], posted[1]) {
+				t.Fatalf("result retry changed: calls=%d posted=%+v", postCalls, posted)
+			}
+			if pending, err := store.Pending(); err != nil || len(pending) != 0 {
+				t.Fatalf("pending after acknowledgement = %+v, err=%v", pending, err)
+			}
+		})
+	}
+}
+
+func TestRunTasksRestartFlushesCompletedResultBeforeFetch(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	dir := t.TempDir()
+	store, err := taskoutbox.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo ok"}
+	if _, err := store.Begin(task); err != nil {
+		t.Fatal(err)
+	}
+	result := model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, NodeID: "node-a", ExitCode: 0, Stdout: "persisted"}
+	if _, err := store.Complete(result); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := taskoutbox.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	runner := &countingTaskRunner{}
+	var order []string
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		order = append(order, r.URL.Path)
+		if r.URL.Path == "/api/agent/task-result" {
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		}
+		return testResponse(http.StatusOK, `[]`), nil
+	})}
+	if err := runTasks(agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}, runner, restarted); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("completed task was re-executed: calls=%d", runner.calls)
+	}
+	wantOrder := []string{"/api/agent/task-result", "/api/agent/tasks"}
+	if !reflect.DeepEqual(order, wantOrder) {
+		t.Fatalf("request order = %v, want %v", order, wantOrder)
+	}
+}
+
+func TestRunTasksRestartConvertsInterruptedLeaseToUnknownOutcome(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	dir := t.TempDir()
+	store, err := taskoutbox.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Begin(model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "mutate host"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := taskoutbox.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	runner := &countingTaskRunner{}
+	var posted model.TaskResult
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/api/agent/task-result" {
+			var body struct {
+				Result model.TaskResult `json:"result"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			posted = body.Result
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		}
+		return testResponse(http.StatusOK, `[]`), nil
+	})}
+	if err := runTasks(agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}, runner, restarted); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("interrupted task was re-executed: calls=%d", runner.calls)
+	}
+	if posted.ExitCode != -1 || !strings.Contains(posted.Error, "outcome is unknown") || !strings.Contains(posted.Error, "not re-executed") {
+		t.Fatalf("interrupted result is not honest: %+v", posted)
+	}
+}
+
+type beginFailingOutbox struct {
+	committed bool
+	err       error
+}
+
+func (o beginFailingOutbox) Begin(model.Task) (bool, error)          { return o.committed, o.err }
+func (o beginFailingOutbox) Complete(model.TaskResult) (bool, error) { return true, nil }
+func (o beginFailingOutbox) RecoverInterrupted(string) error         { return nil }
+func (o beginFailingOutbox) Pending() ([]taskoutbox.Entry, error)    { return nil, nil }
+func (o beginFailingOutbox) Remove(taskoutbox.Entry) error           { return nil }
+
+func TestRunTasksJournalFailurePreventsExecution(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
+	data, _ := json.Marshal([]model.Task{task})
+	var reported model.TaskResult
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/api/agent/tasks" {
+			return testResponse(http.StatusOK, string(data)), nil
+		}
+		var body struct {
+			Result model.TaskResult `json:"result"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		reported = body.Result
+		return testResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	runner := &countingTaskRunner{}
+	err := runTasks(
+		agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"},
+		runner,
+		beginFailingOutbox{err: errors.New("disk full")},
+	)
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("runTasks error = %v, want disk failure", err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("task ran despite journal failure: calls=%d", runner.calls)
+	}
+	if reported.TaskID != task.ID || reported.LeaseID != task.LeaseID || reported.ExitCode != -1 ||
+		!strings.Contains(reported.Error, "not executed") {
+		t.Fatalf("journal failure did not report an honest terminal result: %+v", reported)
+	}
+}
+
+func TestRunTasksPublishedJournalFailureDoesNotPostConflictingDirectResult(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
+	data, _ := json.Marshal([]model.Task{task})
+	postCalls := 0
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/api/agent/tasks" {
+			return testResponse(http.StatusOK, string(data)), nil
+		}
+		postCalls++
+		return testResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	runner := &countingTaskRunner{}
+	err := runTasks(
+		agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"},
+		runner,
+		beginFailingOutbox{committed: true, err: errors.New("directory sync failed")},
+	)
+	if err == nil || !strings.Contains(err.Error(), "directory sync failed") {
+		t.Fatalf("runTasks error = %v, want directory sync failure", err)
+	}
+	if runner.calls != 0 || postCalls != 0 {
+		t.Fatalf("published journal ambiguity ran or directly reported task: runner=%d posts=%d", runner.calls, postCalls)
+	}
+}
+
+func TestTaskResultOutboxDirPrefersConfiguredStateAndIsolatedIdentity(t *testing.T) {
+	base := t.TempDir()
+	one, err := taskResultOutboxDir(agentConfig{
+		Server:      "https://one.example",
+		NodeID:      "node-a",
+		LogStateDir: base,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := taskResultOutboxDir(agentConfig{
+		Server:        "https://two.example",
+		NodeID:        "node-a",
+		LogStateDir:   base,
+		TaskOutboxDir: filepath.Join(base, "override"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(one, filepath.Join(base, "task-outbox")+string(os.PathSeparator)) {
+		t.Fatalf("LogStateDir was not used: %s", one)
+	}
+	if !strings.HasPrefix(two, filepath.Join(base, "override", "task-outbox")+string(os.PathSeparator)) {
+		t.Fatalf("TaskOutboxDir override was not used: %s", two)
+	}
+	if one == two || filepath.Base(one) == filepath.Base(two) {
+		t.Fatalf("server/node identities were not isolated: one=%s two=%s", one, two)
+	}
 }
 
 func TestShipLogBatchReturnsStatusAndStructuredDiagnostics(t *testing.T) {
