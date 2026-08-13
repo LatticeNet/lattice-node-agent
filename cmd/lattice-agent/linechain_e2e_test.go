@@ -29,15 +29,17 @@ import (
 )
 
 const (
-	linechainE2EBinEnv         = "LATTICE_SINGBOX_E2E_BIN"
-	linechainE2ERootEnv        = "LATTICE_LINECHAIN_E2E_ROOT"
-	linechainE2EConfigEnv      = "LATTICE_LINECHAIN_E2E_CONFIG_DIR"
-	linechainE2ESidecarEnv     = "LATTICE_LINECHAIN_E2E_SIDECAR"
-	linechainE2EBPortEnv       = "LATTICE_LINECHAIN_E2E_B_PORT"
-	linechainE2ETaskEnv        = "LATTICE_LINECHAIN_E2E_TASK"
-	linechainE2ELeaseEnv       = "LATTICE_LINECHAIN_E2E_LEASE"
-	linechainE2ECrashMarkerEnv = "LATTICE_LINECHAIN_E2E_CRASH_MARKER"
-	linechainE2ERecoveryResult = "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT"
+	linechainE2EBinEnv          = "LATTICE_SINGBOX_E2E_BIN"
+	linechainE2ERootEnv         = "LATTICE_LINECHAIN_E2E_ROOT"
+	linechainE2EConfigEnv       = "LATTICE_LINECHAIN_E2E_CONFIG_DIR"
+	linechainE2ESidecarEnv      = "LATTICE_LINECHAIN_E2E_SIDECAR"
+	linechainE2EBPortEnv        = "LATTICE_LINECHAIN_E2E_B_PORT"
+	linechainE2ETaskEnv         = "LATTICE_LINECHAIN_E2E_TASK"
+	linechainE2ELeaseEnv        = "LATTICE_LINECHAIN_E2E_LEASE"
+	linechainE2ECrashMarkerEnv  = "LATTICE_LINECHAIN_E2E_CRASH_MARKER"
+	linechainE2ERecoveryResult  = "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT"
+	linechainE2EResolveResult   = "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT"
+	linechainE2EInventoryResult = "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT"
 )
 
 var managedE2EProcesses = struct {
@@ -256,32 +258,77 @@ func TestLinechainE2ERecoverHelper(t *testing.T) {
 	if resultPath == "" {
 		return
 	}
-	m := openE2EManager(t, os.Getenv(linechainE2EBinEnv), os.Getenv(linechainE2ERootEnv), os.Getenv(linechainE2EConfigEnv), os.Getenv(linechainE2ESidecarEnv), filepath.Join(os.Getenv(linechainE2ERootEnv), "txn"), mustEnvPort(linechainE2EBPortEnv))
+	root := mustAbsoluteEnv(t, linechainE2ERootEnv)
+	consumeE2ECrashMarker(t, mustAbsoluteEnv(t, linechainE2ECrashMarkerEnv))
+	m := openE2EManager(t, mustExecutableEnv(t, linechainE2EBinEnv), root, mustAbsoluteEnv(t, linechainE2EConfigEnv), mustAbsoluteEnv(t, linechainE2ESidecarEnv), filepath.Join(root, "txn"), mustEnvPort(linechainE2EBPortEnv))
 	defer m.Close()
 	var recovered model.TaskResult
+	called := false
 	if err := m.RequireRecovered(context.Background(), func(result model.TaskResult) error {
+		called = true
 		recovered = result
 		return nil
 	}, "node-b"); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := json.Marshal(recovered)
+	if !called || recovered.TaskID == "" || recovered.LeaseID == "" {
+		t.Fatalf("recovery emitted no exact task result: %+v", recovered)
+	}
+	writeE2EJSON(t, resultPath, recovered)
+}
+
+// TestLinechainE2EResolveHelper converts a successful helper run into the
+// stable durable result, cleans its journal, and only then publishes JSON.
+func TestLinechainE2EResolveHelper(t *testing.T) {
+	resultPath := os.Getenv(linechainE2EResolveResult)
+	if resultPath == "" {
+		return
+	}
+	root := mustAbsoluteEnv(t, linechainE2ERootEnv)
+	taskID := mustEnv(t, linechainE2ETaskEnv)
+	leaseID := mustEnv(t, linechainE2ELeaseEnv)
+	m := openE2EManager(t, mustExecutableEnv(t, linechainE2EBinEnv), root, mustAbsoluteEnv(t, linechainE2EConfigEnv), mustAbsoluteEnv(t, linechainE2ESidecarEnv), filepath.Join(root, "txn"), mustEnvPort(linechainE2EBPortEnv))
+	defer m.Close()
+	result, err := m.ResolveAfterRun(context.Background(), model.Task{ID: taskID, LeaseID: leaseID}, model.TaskResult{TaskID: taskID, LeaseID: leaseID, ExitCode: 0, FinishedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(resultPath, raw, 0o600); err != nil {
+	if err := m.Cleanup(taskID, leaseID); err != nil {
 		t.Fatal(err)
 	}
+	writeE2EJSON(t, resultPath, result)
+}
+
+// TestLinechainE2EInventoryHelper publishes the inventory discovered from the
+// actual post-restart config directory and semantic sidecar.
+func TestLinechainE2EInventoryHelper(t *testing.T) {
+	resultPath := os.Getenv(linechainE2EInventoryResult)
+	if resultPath == "" {
+		return
+	}
+	configDir := mustAbsoluteEnv(t, linechainE2EConfigEnv)
+	paths, err := filepath.Glob(filepath.Join(configDir, "*.json"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("discover config files: paths=%v err=%v", paths, err)
+	}
+	inv, err := singboxdiscover.DiscoverRuntimeFiles("node-b", paths, mustAbsoluteEnv(t, linechainE2ESidecarEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeE2EJSON(t, resultPath, inv)
 }
 
 // TestLinechainE2ERestartHelper is the fixed restart/active command used by the
 // Manager. It stops the prior B instance and starts a checked replacement.
 func TestLinechainE2ERestartHelper(t *testing.T) {
-	root := os.Getenv(linechainE2ERootEnv)
-	if root == "" {
+	if os.Getenv(linechainE2ERootEnv) == "" {
 		return
 	}
+	root := mustAbsoluteEnv(t, linechainE2ERootEnv)
 	if marker := os.Getenv(linechainE2ECrashMarkerEnv); marker != "" {
+		if !filepath.IsAbs(marker) {
+			t.Fatalf("%s must be absolute", linechainE2ECrashMarkerEnv)
+		}
 		if err := os.WriteFile(marker, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -289,8 +336,68 @@ func TestLinechainE2ERestartHelper(t *testing.T) {
 			time.Sleep(time.Hour)
 		}
 	}
-	if err := restartManagedSingBox(os.Getenv(linechainE2EBinEnv), root, "b", os.Getenv(linechainE2EConfigEnv), mustEnvPort(linechainE2EBPortEnv)); err != nil {
+	if err := restartManagedSingBox(mustExecutableEnv(t, linechainE2EBinEnv), root, "b", mustAbsoluteEnv(t, linechainE2EConfigEnv), mustEnvPort(linechainE2EBPortEnv)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func mustEnv(t *testing.T, key string) string {
+	t.Helper()
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		t.Fatalf("%s is required", key)
+	}
+	return value
+}
+
+func mustAbsoluteEnv(t *testing.T, key string) string {
+	t.Helper()
+	value := mustEnv(t, key)
+	if !filepath.IsAbs(value) {
+		t.Fatalf("%s must be absolute", key)
+	}
+	return value
+}
+
+func mustExecutableEnv(t *testing.T, key string) string {
+	t.Helper()
+	value := mustAbsoluteEnv(t, key)
+	info, err := os.Stat(value)
+	if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		t.Fatalf("%s must be executable: %v", key, err)
+	}
+	return value
+}
+
+func writeE2EJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	if !filepath.IsAbs(path) {
+		t.Fatalf("result path must be absolute: %s", path)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func consumeE2ECrashMarker(t *testing.T, path string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read one-shot crash marker: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		t.Fatalf("invalid one-shot crash marker %q", raw)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("consume one-shot crash marker: %v", err)
+	}
+	if err := os.Unsetenv(linechainE2ECrashMarkerEnv); err != nil {
+		t.Fatalf("clear one-shot crash marker env: %v", err)
 	}
 }
 
@@ -584,7 +691,11 @@ func startManagedSingBox(t *testing.T, bin, root, name, configDir string, port i
 	if err := restartManagedSingBox(bin, root, name, configDir, port); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = killManagedSingBox(root, name) })
+	t.Cleanup(func() {
+		if err := killManagedSingBox(root, name); err != nil {
+			t.Errorf("cleanup managed sing-box %s: %v", name, err)
+		}
+	})
 }
 
 func restartManagedSingBox(bin, root, name, configDir string, port int) error {
@@ -611,17 +722,27 @@ func restartManagedSingBox(bin, root, name, configDir string, port int) error {
 	_ = logFile.Close()
 	if err := os.WriteFile(filepath.Join(root, name+".pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		exited := waitManagedProcess(cmd.Process.Pid, done, 2*time.Second)
+		managedE2EProcesses.Lock()
+		delete(managedE2EProcesses.done, cmd.Process.Pid)
+		managedE2EProcesses.Unlock()
+		if !exited {
+			return fmt.Errorf("write %s pid file: %w; process group %d remained after SIGKILL", name, err, cmd.Process.Pid)
+		}
 		return err
 	}
 	if err := waitForPort(port, 8*time.Second); err != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		cleanupErr := killManagedSingBox(root, name)
 		logBytes, _ := os.ReadFile(logPath)
+		if cleanupErr != nil {
+			return fmt.Errorf("start %s: %w: %s; cleanup: %v", name, err, logBytes, cleanupErr)
+		}
 		return fmt.Errorf("start %s: %w: %s", name, err, logBytes)
 	}
 	return nil
 }
 
-func killManagedSingBox(root, name string) error {
+func killManagedSingBox(root, name string) (retErr error) {
 	pidPath := filepath.Join(root, name+".pid")
 	raw, err := os.ReadFile(pidPath)
 	if os.IsNotExist(err) {
@@ -632,52 +753,104 @@ func killManagedSingBox(root, name string) error {
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil || pid <= 1 {
-		return fmt.Errorf("invalid %s pid %q", name, raw)
-	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-		return err
+		parseErr := fmt.Errorf("invalid %s pid %q", name, raw)
+		if removeErr := os.Remove(pidPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("%v; remove invalid pid file: %w", parseErr, removeErr)
+		}
+		return parseErr
 	}
 	managedE2EProcesses.Lock()
 	done := managedE2EProcesses.done[pid]
 	managedE2EProcesses.Unlock()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if managedProcessExited(pid, done) {
-			managedE2EProcesses.Lock()
-			delete(managedE2EProcesses.done, pid)
-			managedE2EProcesses.Unlock()
-			_ = os.Remove(pidPath)
-			return nil
+	defer func() {
+		managedE2EProcesses.Lock()
+		delete(managedE2EProcesses.done, pid)
+		managedE2EProcesses.Unlock()
+		if err := os.Remove(pidPath); err != nil && !os.IsNotExist(err) {
+			if retErr == nil {
+				retErr = fmt.Errorf("remove %s pid file: %w", name, err)
+			} else {
+				retErr = fmt.Errorf("%v; remove %s pid file: %w", retErr, name, err)
+			}
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+	}()
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 		return err
 	}
-	killDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(killDeadline) {
-		if managedProcessExited(pid, done) {
-			managedE2EProcesses.Lock()
-			delete(managedE2EProcesses.done, pid)
-			managedE2EProcesses.Unlock()
-			_ = os.Remove(pidPath)
-			return nil
-		}
-		time.Sleep(20 * time.Millisecond)
+	if waitManagedProcess(pid, done, 2*time.Second) {
+		return nil
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		return err
+	}
+	if waitManagedProcess(pid, done, 2*time.Second) {
+		return nil
 	}
 	return fmt.Errorf("%s process %d remained after SIGKILL", name, pid)
 }
 
-func managedProcessExited(pid int, done <-chan error) bool {
-	if done != nil {
-		select {
-		case <-done:
+func waitManagedProcess(pid int, done <-chan error, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if done != nil {
+			select {
+			case <-done:
+				return true
+			default:
+			}
+		} else if syscall.Kill(-pid, 0) == syscall.ESRCH {
 			return true
-		default:
-			return false
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	return syscall.Kill(pid, 0) == syscall.ESRCH
+	return false
+}
+
+func TestKillManagedSingBoxTerminatesProcessGroupAndClearsState(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; sleep 60 & wait")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	managedE2EProcesses.Lock()
+	managedE2EProcesses.done[cmd.Process.Pid] = done
+	managedE2EProcesses.Unlock()
+	go func() { done <- cmd.Wait() }()
+	pidPath := filepath.Join(root, "test.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := killManagedSingBox(root, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("pid file survived cleanup: %v", err)
+	}
+	managedE2EProcesses.Lock()
+	_, tracked := managedE2EProcesses.done[cmd.Process.Pid]
+	managedE2EProcesses.Unlock()
+	if tracked {
+		t.Fatal("managed process survived in reap map")
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, 0); err != syscall.ESRCH {
+		t.Fatalf("managed process group survived cleanup: %v", err)
+	}
+}
+
+func TestKillManagedSingBoxRejectsAndRemovesInvalidPID(t *testing.T) {
+	root := t.TempDir()
+	pidPath := filepath.Join(root, "invalid.pid")
+	if err := os.WriteFile(pidPath, []byte("not-a-pid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := killManagedSingBox(root, "invalid"); err == nil || !strings.Contains(err.Error(), "invalid invalid pid") {
+		t.Fatalf("invalid pid error = %v", err)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid pid file survived cleanup: %v", err)
+	}
 }
 
 func killMarkerProcess(t *testing.T, marker string) {
