@@ -722,7 +722,8 @@ func restartManagedSingBox(bin, root, name, configDir string, port int) error {
 	_ = logFile.Close()
 	if err := os.WriteFile(filepath.Join(root, name+".pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		exited := waitManagedProcess(cmd.Process.Pid, done, 2*time.Second)
+		leaderReaped := false
+		exited := waitManagedProcess(cmd.Process.Pid, done, &leaderReaped, 2*time.Second)
 		managedE2EProcesses.Lock()
 		delete(managedE2EProcesses.done, cmd.Process.Pid)
 		managedE2EProcesses.Unlock()
@@ -777,28 +778,30 @@ func killManagedSingBox(root, name string) (retErr error) {
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 		return err
 	}
-	if waitManagedProcess(pid, done, 2*time.Second) {
+	leaderReaped := done == nil
+	if waitManagedProcess(pid, done, &leaderReaped, 2*time.Second) {
 		return nil
 	}
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 		return err
 	}
-	if waitManagedProcess(pid, done, 2*time.Second) {
+	if waitManagedProcess(pid, done, &leaderReaped, 2*time.Second) {
 		return nil
 	}
 	return fmt.Errorf("%s process %d remained after SIGKILL", name, pid)
 }
 
-func waitManagedProcess(pid int, done <-chan error, timeout time.Duration) bool {
+func waitManagedProcess(pid int, done <-chan error, leaderReaped *bool, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if done != nil {
+		if !*leaderReaped && done != nil {
 			select {
 			case <-done:
-				return true
+				*leaderReaped = true
 			default:
 			}
-		} else if syscall.Kill(-pid, 0) == syscall.ESRCH {
+		}
+		if *leaderReaped && syscall.Kill(-pid, 0) == syscall.ESRCH {
 			return true
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -808,7 +811,8 @@ func waitManagedProcess(pid int, done <-chan error, timeout time.Duration) bool 
 
 func TestKillManagedSingBoxTerminatesProcessGroupAndClearsState(t *testing.T) {
 	root := t.TempDir()
-	cmd := exec.Command("sh", "-c", "trap 'exit 0' TERM; sleep 60 & wait")
+	childPIDPath := filepath.Join(root, "child.pid")
+	cmd := exec.Command("sh", "-c", `trap 'exit 0' TERM; sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $! > "$1"; wait`, "managed-test", childPIDPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -818,6 +822,16 @@ func TestKillManagedSingBoxTerminatesProcessGroupAndClearsState(t *testing.T) {
 	managedE2EProcesses.done[cmd.Process.Pid] = done
 	managedE2EProcesses.Unlock()
 	go func() { done <- cmd.Wait() }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(childPIDPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("TERM-ignoring child did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	pidPath := filepath.Join(root, "test.pid")
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
 		t.Fatal(err)
