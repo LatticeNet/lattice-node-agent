@@ -22,6 +22,13 @@ import (
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+func TestMain(m *testing.M) {
+	if taskexec.MaybeRunChildShim(os.Args) {
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
