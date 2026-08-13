@@ -1,3 +1,5 @@
+//go:build linechain_e2e && (darwin || linux || freebsd || openbsd || netbsd)
+
 package main
 
 import (

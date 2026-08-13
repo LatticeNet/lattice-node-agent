@@ -20,4 +20,4 @@ JSON
 "$bin" check -C "$probe" >/dev/null 2>&1 || { echo "sing-box 1.13.x config check failed" >&2; exit 1; }
 printf '%s\n' "linechain E2E binary: $(printf '%s\n' "$version" | sed -n '1p')"
 
-LATTICE_SINGBOX_E2E_BIN="$bin" go test ./cmd/lattice-agent -run '^TestLinechainRealSingBoxE2E$' -count=1 -v
+LATTICE_SINGBOX_E2E_BIN="$bin" go test -tags=linechain_e2e ./cmd/lattice-agent -run '^TestLinechainRealSingBoxE2E$' -count=1 -v
