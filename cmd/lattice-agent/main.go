@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -294,7 +295,7 @@ func main() {
 		if err := manager.ConfigureLayout(os.Getenv("LATTICE_LINECHAIN_CONFIG_DIR"), os.Getenv("LATTICE_LINECHAIN_SIDECAR_PATH")); err != nil {
 			log.Fatalf("linechain local layout failed: %v", err)
 		}
-		if err := manager.Apply(context.Background(), os.Stdin, os.Getenv("LATTICE_TASK_ID"), os.Getenv("LATTICE_TASK_LEASE_ID")); err != nil {
+		if err := manager.Apply(context.Background(), os.Stdin, os.Getenv("LATTICE_TASK_ID"), os.Getenv("LATTICE_TASK_LEASE_ID"), os.Getenv("LATTICE_LINECHAIN_TASK_SCRIPT_SHA256")); err != nil {
 			log.Fatalf("linechain apply failed: %v", err)
 		}
 		return
@@ -1191,9 +1192,6 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		manager = managers[0]
 	}
 	if manager != nil {
-		if err := crossCheckLinechainAuthority(manager, outbox); err != nil {
-			return err
-		}
 		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
 			return err
 		}
@@ -1282,7 +1280,18 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 			continue
 		}
 		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
-		result := runner.Run(task)
+		var result model.TaskResult
+		if isLinechainTask(leased) {
+			typed, ok := runner.(interface {
+				RunLinechain(model.Task) model.TaskResult
+			})
+			if !ok {
+				return fmt.Errorf("linechain task runner does not expose trusted E3 execution")
+			}
+			result = typed.RunLinechain(task)
+		} else {
+			result = runner.Run(task)
+		}
 		result.NodeID = cfg.NodeID
 		if manager != nil && isLinechainTask(leased) {
 			result, err = manager.ResolveAfterRun(context.Background(), task, result)
@@ -1332,44 +1341,84 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 }
 
 func crossCheckLinechainAuthority(manager *linechain.Manager, outbox taskResultOutbox) error {
+	_, err := captureLinechainAuthority(manager, outbox)
+	return err
+}
+
+func captureLinechainAuthority(manager *linechain.Manager, outbox taskResultOutbox) (map[string]linechain.RecoveryAuthority, error) {
 	typed, ok := outbox.(taskResultOutboxSnapshot)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	entries, err := typed.Snapshot()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	refs, err := manager.Snapshot()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	journals := map[string]struct{}{}
+	journals := map[string]linechain.JournalRef{}
 	for _, ref := range refs {
-		journals[ref.TaskID+"\x00"+ref.LeaseID] = struct{}{}
+		journals[ref.TaskID+"\x00"+ref.LeaseID] = ref
 	}
 	matchedE3 := map[string]struct{}{}
 	for _, entry := range entries {
 		key := entry.Task.ID + "\x00" + entry.Task.LeaseID
-		_, hasJournal := journals[key]
+		ref, hasJournal := journals[key]
 		if hasJournal && entry.DurableProtocol != "linechain-e3-v1" {
-			return fmt.Errorf("linechain journal %s has mismatched outbox protocol", entry.Task.ID)
+			return nil, fmt.Errorf("linechain journal %s has mismatched outbox protocol", entry.Task.ID)
 		}
 		if hasJournal && entry.DurableProtocol == "linechain-e3-v1" {
+			if ref.TaskScriptSHA != linechainTaskScriptSHA(entry.Task.Script) {
+				return nil, fmt.Errorf("linechain journal %s does not match the exact outbox task script", entry.Task.ID)
+			}
 			matchedE3[key] = struct{}{}
 		}
 		if entry.State == "leased" && entry.DurableProtocol == "linechain-e3-v1" {
 			if !hasJournal {
-				return fmt.Errorf("leased E3 outbox %s lacks exact linechain journal", entry.Task.ID)
+				return nil, fmt.Errorf("leased E3 outbox %s lacks exact linechain journal", entry.Task.ID)
+			}
+		}
+		if entry.State == "completed" && entry.DurableProtocol == "linechain-e3-v1" && hasJournal {
+			if !ref.Terminal || entry.Result == nil || ref.Result == nil || !sameTaskResult(*entry.Result, *ref.Result) {
+				return nil, fmt.Errorf("completed E3 outbox %s conflicts with linechain terminal result", entry.Task.ID)
 			}
 		}
 	}
 	for key := range journals {
 		if _, ok := matchedE3[key]; !ok {
-			return fmt.Errorf("linechain journal lacks exact leased E3 outbox: %q", key)
+			return nil, fmt.Errorf("linechain journal lacks exact leased E3 outbox: %q", key)
 		}
 	}
-	return nil
+	authority := make(map[string]linechain.RecoveryAuthority, len(journals))
+	for key, ref := range journals {
+		authority[key] = linechain.RecoveryAuthority{TaskScriptSHA: ref.TaskScriptSHA, CombinedSHA256: ref.CombinedSHA256, Phase: ref.Phase, ResultSHA256: taskResultPointerSHA(ref.Result), JournalSHA256: ref.JournalSHA256}
+	}
+	return authority, nil
+}
+
+func sameTaskResult(a, b model.TaskResult) bool {
+	aBytes, aErr := json.Marshal(a)
+	bBytes, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aBytes, bBytes)
+}
+
+func linechainTaskScriptSHA(script string) string {
+	sum := sha256.Sum256([]byte(script))
+	return hex.EncodeToString(sum[:])
+}
+
+func taskResultPointerSHA(result *model.TaskResult) string {
+	if result == nil {
+		return ""
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func validateDurablePair(task leasedAgentTask, manager *linechain.Manager, ready bool) error {
@@ -1393,7 +1442,11 @@ func isLinechainTask(task leasedAgentTask) bool {
 }
 
 func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
-	return manager.RequireRecovered(ctx, func(result model.TaskResult) error {
+	authority, err := captureLinechainAuthority(manager, outbox)
+	if err != nil {
+		return err
+	}
+	return manager.RequireRecoveredAuthorized(ctx, func(result model.TaskResult) error {
 		committed, err := outbox.Complete(result)
 		if err == nil {
 			return nil
@@ -1404,7 +1457,7 @@ func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, 
 		// An exact completed outbox may remain after a crash before transaction
 		// cleanup. Complete implementations treat that replay idempotently.
 		return err
-	}, nodeID)
+	}, nodeID, authority)
 }
 
 func flushTaskResults(cfg agentConfig, outbox taskResultOutbox) error {

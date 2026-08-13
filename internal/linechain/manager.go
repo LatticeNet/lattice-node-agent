@@ -24,7 +24,7 @@ import (
 const (
 	journalVersion  = 1
 	maxDocumentSize = 4 << 20
-	maxDiagnostic   = 4096
+	maxArtifactSize = maxDocumentSize
 )
 
 var linechainBasenameRE = regexp.MustCompile(`^lattice-linechain-[0-9a-f]{20}\.json$`)
@@ -34,12 +34,11 @@ var linechainBasenameRE = regexp.MustCompile(`^lattice-linechain-[0-9a-f]{20}\.j
 type Document struct {
 	Version                int     `json:"version"`
 	Operation              string  `json:"operation"`
-	ConfigDir              string  `json:"config_dir"`
+	ConfigDir              string  `json:"-"`
 	FragmentBasename       string  `json:"fragment_basename,omitempty"`
-	FragmentPath           string  `json:"fragment_path"`
-	SidecarPath            string  `json:"sidecar_path"`
+	FragmentPath           string  `json:"-"`
+	SidecarPath            string  `json:"-"`
 	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
-	PreviousSidecarSHA256  string  `json:"previous_sidecar_sha256,omitempty"`
 	Fragment               *string `json:"fragment,omitempty"`
 	Sidecar                *string `json:"sidecar,omitempty"`
 	FragmentSHA256         string  `json:"fragment_sha256,omitempty"`
@@ -88,6 +87,8 @@ type journal struct {
 	SidecarOld     string            `json:"sidecar_old_sha256,omitempty"`
 	FragmentNew    string            `json:"fragment_desired_sha256,omitempty"`
 	SidecarNew     string            `json:"sidecar_desired_sha256,omitempty"`
+	CombinedNew    string            `json:"combined_desired_sha256"`
+	TaskScriptSHA  string            `json:"task_script_sha256"`
 	FragmentHadOld bool              `json:"fragment_had_old"`
 	SidecarHadOld  bool              `json:"sidecar_had_old"`
 	Phase          string            `json:"phase"`
@@ -101,6 +102,8 @@ type Manager struct {
 	configDir      string
 	sidecarPath    string
 	remove         func(string) error
+	publishFile    func(string, *string) error
+	writeJournal   func(string, any) error
 	syncDirectory  func(string) error
 	singBoxBinary  string
 	restartCommand []string
@@ -113,12 +116,6 @@ func (m *Manager) ConfigureLayout(configDir, sidecarPath string) error {
 	if !filepath.IsAbs(configDir) || !filepath.IsAbs(sidecarPath) {
 		return fmt.Errorf("linechain layout paths must be absolute")
 	}
-	for label, root := range map[string]string{"config": configDir, "sidecar": filepath.Dir(sidecarPath)} {
-		info, err := os.Lstat(root)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedPath(info) || info.Mode().Perm()&0o022 != 0 {
-			return fmt.Errorf("linechain %s root is not a trusted private directory", label)
-		}
-	}
 	resolvedConfig, err := filepath.EvalSymlinks(configDir)
 	if err != nil {
 		return fmt.Errorf("resolve linechain config directory: %w", err)
@@ -126,6 +123,12 @@ func (m *Manager) ConfigureLayout(configDir, sidecarPath string) error {
 	resolvedSidecarParent, err := filepath.EvalSymlinks(filepath.Dir(sidecarPath))
 	if err != nil {
 		return fmt.Errorf("resolve linechain sidecar directory: %w", err)
+	}
+	for label, root := range map[string]string{"config": resolvedConfig, "sidecar": resolvedSidecarParent} {
+		info, err := os.Lstat(root)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedPath(info) || info.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("linechain %s root is not a trusted private directory", label)
+		}
 	}
 	configDir = filepath.Clean(resolvedConfig)
 	sidecarPath = filepath.Join(filepath.Clean(resolvedSidecarParent), filepath.Base(sidecarPath))
@@ -163,6 +166,18 @@ func (m *Manager) ConfigureCleanupForTest(remove func(string) error, syncDirecto
 	}
 	m.remove = remove
 	m.syncDirectory = syncDirectory
+}
+
+// ConfigureMutationForTest injects atomic publication and journal-write faults.
+func (m *Manager) ConfigureMutationForTest(publishFile func(string, *string) error, writeJournal func(string, any) error) {
+	if publishFile == nil {
+		publishFile = publish
+	}
+	if writeJournal == nil {
+		writeJournal = writeJSON
+	}
+	m.publishFile = publishFile
+	m.writeJournal = writeJournal
 }
 
 // Open takes exclusive ownership of a private absolute transaction directory.
@@ -205,6 +220,8 @@ func open(dir string) (*Manager, error) {
 	}
 	m := &Manager{dir: dir}
 	m.remove = os.Remove
+	m.publishFile = publish
+	m.writeJournal = writeJSON
 	m.syncDirectory = syncDir
 	m.singBoxBinary = "sing-box"
 	m.restartCommand = []string{"systemctl", "restart", "sing-box"}
@@ -270,11 +287,22 @@ func (m *Manager) journalPath(taskID, leaseID string) string {
 
 // Apply reads and applies one document. It is intended for the early-exit
 // helper mode and obtains task identity from the runner's minimal environment.
-func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string) error {
+func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID, taskScriptSHA string) error {
 	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(leaseID) == "" {
 		return fmt.Errorf("task and lease identity are required")
 	}
-	dec := json.NewDecoder(io.LimitReader(r, maxDocumentSize+1))
+	scriptBinding := strings.TrimSpace(taskScriptSHA)
+	if !validSHA(scriptBinding) {
+		return fmt.Errorf("linechain task script binding is required and must be lowercase SHA-256")
+	}
+	raw, err := io.ReadAll(io.LimitReader(r, maxDocumentSize+1))
+	if err != nil {
+		return fmt.Errorf("read linechain document: %w", err)
+	}
+	if len(raw) > maxDocumentSize {
+		return fmt.Errorf("linechain document exceeds %d bytes", maxDocumentSize)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var wire wireDocumentV2
 	if err := dec.Decode(&wire); err != nil {
@@ -301,15 +329,11 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	if err := m.validateDocument(d); err != nil {
 		return err
 	}
-	mergedSidecar, err := mergeSidecar(sidecarCurrent(m.sidecarPath), d.Sidecar)
-	if err != nil {
-		return err
-	}
-	d.Sidecar = mergedSidecar
-	d = BindDocument(d)
 	path := m.journalPath(taskID, leaseID)
 	if _, err := os.Lstat(path); err == nil {
-		return m.recoverOne(ctx, path, nil, "")
+		return m.recoverOne(ctx, path, nil, "", scriptBinding)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 
 	fragmentOld, fragmentHad, err := readCurrent(d.FragmentPath)
@@ -323,67 +347,64 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	if err := requirePrevious("fragment", fragmentOld, fragmentHad, d.PreviousFragmentSHA256); err != nil {
 		return err
 	}
+	mergedSidecar, err := mergeSidecar(sidecarOld, sidecarHad, d.Sidecar)
+	if err != nil {
+		return err
+	}
+	d.Sidecar = mergedSidecar
+	d = BindDocument(d)
 	j := journal{Version: journalVersion, TaskID: taskID, LeaseID: leaseID, FragmentPath: d.FragmentPath, SidecarPath: d.SidecarPath,
 		FragmentOld: digestMaybe(fragmentOld, fragmentHad), SidecarOld: digestMaybe(sidecarOld, sidecarHad), FragmentHadOld: fragmentHad, SidecarHadOld: sidecarHad,
-		FragmentNew: digestPtr(d.Fragment), SidecarNew: digestPtr(d.Sidecar), Phase: "prepared"}
+		FragmentNew: digestPtr(d.Fragment), SidecarNew: digestPtr(d.Sidecar), CombinedNew: d.CombinedSHA256, TaskScriptSHA: scriptBinding, Phase: "prepared"}
 	if err := m.writeBackup(path+".fragment.old", fragmentOld, fragmentHad); err != nil {
 		return err
 	}
 	if err := m.writeBackup(path+".sidecar.old", sidecarOld, sidecarHad); err != nil {
 		return err
 	}
-	if err := writeJSON(path, j); err != nil {
+	if err := m.writeJournal(path, j); err != nil {
 		return err
 	}
-	if err := publish(d.FragmentPath, d.Fragment); err != nil {
+	if err := m.publishFile(d.FragmentPath, d.Fragment); err != nil {
 		return m.rollback(ctx, path, &j, d, fmt.Errorf("publish fragment: %w", err))
 	}
 	j.Phase = "fragment_published"
-	if err := writeJSON(path, j); err != nil {
+	if err := m.writeJournal(path, j); err != nil {
 		return err
 	}
-	if err := publish(d.SidecarPath, d.Sidecar); err != nil {
+	if err := m.publishFile(d.SidecarPath, d.Sidecar); err != nil {
 		return m.rollback(ctx, path, &j, d, fmt.Errorf("publish sidecar: %w", err))
 	}
 	j.Phase = "pair_published"
-	if err := writeJSON(path, j); err != nil {
+	if err := m.writeJournal(path, j); err != nil {
 		return err
 	}
 	if err := m.checkRestartVerify(ctx, d); err != nil {
 		return m.rollback(ctx, path, &j, d, err)
 	}
 	j.Phase = "desired_verified"
-	return writeJSON(path, j)
+	return m.writeJournal(path, j)
 }
 
-func sidecarCurrent(path string) *string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	s := string(b)
-	return &s
-}
-
-func mergeSidecar(current, desired *string) (*string, error) {
+func mergeSidecar(current []byte, currentExists bool, desired *string) (*string, error) {
 	if desired == nil {
 		return nil, nil
 	}
 	merged := map[string]any{}
-	if current != nil {
-		if err := json.Unmarshal([]byte(*current), &merged); err != nil {
+	if currentExists {
+		if err := json.Unmarshal(current, &merged); err != nil {
 			return nil, fmt.Errorf("decode current semantic sidecar: %w", err)
+		}
+		if err := validateSidecarObject("current", merged); err != nil {
+			return nil, err
 		}
 	}
 	want := map[string]any{}
 	if err := json.Unmarshal([]byte(*desired), &want); err != nil {
 		return nil, fmt.Errorf("decode desired semantic sidecar: %w", err)
 	}
-	if want["schema"] != "lattice.singbox-metadata.v2" {
-		return nil, fmt.Errorf("desired semantic sidecar has unsupported schema")
-	}
-	if _, ok := want["inbounds"].([]any); !ok {
-		return nil, fmt.Errorf("desired semantic sidecar inbounds must be an array")
+	if err := validateSidecarObject("desired", want); err != nil {
+		return nil, err
 	}
 	for key, value := range want {
 		merged[key] = value
@@ -397,8 +418,33 @@ func mergeSidecar(current, desired *string) (*string, error) {
 	return &s, nil
 }
 
+func validateSidecarObject(label string, value map[string]any) error {
+	if value == nil {
+		return fmt.Errorf("%s semantic sidecar must be a non-null object", label)
+	}
+	if value["schema"] != "lattice.singbox-metadata.v2" {
+		return fmt.Errorf("%s semantic sidecar has unsupported schema", label)
+	}
+	if _, ok := value["inbounds"].([]any); !ok {
+		return fmt.Errorf("%s semantic sidecar inbounds must be an array", label)
+	}
+	return nil
+}
+
 // JournalRef is the bounded identity needed to cross-check outbox authority.
-type JournalRef struct{ TaskID, LeaseID string }
+type JournalRef struct {
+	TaskID, LeaseID string
+	Phase           string
+	Result          *model.TaskResult
+	Terminal        bool
+	TaskScriptSHA   string
+	CombinedSHA256  string
+	JournalSHA256   string
+}
+
+type RecoveryAuthority struct {
+	TaskScriptSHA, CombinedSHA256, Phase, ResultSHA256, JournalSHA256 string
+}
 
 func (m *Manager) Snapshot() ([]JournalRef, error) {
 	entries, err := os.ReadDir(m.dir)
@@ -406,6 +452,7 @@ func (m *Manager) Snapshot() ([]JournalRef, error) {
 		return nil, err
 	}
 	refs := make([]JournalRef, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -417,9 +464,98 @@ func (m *Manager) Snapshot() ([]JournalRef, error) {
 		if err != nil {
 			return nil, err
 		}
-		refs = append(refs, JournalRef{TaskID: j.TaskID, LeaseID: j.LeaseID})
+		key := j.TaskID + "\x00" + j.LeaseID
+		if _, ok := seen[key]; ok {
+			return nil, fmt.Errorf("duplicate linechain journal identity: %s", j.TaskID)
+		}
+		seen[key] = struct{}{}
+		if entry.Name() != filepath.Base(m.journalPath(j.TaskID, j.LeaseID)) {
+			return nil, fmt.Errorf("linechain journal filename does not match task and lease: %s", entry.Name())
+		}
+		if err := m.validateJournal(filepath.Join(m.dir, entry.Name()), j); err != nil {
+			return nil, err
+		}
+		refs = append(refs, JournalRef{TaskID: j.TaskID, LeaseID: j.LeaseID, Phase: j.Phase, Result: j.Result, Terminal: journalTerminal(j.Phase), TaskScriptSHA: j.TaskScriptSHA, CombinedSHA256: j.CombinedNew, JournalSHA256: journalSHA(j)})
 	}
 	return refs, nil
+}
+
+func (m *Manager) validateJournal(path string, j journal) error {
+	if !m.Configured() {
+		return fmt.Errorf("linechain journal exists before runtime layout is configured")
+	}
+	if filepath.Clean(path) != m.journalPath(j.TaskID, j.LeaseID) {
+		return fmt.Errorf("linechain journal filename does not match task and lease")
+	}
+	fragmentName := filepath.Base(j.FragmentPath)
+	if filepath.Clean(j.FragmentPath) != filepath.Join(m.configDir, fragmentName) || !linechainBasenameRE.MatchString(fragmentName) {
+		return fmt.Errorf("linechain journal fragment path is outside local authority")
+	}
+	if filepath.Clean(j.SidecarPath) != m.sidecarPath {
+		return fmt.Errorf("linechain journal sidecar path is outside local authority")
+	}
+	validPhase := map[string]bool{
+		"prepared": true, "fragment_published": true, "pair_published": true, "desired_verified": true,
+		"old_restored": true, "terminal_desired": true, "terminal_old": true,
+	}
+	if !validPhase[j.Phase] {
+		return fmt.Errorf("linechain journal has unknown phase %q", j.Phase)
+	}
+	terminal := journalTerminal(j.Phase)
+	if terminal != (j.Result != nil) {
+		return fmt.Errorf("linechain journal phase/result shape is inconsistent")
+	}
+	if j.Result != nil && (j.Result.TaskID != j.TaskID || j.Result.LeaseID != j.LeaseID || j.Result.FinishedAt.IsZero()) {
+		return fmt.Errorf("linechain journal terminal result does not match its identity")
+	}
+	if (j.FragmentHadOld && !validSHA(j.FragmentOld)) || (!j.FragmentHadOld && j.FragmentOld != "") ||
+		(j.SidecarHadOld && !validSHA(j.SidecarOld)) || (!j.SidecarHadOld && j.SidecarOld != "") ||
+		(j.FragmentNew != "" && !validSHA(j.FragmentNew)) || !validSHA(j.SidecarNew) || !validSHA(j.CombinedNew) || !validSHA(j.TaskScriptSHA) {
+		return fmt.Errorf("linechain journal artifact digest shape is invalid")
+	}
+	if terminal {
+		return nil
+	}
+	for _, backup := range []struct {
+		path   string
+		exists bool
+		want   string
+	}{
+		{path: path + ".fragment.old", exists: j.FragmentHadOld, want: j.FragmentOld},
+		{path: path + ".sidecar.old", exists: j.SidecarHadOld, want: j.SidecarOld},
+	} {
+		data, exists, err := readValidatedFile(backup.path, true)
+		if err != nil {
+			return err
+		}
+		if exists != backup.exists || (exists && digest(data) != backup.want) {
+			return fmt.Errorf("linechain journal backup shape does not match authority")
+		}
+	}
+	return nil
+}
+
+func journalTerminal(phase string) bool {
+	return phase == "terminal_desired" || phase == "terminal_old"
+}
+
+func resultSHA(result *model.TaskResult) string {
+	if result == nil {
+		return ""
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	return digest(b)
+}
+
+func journalSHA(j journal) string {
+	b, err := json.Marshal(j)
+	if err != nil {
+		return ""
+	}
+	return digest(b)
 }
 
 func (m *Manager) validateDocument(d Document) error {
@@ -471,7 +607,7 @@ func (m *Manager) validateDocument(d Document) error {
 		return fmt.Errorf("fragment and sidecar paths must differ")
 	}
 	fragmentName := filepath.Base(d.FragmentPath)
-	if filepath.Dir(filepath.Clean(d.FragmentPath)) != configDir || !strings.HasPrefix(fragmentName, "lattice-linechain-") || filepath.Ext(fragmentName) != ".json" {
+	if filepath.Dir(filepath.Clean(d.FragmentPath)) != configDir || !linechainBasenameRE.MatchString(fragmentName) {
 		return fmt.Errorf("fragment path is outside the server-owned linechain config namespace")
 	}
 	wantSidecar := m.sidecarPath
@@ -493,16 +629,16 @@ func (m *Manager) validateDocument(d Document) error {
 }
 
 func (m *Manager) checkRestartVerify(ctx context.Context, d Document) error {
-	if out, err := m.run(ctx, m.singBoxBinary, "check", "-C", m.configDir); err != nil {
-		return fmt.Errorf("sing-box check failed: %s", bounded(out))
+	if _, err := m.run(ctx, m.singBoxBinary, "check", "-C", m.configDir); err != nil {
+		return fmt.Errorf("sing-box check failed")
 	}
 	restart := m.restartCommand
-	if out, err := m.run(ctx, restart[0], restart[1:]...); err != nil {
-		return fmt.Errorf("sing-box restart failed: %s", bounded(out))
+	if _, err := m.run(ctx, restart[0], restart[1:]...); err != nil {
+		return fmt.Errorf("sing-box restart failed")
 	}
 	verify := m.verifyCommand
-	if out, err := m.run(ctx, verify[0], verify[1:]...); err != nil {
-		return fmt.Errorf("sing-box active verification failed: %s", bounded(out))
+	if _, err := m.run(ctx, verify[0], verify[1:]...); err != nil {
+		return fmt.Errorf("sing-box active verification failed")
 	}
 	return nil
 }
@@ -530,10 +666,25 @@ func (m *Manager) ResolveAfterRun(ctx context.Context, task model.Task, result m
 		if !pairMatches(j, true) {
 			return result, fmt.Errorf("desired linechain pair is not exact")
 		}
-		j.Phase = "terminal_desired"
+		if verifyErr := m.checkRestartVerify(ctx, Document{}); verifyErr == nil {
+			j.Phase = "terminal_desired"
+		} else {
+			if err := m.restoreOld(path, &j); err != nil {
+				return result, fmt.Errorf("post-run desired runtime verification failed: %v; restore old pair: %w", verifyErr, err)
+			}
+			if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+				return result, fmt.Errorf("post-run desired runtime verification failed: %v; old runtime recovery failed: %w", verifyErr, err)
+			}
+			result.ExitCode = -1
+			result.Error = "desired linechain runtime verification failed after helper return; exact old pair restored and verified"
+			j.Phase = "terminal_old"
+		}
 	} else {
 		if err := m.restoreOld(path, &j); err != nil {
 			return result, err
+		}
+		if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+			return result, fmt.Errorf("verify restored old linechain runtime after helper failure: %w", err)
 		}
 		if result.ExitCode == 0 {
 			result.ExitCode = -1
@@ -544,7 +695,7 @@ func (m *Manager) ResolveAfterRun(ctx context.Context, task model.Task, result m
 		j.Phase = "terminal_old"
 	}
 	j.Result = &result
-	if err := writeJSON(path, j); err != nil {
+	if err := m.writeJournal(path, j); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -554,6 +705,10 @@ func (m *Manager) ResolveAfterRun(ctx context.Context, task model.Task, result m
 // complete is called only with a stable exact result; cleanup follows its
 // confirmed durable completion.
 func (m *Manager) RequireRecovered(ctx context.Context, complete func(model.TaskResult) error, nodeID string) error {
+	return m.RequireRecoveredAuthorized(ctx, complete, nodeID, nil)
+}
+
+func (m *Manager) RequireRecoveredAuthorized(ctx context.Context, complete func(model.TaskResult) error, nodeID string, authority map[string]RecoveryAuthority) error {
 	entries, err := os.ReadDir(m.dir)
 	if err != nil {
 		return err
@@ -562,24 +717,60 @@ func (m *Manager) RequireRecovered(ctx context.Context, complete func(model.Task
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		if err := m.recoverOne(ctx, filepath.Join(m.dir, entry.Name()), complete, nodeID); err != nil {
+		path := filepath.Join(m.dir, entry.Name())
+		var expected *RecoveryAuthority
+		if authority != nil {
+			j, err := readJournal(path)
+			if err != nil {
+				return err
+			}
+			value, ok := authority[j.TaskID+"\x00"+j.LeaseID]
+			if !ok {
+				return fmt.Errorf("linechain recovery journal is outside captured authority")
+			}
+			expected = &value
+		}
+		if err := m.recoverOne(ctx, path, complete, nodeID, "", expected); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (m *Manager) recoverOne(ctx context.Context, path string, complete func(model.TaskResult) error, nodeID string) error {
+func (m *Manager) recoverOne(ctx context.Context, path string, complete func(model.TaskResult) error, nodeID, expectedScriptSHA string, expected ...*RecoveryAuthority) error {
 	j, err := readJournal(path)
 	if err != nil {
 		return err
 	}
+	if err := m.validateJournal(path, j); err != nil {
+		return err
+	}
+	if expectedScriptSHA != "" && j.TaskScriptSHA != expectedScriptSHA {
+		return fmt.Errorf("linechain retry task script does not match journal authority")
+	}
+	if len(expected) > 0 && expected[0] != nil {
+		want := expected[0]
+		if journalSHA(j) != want.JournalSHA256 || j.TaskScriptSHA != want.TaskScriptSHA || j.CombinedNew != want.CombinedSHA256 || j.Phase != want.Phase || resultSHA(j.Result) != want.ResultSHA256 {
+			return fmt.Errorf("linechain journal changed after authority capture")
+		}
+	}
 	if j.Result == nil {
 		result := model.TaskResult{TaskID: j.TaskID, LeaseID: j.LeaseID, NodeID: nodeID, ExitCode: -1, Error: "linechain transaction interrupted; exact old pair restored", FinishedAt: time.Now().UTC()}
 		if j.Phase == "desired_verified" && pairMatches(j, true) {
-			result.ExitCode = 0
-			result.Error = ""
-			j.Phase = "terminal_desired"
+			if verifyErr := m.checkRestartVerify(ctx, Document{}); verifyErr == nil {
+				result.ExitCode = 0
+				result.Error = ""
+				j.Phase = "terminal_desired"
+			} else {
+				if err := m.restoreOld(path, &j); err != nil {
+					return fmt.Errorf("recover desired runtime verification failed: %v; restore old pair: %w", verifyErr, err)
+				}
+				if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+					return fmt.Errorf("recover desired runtime verification failed: %v; old runtime recovery failed: %w", verifyErr, err)
+				}
+				result.Error = "recovered desired runtime verification failed; exact old pair restored and verified"
+				j.Phase = "terminal_old"
+			}
 		} else {
 			if err := m.restoreOld(path, &j); err != nil {
 				return err
@@ -590,7 +781,7 @@ func (m *Manager) recoverOne(ctx context.Context, path string, complete func(mod
 			j.Phase = "terminal_old"
 		}
 		j.Result = &result
-		if err := writeJSON(path, j); err != nil {
+		if err := m.writeJournal(path, j); err != nil {
 			return err
 		}
 	}
@@ -618,7 +809,7 @@ func (m *Manager) rollback(ctx context.Context, path string, j *journal, d Docum
 		return fmt.Errorf("%v; rollback failed: %w", cause, err)
 	}
 	if err := m.checkRestartVerify(ctx, d); err != nil {
-		return fmt.Errorf("%v; exact old pair restored but service recovery failed: %s", cause, bounded([]byte(err.Error())))
+		return fmt.Errorf("%v; exact old pair restored but service recovery failed: %v", cause, err)
 	}
 	return cause
 }
@@ -630,18 +821,21 @@ func (m *Manager) restoreOld(path string, j *journal) error {
 		want        string
 	}{{j.FragmentPath, path + ".fragment.old", j.FragmentHadOld, j.FragmentOld}, {j.SidecarPath, path + ".sidecar.old", j.SidecarHadOld, j.SidecarOld}} {
 		if a.had {
-			data, err := os.ReadFile(a.backup)
+			data, exists, err := readValidatedFile(a.backup, true)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				return fmt.Errorf("required linechain backup is missing")
 			}
 			if digest(data) != a.want {
 				return fmt.Errorf("backup digest mismatch")
 			}
 			s := string(data)
-			if err := publish(a.dst, &s); err != nil {
+			if err := m.publishFile(a.dst, &s); err != nil {
 				return err
 			}
-		} else if err := publish(a.dst, nil); err != nil {
+		} else if err := m.publishFile(a.dst, nil); err != nil {
 			return err
 		}
 	}
@@ -649,7 +843,7 @@ func (m *Manager) restoreOld(path string, j *journal) error {
 		return fmt.Errorf("restored pair digest mismatch")
 	}
 	j.Phase = "old_restored"
-	return writeJSON(path, *j)
+	return m.writeJournal(path, *j)
 }
 
 func pairMatches(j journal, desired bool) bool {
@@ -665,17 +859,29 @@ func pairMatches(j journal, desired bool) bool {
 }
 
 func readCurrent(path string) ([]byte, bool, error) {
-	info, err := os.Lstat(path)
+	return readValidatedFile(path, false)
+}
+
+func readValidatedFile(path string, private bool) ([]byte, bool, error) {
+	f, err := openNoFollow(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ownedPath(info) {
-		return nil, false, fmt.Errorf("artifact is not a regular file: %s", path)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, err
 	}
-	b, err := os.ReadFile(path)
+	if !info.Mode().IsRegular() || !ownedPath(info) || (private && info.Mode().Perm()&0o077 != 0) {
+		return nil, false, fmt.Errorf("linechain file is not a trusted regular file: %s", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxArtifactSize+1))
+	if err == nil && len(b) > maxArtifactSize {
+		return nil, false, fmt.Errorf("linechain file exceeds %d bytes: %s", maxArtifactSize, path)
+	}
 	return b, true, err
 }
 func requirePrevious(name string, data []byte, exists bool, want string) error {
@@ -706,13 +912,6 @@ func digestMaybe(b []byte, exists bool) string {
 func validSHA(s string) bool {
 	b, e := hex.DecodeString(s)
 	return e == nil && len(b) == sha256.Size && s == strings.ToLower(s)
-}
-func bounded(b []byte) string {
-	b = bytes.TrimSpace(b)
-	if len(b) > maxDiagnostic {
-		b = b[:maxDiagnostic]
-	}
-	return string(b)
 }
 func (m *Manager) writeBackup(path string, data []byte, exists bool) error {
 	if !exists {
@@ -794,19 +993,36 @@ func writeJSON(path string, v any) error {
 	return writeFile(path, b)
 }
 func readJournal(path string) (journal, error) {
-	info, err := os.Lstat(path)
+	f, err := openNoFollow(path)
 	if err != nil {
 		return journal{}, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return journal{}, err
+	}
+	if !info.Mode().IsRegular() || !ownedPath(info) || info.Mode().Perm()&0o077 != 0 {
 		return journal{}, fmt.Errorf("invalid linechain journal")
 	}
-	b, err := os.ReadFile(path)
+	b, err := io.ReadAll(io.LimitReader(f, maxDocumentSize+1))
 	if err != nil {
 		return journal{}, err
 	}
+	if len(b) > maxDocumentSize {
+		return journal{}, fmt.Errorf("linechain journal exceeds %d bytes", maxDocumentSize)
+	}
 	var j journal
-	if err = json.Unmarshal(b, &j); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&j); err != nil {
+		return j, err
+	}
+	var trailing any
+	if err = dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return j, fmt.Errorf("linechain journal has trailing data")
+		}
 		return j, err
 	}
 	if j.Version != journalVersion || j.TaskID == "" || j.LeaseID == "" {

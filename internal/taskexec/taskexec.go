@@ -3,6 +3,8 @@ package taskexec
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -297,7 +299,14 @@ func (r Runner) effectiveUID() int {
 	return os.Geteuid()
 }
 
-func (r Runner) Run(task model.Task) model.TaskResult {
+func (r Runner) Run(task model.Task) model.TaskResult { return r.run(task, false) }
+
+// RunLinechain runs an already validated E3 lease with the private host-local
+// linechain authority in its environment. Callers must select this path from
+// durable protocol metadata, never from script contents.
+func (r Runner) RunLinechain(task model.Task) model.TaskResult { return r.run(task, true) }
+
+func (r Runner) run(task model.Task, trustedLinechain bool) model.TaskResult {
 	start := time.Now().UTC()
 	result := model.TaskResult{
 		TaskID:    task.ID,
@@ -398,11 +407,15 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	if filepath.IsAbs(r.AgentBinary) {
 		cmd.Env = append(cmd.Env, "LATTICE_AGENT_BIN="+r.AgentBinary)
 	}
-	if filepath.IsAbs(r.LinechainTxnDir) {
+	if trustedLinechain && filepath.IsAbs(r.LinechainTxnDir) {
 		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_TXN_DIR="+r.LinechainTxnDir)
 	}
-	if filepath.IsAbs(r.LinechainConfigDir) && filepath.IsAbs(r.LinechainSidecarPath) {
+	if trustedLinechain && filepath.IsAbs(r.LinechainConfigDir) && filepath.IsAbs(r.LinechainSidecarPath) {
 		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_CONFIG_DIR="+r.LinechainConfigDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+r.LinechainSidecarPath)
+	}
+	if trustedLinechain {
+		sum := sha256.Sum256([]byte(task.Script))
+		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+hex.EncodeToString(sum[:]))
 	}
 
 	var stdout, stderr cappedBuffer

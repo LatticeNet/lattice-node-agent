@@ -1,6 +1,8 @@
 package taskexec
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -198,6 +200,31 @@ func TestRunnerPropagatesAbsoluteAgentBinary(t *testing.T) {
 	})
 	if result.ExitCode != 0 || result.Stdout != agentBinary {
 		t.Fatalf("agent binary env = %#v, want %q", result, agentBinary)
+	}
+}
+
+func TestRunnerRestrictsLinechainEnvironmentToTrustedPath(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	if err := os.Mkdir(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{
+		AllowExec: true, AllowRoot: true, WorkdirRoot: work,
+		AgentBinary: "/absolute/lattice-agent", LinechainTxnDir: filepath.Join(root, "txn"),
+		LinechainConfigDir: filepath.Join(root, "conf"), LinechainSidecarPath: filepath.Join(root, "meta.json"),
+	}
+	task := model.Task{ID: "task-env", LeaseID: "lease-env", Interpreter: "sh", TimeoutSec: 10, OutputLimit: 4096,
+		Script: `printf '%s|%s|%s|%s|%s' "$LATTICE_AGENT_BIN" "$LATTICE_LINECHAIN_TXN_DIR" "$LATTICE_LINECHAIN_CONFIG_DIR" "$LATTICE_LINECHAIN_SIDECAR_PATH" "$LATTICE_LINECHAIN_TASK_SCRIPT_SHA256"`}
+	ordinary := r.Run(task)
+	if ordinary.ExitCode != 0 || ordinary.Stdout != "/absolute/lattice-agent||||" {
+		t.Fatalf("ordinary task environment leaked linechain authority: %+v", ordinary)
+	}
+	trusted := r.RunLinechain(task)
+	sum := sha256.Sum256([]byte(task.Script))
+	want := strings.Join([]string{r.AgentBinary, r.LinechainTxnDir, r.LinechainConfigDir, r.LinechainSidecarPath, hex.EncodeToString(sum[:])}, "|")
+	if trusted.ExitCode != 0 || trusted.Stdout != want {
+		t.Fatalf("trusted E3 environment = %q result=%+v, want %q", trusted.Stdout, trusted, want)
 	}
 }
 

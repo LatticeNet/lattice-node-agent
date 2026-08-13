@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -38,11 +39,22 @@ const (
 	linechainE2ECrashMarkerEnv = "LATTICE_LINECHAIN_E2E_CRASH_MARKER"
 )
 
+var managedE2EProcesses = struct {
+	sync.Mutex
+	done map[int]<-chan error
+}{done: make(map[int]<-chan error)}
+
 // TestLinechainRealSingBoxE2E is invoked by scripts/test-linechain-e2e.sh. The
 // script makes the real 1.13.x binary mandatory, so this test never skips.
 func TestLinechainRealSingBoxE2E(t *testing.T) {
 	bin := requireSingBoxE2EBinary(t)
-	root := t.TempDir()
+	root := os.Getenv(linechainE2ERootEnv)
+	if !filepath.IsAbs(root) {
+		t.Fatalf("%s must be an absolute test root", linechainE2ERootEnv)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	origin := startEchoOrigin(t)
 	aPort, bPort, clientPort := freePort(t), freePort(t), freePort(t)
 	observer := startTCPObserver(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)))
@@ -126,7 +138,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	// must restore and restart B before any inventory, traffic, or result callback.
 	crashDoc := bindE2EDocument("create", basename, "", &fragment, &sidecar)
 	crashBytes := marshalE2EDocument(t, crashDoc)
-	apply := exec.Command(os.Args[0], "-test.run=^TestLinechainE2EApplyHelper$", "--")
+	apply := exec.Command(os.Args[0], "-test.run=^TestLinechainE2EApplyHelper$", "--", root)
 	crashMarker := filepath.Join(root, "restart-blocked")
 	apply.Env = append(os.Environ(),
 		linechainE2EBinEnv+"="+bin,
@@ -136,6 +148,7 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 		linechainE2EBPortEnv+"="+strconv.Itoa(bPort),
 		linechainE2ETaskEnv+"=crash-task",
 		linechainE2ELeaseEnv+"=crash-lease",
+		"LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+digestText("e2e-helper-script"),
 		linechainE2ECrashMarkerEnv+"="+crashMarker,
 	)
 	apply.Stdin = bytes.NewReader(crashBytes)
@@ -147,12 +160,22 @@ func TestLinechainRealSingBoxE2E(t *testing.T) {
 	}
 	applyDone := make(chan error, 1)
 	go func() { applyDone <- apply.Wait() }()
+	var cleanupApply sync.Once
+	stopApply := func() {
+		cleanupApply.Do(func() {
+			_ = syscall.Kill(-apply.Process.Pid, syscall.SIGKILL)
+			select {
+			case <-applyDone:
+			case <-time.After(5 * time.Second):
+				t.Errorf("apply helper did not exit after process-group kill")
+			}
+			killMarkerProcess(t, crashMarker)
+		})
+	}
+	t.Cleanup(stopApply)
 	waitForFileOrProcess(t, crashMarker, applyDone, &applyLog)
 	waitForExactPair(t, fragmentPath, fragment, sidecarPath, sidecar)
-	if err := syscall.Kill(-apply.Process.Pid, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill apply helper process group: %v", err)
-	}
-	<-applyDone
+	stopApply()
 
 	order := []string{}
 	if err := m.RequireRecovered(context.Background(), func(result model.TaskResult) error {
@@ -220,7 +243,7 @@ func TestLinechainE2EApplyHelper(t *testing.T) {
 	}
 	defer m.Close()
 	configureE2EManager(t, m)
-	if err := m.Apply(context.Background(), os.Stdin, os.Getenv(linechainE2ETaskEnv), os.Getenv(linechainE2ELeaseEnv)); err != nil {
+	if err := m.Apply(context.Background(), os.Stdin, os.Getenv(linechainE2ETaskEnv), os.Getenv(linechainE2ELeaseEnv), os.Getenv("LATTICE_LINECHAIN_TASK_SCRIPT_SHA256")); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -233,7 +256,7 @@ func TestLinechainE2ERestartHelper(t *testing.T) {
 		return
 	}
 	if marker := os.Getenv(linechainE2ECrashMarkerEnv); marker != "" {
-		if err := os.WriteFile(marker, []byte("pair_published\n"), 0o600); err != nil {
+		if err := os.WriteFile(marker, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		for {
@@ -328,8 +351,9 @@ func configureE2EManager(t *testing.T, m *linechain.Manager) {
 	if err := m.ConfigureLayout(os.Getenv(linechainE2EConfigEnv), os.Getenv(linechainE2ESidecarEnv)); err != nil {
 		t.Fatal(err)
 	}
-	restart := []string{os.Args[0], "-test.run=^TestLinechainE2ERestartHelper$", "--"}
-	verify := []string{os.Args[0], "-test.run=^TestLinechainE2EActiveHelper$", "--"}
+	root := os.Getenv(linechainE2ERootEnv)
+	restart := []string{os.Args[0], "-test.run=^TestLinechainE2ERestartHelper$", "--", root}
+	verify := []string{os.Args[0], "-test.run=^TestLinechainE2EActiveHelper$", "--", root}
 	if err := m.ConfigureCommands(os.Getenv(linechainE2EBinEnv), restart, verify); err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +361,7 @@ func configureE2EManager(t *testing.T, m *linechain.Manager) {
 
 func applyAndResolve(t *testing.T, m *linechain.Manager, document []byte, taskID, leaseID string) {
 	t.Helper()
-	if err := m.Apply(context.Background(), bytes.NewReader(document), taskID, leaseID); err != nil {
+	if err := m.Apply(context.Background(), bytes.NewReader(document), taskID, leaseID, digestText("e2e-direct:"+taskID)); err != nil {
 		t.Fatal(err)
 	}
 	result, err := m.ResolveAfterRun(context.Background(), model.Task{ID: taskID, LeaseID: leaseID}, model.TaskResult{TaskID: taskID, LeaseID: leaseID, ExitCode: 0})
@@ -536,6 +560,11 @@ func restartManagedSingBox(bin, root, name, configDir string, port int) error {
 		_ = logFile.Close()
 		return err
 	}
+	done := make(chan error, 1)
+	managedE2EProcesses.Lock()
+	managedE2EProcesses.done[cmd.Process.Pid] = done
+	managedE2EProcesses.Unlock()
+	go func() { done <- cmd.Wait() }()
 	_ = logFile.Close()
 	if err := os.WriteFile(filepath.Join(root, name+".pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -565,9 +594,16 @@ func killManagedSingBox(root, name string) error {
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 		return err
 	}
+	managedE2EProcesses.Lock()
+	done := managedE2EProcesses.done[pid]
+	managedE2EProcesses.Unlock()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+		if managedProcessExited(pid, done) {
+			managedE2EProcesses.Lock()
+			delete(managedE2EProcesses.done, pid)
+			managedE2EProcesses.Unlock()
+			_ = os.Remove(pidPath)
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -575,7 +611,58 @@ func killManagedSingBox(root, name string) error {
 	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 		return err
 	}
-	return nil
+	killDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(killDeadline) {
+		if managedProcessExited(pid, done) {
+			managedE2EProcesses.Lock()
+			delete(managedE2EProcesses.done, pid)
+			managedE2EProcesses.Unlock()
+			_ = os.Remove(pidPath)
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("%s process %d remained after SIGKILL", name, pid)
+}
+
+func managedProcessExited(pid int, done <-chan error) bool {
+	if done != nil {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	return syscall.Kill(pid, 0) == syscall.ESRCH
+}
+
+func killMarkerProcess(t *testing.T, marker string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(marker)
+		if os.IsNotExist(err) {
+			return
+		}
+		if err != nil {
+			t.Errorf("read helper marker: %v", err)
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil || pid <= 1 {
+			t.Errorf("invalid helper marker %q", raw)
+			return
+		}
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			_ = os.Remove(marker)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("restart helper from %s remained after cleanup", marker)
 }
 
 func verifyManagedSingBox(root, name string, port int) error {
