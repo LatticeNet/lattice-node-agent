@@ -250,7 +250,7 @@ func (s *Store) RecoverInterrupted(nodeID string) error {
 		if entry.State != stateLeased {
 			continue
 		}
-		if entry.DurableProtocol == "linechain-e3-v1" {
+		if entry.DurableProtocol == "linechain-e3-v2" {
 			return fmt.Errorf("leased E3 task %s requires linechain journal recovery before generic outbox recovery", entry.Task.ID)
 		}
 		now := time.Now().UTC()
@@ -389,6 +389,9 @@ func (s *Store) read(key string) (Entry, error) {
 	}
 	if entry.Version != entryVersion || entry.Task.ID == "" || entry.Task.LeaseID == "" {
 		return Entry{}, fmt.Errorf("invalid task result journal: %s", path)
+	}
+	if strings.HasPrefix(entry.DurableProtocol, "linechain-e3-") && entry.DurableProtocol != "linechain-e3-v2" {
+		return Entry{}, fmt.Errorf("unsupported persisted linechain durable protocol %q", entry.DurableProtocol)
 	}
 	if key != entryKey(entry.Task.ID, entry.Task.LeaseID) {
 		return Entry{}, fmt.Errorf("task result journal key mismatch: %s", path)

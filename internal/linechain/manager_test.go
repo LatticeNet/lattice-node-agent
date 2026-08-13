@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,9 +28,11 @@ func TestApplyCreateResolveAndCleanup(t *testing.T) {
 	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(sidecarPath, []byte(testCurrentSidecar(nil, map[string]any{"credential": "sidecar-secret"})), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	fragment := `{"outbounds":[{"type":"direct","tag":"chain"}]}`
-	sidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[],"credential":"sidecar-secret"}`
-	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &fragment, Sidecar: &sidecar}
+	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &fragment, SidecarPatch: testSidecarPatch("create")}
 	applyDoc(t, m, doc, "task-a", "lease-a")
 	result, err := m.ResolveAfterRun(context.Background(), model.Task{ID: "task-a", LeaseID: "lease-a"}, model.TaskResult{TaskID: "task-a", LeaseID: "lease-a", ExitCode: 0, FinishedAt: time.Now().UTC()})
 	if err != nil || result.ExitCode != 0 {
@@ -63,8 +66,7 @@ func TestApplyRejectsUnexpectedExistingAndSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	desired := "new"
-	desiredSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &desired, Sidecar: &desiredSidecar}
+	doc := Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &desired, SidecarPatch: testSidecarPatch("create")}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "unexpected existing") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -91,14 +93,14 @@ func TestCheckFailureRestoresExactOldPair(t *testing.T) {
 	if err := m.ConfigureCommands("false", []string{"true"}, []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
-	oldFragment, oldSidecar := "old-fragment", `{"schema":"lattice.singbox-metadata.v2","inbounds":[],"ordinary":"old"}`
+	oldFragment, oldSidecar := "old-fragment", testCurrentSidecar(stringPtr(newUUID), map[string]any{"ordinary": "old"})
 	for path, data := range map[string]string{fragmentPath: oldFragment, sidecarPath: oldSidecar} {
 		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	newFragment, newSidecar := "new-fragment", `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	doc := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: digest([]byte(oldFragment)), Fragment: &newFragment, Sidecar: &newSidecar}
+	newFragment := "new-fragment"
+	doc := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: stringPtr(digest([]byte(oldFragment))), Fragment: &newFragment, SidecarPatch: testSidecarPatch("replace")}
 	if err := applyDocErr(m, doc, "task-a", "lease-a"); err == nil || !strings.Contains(err.Error(), "check failed") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -119,8 +121,8 @@ func TestRecoveryProducesStableFailureAndCleansAfterCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	j := journal{
-		Version: 1, TaskID: "task-a", LeaseID: "lease-a", FragmentPath: fragmentPath, SidecarPath: sidecarPath,
-		FragmentNew: digest([]byte("new-fragment")), SidecarNew: digest([]byte("new-sidecar")), CombinedNew: digest([]byte("combined")), TaskScriptSHA: digest(nil), Phase: "prepared",
+		Version: journalVersion, TaskID: "task-a", LeaseID: "lease-a", FragmentPath: fragmentPath, SidecarPath: sidecarPath,
+		FragmentOutputSHA256: digest([]byte("new-fragment")), SidecarOutputSHA256: digest([]byte("new-sidecar")), ArtifactSHA256: digest([]byte("combined")), SidecarPatchSHA256: digest([]byte("patch")), TaskScriptSHA: digest(nil), Phase: "prepared",
 	}
 	path := m.journalPath(j.TaskID, j.LeaseID)
 	if err := writeJSON(path, j); err != nil {
@@ -176,12 +178,11 @@ func TestValidateDocumentBindsOwnedPaths(t *testing.T) {
 	configDir := filepath.Join(root, "conf")
 	mustMkdir(t, configDir)
 	fragment := "{}"
-	sidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
 	if err := m.ConfigureLayout(configDir, filepath.Join(root, "lattice-metadata.json")); err != nil {
 		t.Fatal(err)
 	}
 	basename := "lattice-linechain-0123456789abcdef0123.json"
-	valid := BindDocument(Document{Version: 2, Operation: "create", ConfigDir: m.configDir, FragmentBasename: basename, FragmentPath: filepath.Join(m.configDir, basename), SidecarPath: m.sidecarPath, Fragment: &fragment, Sidecar: &sidecar})
+	valid := BindDocument(Document{Version: 2, Operation: "create", ConfigDir: m.configDir, FragmentBasename: basename, FragmentPath: filepath.Join(m.configDir, basename), SidecarPath: m.sidecarPath, Fragment: &fragment, SidecarPatch: testSidecarPatch("create")})
 	if err := m.validateDocument(valid); err != nil {
 		t.Fatal(err)
 	}
@@ -223,11 +224,14 @@ func TestApplyRejectsTrailingAndLegacyWireFields(t *testing.T) {
 	if err := m.ConfigureLayout(configDir, filepath.Join(dir, "lattice-metadata.json")); err != nil {
 		t.Fatal(err)
 	}
-	fragment, sidecar := `{}`, `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	d := BindDocument(Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, Sidecar: &sidecar})
-	base, _ := json.Marshal(wireDocumentV2{Version: d.Version, Operation: d.Operation, FragmentBasename: d.FragmentBasename, Fragment: d.Fragment, Sidecar: d.Sidecar, FragmentSHA256: d.FragmentSHA256, SidecarSHA256: d.SidecarSHA256, CombinedSHA256: d.CombinedSHA256})
+	fragment := `{}`
+	d := BindDocument(Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testSidecarPatch("create")})
+	base, _ := json.Marshal(wireDocumentV2{Version: d.Version, DurableProtocol: d.DurableProtocol, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		Fragment: d.Fragment, SidecarPatch: d.SidecarPatch, PreviousFragmentSHA256: d.PreviousFragmentSHA256,
+		FragmentSHA256: d.FragmentSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256, ArtifactSHA256: d.ArtifactSHA256})
 	for name, raw := range map[string]string{
 		"trailing":                       string(base) + ` {}`,
+		"duplicate known field":          strings.Replace(string(base), `"version":2`, `"version":2,"version":2`, 1),
 		"legacy config path":             strings.TrimSuffix(string(base), "}") + `,"config_dir":""}`,
 		"legacy fragment path":           strings.TrimSuffix(string(base), "}") + `,"fragment_path":""}`,
 		"legacy sidecar path":            strings.TrimSuffix(string(base), "}") + `,"sidecar_path":""}`,
@@ -265,7 +269,7 @@ func TestSemanticSidecarOverlayPreservesOrdinaryFields(t *testing.T) {
 	configDir := filepath.Join(dir, "conf")
 	mustMkdir(t, configDir)
 	sidecarPath := filepath.Join(dir, "lattice-metadata.json")
-	if err := os.WriteFile(sidecarPath, []byte(`{"schema":"lattice.singbox-metadata.v2","ordinary":{"owner":"sb"},"inbounds":[{"tag":"old"}]}`), 0o600); err != nil {
+	if err := os.WriteFile(sidecarPath, []byte(testCurrentSidecar(nil, map[string]any{"ordinary": map[string]any{"owner": "sb"}})), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
@@ -274,8 +278,8 @@ func TestSemanticSidecarOverlayPreservesOrdinaryFields(t *testing.T) {
 	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
-	fragment, sidecar := `{}`, `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"managed"}]}`
-	d := Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, Sidecar: &sidecar}
+	fragment := `{}`
+	d := Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testSidecarPatch("create")}
 	applyDoc(t, m, d, "task-overlay", "lease-overlay")
 	b, err := os.ReadFile(sidecarPath)
 	if err != nil {
@@ -352,8 +356,8 @@ func TestApplyRejectsSymlinkAndInvalidCurrentSidecar(t *testing.T) {
 			if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
 				t.Fatal(err)
 			}
-			fragment, sidecar := `{}`, `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-			d := Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, Sidecar: &sidecar}
+			fragment := `{}`
+			d := Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testSidecarPatch("create")}
 			if err := applyDocErr(m, d, "task-"+name, "lease"); err == nil {
 				t.Fatal("invalid current sidecar accepted")
 			}
@@ -438,17 +442,6 @@ func TestSnapshotRejectsSymlinkFIFOOwnerAndMode(t *testing.T) {
 	}
 }
 
-func TestBindDocumentMatchesCrossContractDigestVector(t *testing.T) {
-	fragment := "{\"outbounds\":[]}\n"
-	sidecar := "{\"inbounds\":[],\"schema\":\"lattice.singbox-metadata.v2\"}\n"
-	d := BindDocument(Document{Fragment: &fragment, Sidecar: &sidecar})
-	if d.FragmentSHA256 != "0f4c04e3dff1fb9208c856b6de82f766bf6d99ff25ef30c68e076075a8d44b28" ||
-		d.SidecarSHA256 != "f2eee32252fab6c99a728ebb1f16122798aff8609ace953f5f338d8f80b6b979" ||
-		d.CombinedSHA256 != "155ec43b76241d49eac9d3a1415df33d84571f02363ac42bae04b0627e2ab848" {
-		t.Fatalf("cross-contract digest drift: %+v", d)
-	}
-}
-
 func TestRecoveryPhasesRestoreOrCommitExactPair(t *testing.T) {
 	for _, tc := range []struct {
 		phase       string
@@ -475,7 +468,7 @@ func TestRecoveryPhasesRestoreOrCommitExactPair(t *testing.T) {
 				t.Fatal(err)
 			}
 			oldFragment := []byte("old-fragment")
-			oldSidecar := []byte(`{"schema":"lattice.singbox-metadata.v2","inbounds":[],"ordinary":true}`)
+			oldSidecar := []byte(testCurrentSidecar(stringPtr(newUUID), map[string]any{"ordinary": true}))
 			newFragment := []byte("new-fragment")
 			newSidecar := []byte(`{"inbounds":[],"schema":"lattice.singbox-metadata.v2"}` + "\n")
 			currentFragment, currentSidecar := newFragment, newSidecar
@@ -492,8 +485,8 @@ func TestRecoveryPhasesRestoreOrCommitExactPair(t *testing.T) {
 			}
 			j := journal{
 				Version: journalVersion, TaskID: "task-" + tc.phase, LeaseID: "lease", FragmentPath: fragmentPath, SidecarPath: sidecarPath,
-				FragmentOld: digest(oldFragment), SidecarOld: digest(oldSidecar), FragmentNew: digest(newFragment), SidecarNew: digest(newSidecar),
-				CombinedNew: digest(append(append(append([]byte{}, newFragment...), 0), newSidecar...)), TaskScriptSHA: digest(nil),
+				FragmentOld: digest(oldFragment), SidecarOld: digest(oldSidecar), FragmentOutputSHA256: digest(newFragment), SidecarOutputSHA256: digest(newSidecar),
+				ArtifactSHA256: digest(append(append(append([]byte{}, newFragment...), 0), newSidecar...)), SidecarPatchSHA256: digest([]byte("patch")), TaskScriptSHA: digest(nil),
 				FragmentHadOld: true, SidecarHadOld: true, Phase: tc.phase,
 			}
 			path := m.journalPath(j.TaskID, j.LeaseID)
@@ -544,7 +537,7 @@ func TestJournalAuthorityRejectsCorruptSemanticsAndUnconfiguredRecovery(t *testi
 	for name, mutate := range map[string]func(*journal){
 		"phase":  func(j *journal) { j.Phase = "invented" },
 		"path":   func(j *journal) { j.FragmentPath = filepath.Join(t.TempDir(), filepath.Base(j.FragmentPath)) },
-		"digest": func(j *journal) { j.SidecarNew = "bad" },
+		"digest": func(j *journal) { j.SidecarOutputSHA256 = "bad" },
 		"result": func(j *journal) {
 			j.Phase = "terminal_desired"
 			j.Result = &model.TaskResult{TaskID: "wrong", LeaseID: j.LeaseID, FinishedAt: time.Now().UTC()}
@@ -589,13 +582,13 @@ func TestAuthorizedRecoveryRejectsJournalSwapAfterSnapshot(t *testing.T) {
 	}
 	ref := refs[0]
 	authority := map[string]RecoveryAuthority{
-		ref.TaskID + "\x00" + ref.LeaseID: {TaskScriptSHA: ref.TaskScriptSHA, CombinedSHA256: ref.CombinedSHA256, Phase: ref.Phase, ResultSHA256: resultSHA(ref.Result), JournalSHA256: ref.JournalSHA256},
+		ref.TaskID + "\x00" + ref.LeaseID: {TaskScriptSHA: ref.TaskScriptSHA, ArtifactSHA256: ref.ArtifactSHA256, Phase: ref.Phase, ResultSHA256: resultSHA(ref.Result), JournalSHA256: ref.JournalSHA256},
 	}
 	j, err := readJournal(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	j.CombinedNew = digest([]byte("swapped-artifact"))
+	j.ArtifactSHA256 = digest([]byte("swapped-artifact"))
 	if err := writeJSON(path, j); err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +667,7 @@ func TestApplyExactRetryReplaceAndRemove(t *testing.T) {
 	configDir := filepath.Join(root, "conf")
 	mustMkdir(t, configDir)
 	sidecarPath := filepath.Join(root, "meta.json")
-	if err := os.WriteFile(sidecarPath, []byte(`{"schema":"lattice.singbox-metadata.v2","inbounds":[],"ordinary":"keep"}`), 0o600); err != nil {
+	if err := os.WriteFile(sidecarPath, []byte(testCurrentSidecar(nil, map[string]any{"ordinary": "keep"})), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
@@ -686,8 +679,8 @@ func TestApplyExactRetryReplaceAndRemove(t *testing.T) {
 	runs := 0
 	m.run = func(context.Context, string, ...string) ([]byte, error) { runs++; return nil, nil }
 	basename := "lattice-linechain-0123456789abcdef0123.json"
-	fragment1, sidecar1 := "one", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"one"}]}`
-	create := Document{Version: 2, Operation: "create", FragmentBasename: basename, Fragment: &fragment1, Sidecar: &sidecar1}
+	fragment1 := "one"
+	create := Document{Version: 2, Operation: "create", FragmentBasename: basename, Fragment: &fragment1, SidecarPatch: testSidecarPatch("create")}
 	applyDoc(t, m, create, "create", "lease")
 	if err := m.Apply(context.Background(), bytes.NewReader(marshalDocument(t, create)), "create", "lease", digest([]byte("different-script"))); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatched retry binding error=%v", err)
@@ -708,12 +701,11 @@ func TestApplyExactRetryReplaceAndRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fragment2, sidecar2 := "two", `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"two"}]}`
-	replace := Document{Version: 2, Operation: "replace", FragmentBasename: basename, PreviousFragmentSHA256: digest([]byte(fragment1)), Fragment: &fragment2, Sidecar: &sidecar2}
+	fragment2 := "two"
+	replace := Document{Version: 2, Operation: "replace", FragmentBasename: basename, PreviousFragmentSHA256: stringPtr(digest([]byte(fragment1))), Fragment: &fragment2, SidecarPatch: testSidecarPatch("replace")}
 	applyDoc(t, m, replace, "replace", "lease")
 	resolveSuccess(t, m, "replace", "lease")
-	removeSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	remove := Document{Version: 2, Operation: "remove", FragmentBasename: basename, PreviousFragmentSHA256: digest([]byte(fragment2)), Sidecar: &removeSidecar}
+	remove := Document{Version: 2, Operation: "remove", FragmentBasename: basename, PreviousFragmentSHA256: stringPtr(digest([]byte(fragment2))), SidecarPatch: testSidecarPatch("remove")}
 	applyDoc(t, m, remove, "remove", "lease")
 	resolveSuccess(t, m, "remove", "lease")
 	if _, err := os.Stat(filepath.Join(m.configDir, basename)); !errors.Is(err, os.ErrNotExist) {
@@ -737,7 +729,7 @@ func TestCommandAndRollbackFailureMatrix(t *testing.T) {
 			mustMkdir(t, configDir)
 			sidecarPath := filepath.Join(root, "meta.json")
 			oldFragment := "old"
-			oldSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[],"ordinary":"secret-not-logged"}`
+			oldSidecar := testCurrentSidecar(stringPtr(newUUID), map[string]any{"ordinary": "secret-not-logged"})
 			fragmentPath := filepath.Join(configDir, "lattice-linechain-0123456789abcdef0123.json")
 			if err := os.WriteFile(fragmentPath, []byte(oldFragment), 0o600); err != nil {
 				t.Fatal(err)
@@ -757,8 +749,8 @@ func TestCommandAndRollbackFailureMatrix(t *testing.T) {
 				}
 				return nil, nil
 			}
-			newFragment, newSidecar := "new", `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-			d := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: digest([]byte(oldFragment)), Fragment: &newFragment, Sidecar: &newSidecar}
+			newFragment := "new"
+			d := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: stringPtr(digest([]byte(oldFragment))), Fragment: &newFragment, SidecarPatch: testSidecarPatch("replace")}
 			err := applyDocErr(m, d, "task-"+failAt, "lease")
 			if err == nil || strings.Contains(err.Error(), "secret-not-logged") || strings.Contains(err.Error(), "private-key-canary") {
 				t.Fatalf("failure=%v", err)
@@ -803,7 +795,7 @@ func TestJournalAndPublishFailureMatrix(t *testing.T) {
 			fragmentPath := filepath.Join(configDir, "lattice-linechain-0123456789abcdef0123.json")
 			sidecarPath := filepath.Join(root, "meta.json")
 			oldFragment := "old"
-			oldSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[],"ordinary":true}`
+			oldSidecar := testCurrentSidecar(stringPtr(newUUID), map[string]any{"ordinary": true})
 			if err := os.WriteFile(fragmentPath, []byte(oldFragment), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -832,8 +824,8 @@ func TestJournalAndPublishFailureMatrix(t *testing.T) {
 				}
 				return writeJSON(path, value)
 			})
-			newFragment, newSidecar := "new", `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-			d := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: digest([]byte(oldFragment)), Fragment: &newFragment, Sidecar: &newSidecar}
+			newFragment := "new"
+			d := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: stringPtr(digest([]byte(oldFragment))), Fragment: &newFragment, SidecarPatch: testSidecarPatch("replace")}
 			err := applyDocErr(m, d, "task-"+failAt, "lease")
 			if err == nil || !failed {
 				t.Fatalf("injected failure not surfaced: %v", err)
@@ -854,7 +846,7 @@ func TestPostRunAndRecoveryRuntimeVerificationFailures(t *testing.T) {
 		fragmentPath := filepath.Join(configDir, "lattice-linechain-0123456789abcdef0123.json")
 		sidecarPath := filepath.Join(root, "meta.json")
 		oldFragment := "old"
-		oldSidecar := `{"schema":"lattice.singbox-metadata.v2","inbounds":[],"ordinary":true}`
+		oldSidecar := testCurrentSidecar(stringPtr(newUUID), map[string]any{"ordinary": true})
 		if err := os.WriteFile(fragmentPath, []byte(oldFragment), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -868,8 +860,8 @@ func TestPostRunAndRecoveryRuntimeVerificationFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 		m.run = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
-		newFragment, newSidecar := "new", `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-		d := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: digest([]byte(oldFragment)), Fragment: &newFragment, Sidecar: &newSidecar}
+		newFragment := "new"
+		d := Document{Version: 2, Operation: "replace", FragmentBasename: filepath.Base(fragmentPath), PreviousFragmentSHA256: stringPtr(digest([]byte(oldFragment))), Fragment: &newFragment, SidecarPatch: testSidecarPatch("replace")}
 		applyDoc(t, m, d, "task-post-run", "lease")
 		return m, fragmentPath, sidecarPath, oldSidecar
 	}
@@ -947,8 +939,8 @@ func appliedJournal(t *testing.T, taskID, leaseID string) (*Manager, string) {
 	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
 		t.Fatal(err)
 	}
-	fragment, sidecar := `{}`, `{"schema":"lattice.singbox-metadata.v2","inbounds":[]}`
-	applyDoc(t, m, Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, Sidecar: &sidecar}, taskID, leaseID)
+	fragment := `{}`
+	applyDoc(t, m, Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testSidecarPatch("create")}, taskID, leaseID)
 	return m, m.journalPath(taskID, leaseID)
 }
 
@@ -975,22 +967,177 @@ func applyDoc(t *testing.T, m *Manager, d Document, task, lease string) {
 	}
 }
 func applyDocErr(m *Manager, d Document, task, lease string) error {
+	d = BindDocument(d)
+	if m.sidecarPath != "" {
+		if _, err := os.Lstat(m.sidecarPath); errors.Is(err, os.ErrNotExist) {
+			inbound := map[string]any{"tag": d.SidecarPatch.SourceInboundTag, "line_uuid": d.SidecarPatch.SourceLineUUID}
+			if d.SidecarPatch.ExpectedDownstreamLineUUID != nil {
+				inbound["chain"] = map[string]any{"downstream_line_uuid": *d.SidecarPatch.ExpectedDownstreamLineUUID}
+			}
+			base, _ := json.Marshal(map[string]any{"schema": semanticSidecarMetadataSchema, "inbounds": []any{inbound}})
+			if err := os.WriteFile(m.sidecarPath, base, 0o600); err != nil {
+				return err
+			}
+		}
+	}
 	b := marshalDocument(nil, d)
 	return m.Apply(context.Background(), strings.NewReader(string(b)), task, lease, digest([]byte(task)))
+}
+
+func testSidecarPatch(operation string) SidecarPatchV2 {
+	patch := SidecarPatchV2{Schema: semanticSidecarPatchSchema, SourceLineUUID: sourceUUID, SourceInboundTag: "source", DesiredDownstreamLineUUID: stringPtr(newUUID)}
+	if operation != "create" {
+		patch.ExpectedDownstreamLineUUID = stringPtr(newUUID)
+	}
+	if operation == "remove" {
+		patch.DesiredDownstreamLineUUID = nil
+	}
+	return patch
 }
 
 func marshalDocument(t *testing.T, d Document) []byte {
 	d = BindDocument(d)
 	b, err := json.Marshal(wireDocumentV2{
-		Version: d.Version, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
-		PreviousFragmentSHA256: d.PreviousFragmentSHA256, Fragment: d.Fragment, Sidecar: d.Sidecar,
-		FragmentSHA256: d.FragmentSHA256, SidecarSHA256: d.SidecarSHA256, CombinedSHA256: d.CombinedSHA256,
+		Version: d.Version, DurableProtocol: d.DurableProtocol, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		Fragment: d.Fragment, SidecarPatch: d.SidecarPatch, PreviousFragmentSHA256: d.PreviousFragmentSHA256,
+		FragmentSHA256: d.FragmentSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256, ArtifactSHA256: d.ArtifactSHA256,
 	})
 	if err != nil && t != nil {
 		t.Fatal(err)
 	}
 	return b
 }
+
+func TestConsumeProductionServerFixture(t *testing.T) {
+	fixturePath := os.Getenv("LATTICE_LINECHAIN_SERVER_FIXTURE")
+	if fixturePath == "" {
+		t.Skip("LATTICE_LINECHAIN_SERVER_FIXTURE is not set")
+	}
+	type fixture struct {
+		Schema                 string          `json:"schema"`
+		ApprovalArtifactSHA256 string          `json:"approval_artifact_sha256"`
+		RequestSHA256          string          `json:"request_sha256"`
+		TaskScriptSHA256       string          `json:"task_script_sha256"`
+		TaskID                 string          `json:"task_id"`
+		LeaseID                string          `json:"lease_id"`
+		Document               json.RawMessage `json:"document"`
+	}
+	rawFixture, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f fixture
+	dec := json.NewDecoder(bytes.NewReader(rawFixture))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		t.Fatal(err)
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		t.Fatalf("fixture has trailing data: %v", err)
+	}
+	if f.Schema != "lattice.linechain.cross-contract-fixture.v2" || !validSHA(f.ApprovalArtifactSHA256) || !validSHA(f.RequestSHA256) || !validSHA(f.TaskScriptSHA256) || f.TaskID == "" || f.LeaseID == "" {
+		t.Fatalf("invalid production fixture wrapper: %+v", f)
+	}
+	var document wireDocumentV2
+	if err := json.Unmarshal(f.Document, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.ArtifactSHA256 != f.ApprovalArtifactSHA256 {
+		t.Fatalf("approval/document artifact mismatch: %s != %s", f.ApprovalArtifactSHA256, document.ArtifactSHA256)
+	}
+
+	root := t.TempDir()
+	m, err := Open(filepath.Join(root, "txn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	configDir := filepath.Join(root, "conf")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sidecarPath := filepath.Join(root, "lattice-metadata.json")
+	if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	current := []byte("{\n  \"unknown_root\": {\"preserve\": true},\n  \"schema\": \"lattice.singbox-metadata.v2\",\n  \"inbounds\": [\n" +
+		"    {\"tag\":\"before\",\"line_uuid\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"keep\":1},\n" +
+		"    {\"tag\":\"source-b\",\"line_uuid\":\"22222222-2222-4222-8222-222222222222\",\"ordinary\":\"keep\"},\n" +
+		"    {\"tag\":\"after\",\"line_uuid\":\"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\",\"keep\":2}\n  ]\n}\n")
+	if err := os.WriteFile(sidecarPath, current, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), bytes.NewReader(f.Document), f.TaskID, f.LeaseID, f.TaskScriptSHA256); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err := readJournal(m.journalPath(f.TaskID, f.LeaseID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragmentBytes, err := os.ReadFile(filepath.Join(configDir, document.FragmentBasename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecarBytes, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.ArtifactSHA256 != f.ApprovalArtifactSHA256 || j.TaskScriptSHA != f.TaskScriptSHA256 || j.FragmentOutputSHA256 != digest(fragmentBytes) || j.SidecarOutputSHA256 != digest(sidecarBytes) {
+		t.Fatalf("fixture journal authority/output mismatch: %+v", j)
+	}
+	var output struct {
+		UnknownRoot map[string]bool `json:"unknown_root"`
+		Inbounds    []struct {
+			Tag      string         `json:"tag"`
+			Ordinary string         `json:"ordinary"`
+			Keep     int            `json:"keep"`
+			Chain    map[string]any `json:"chain"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(sidecarBytes, &output); err != nil {
+		t.Fatal(err)
+	}
+	wantDownstream := ""
+	if document.SidecarPatch.DesiredDownstreamLineUUID != nil {
+		wantDownstream = *document.SidecarPatch.DesiredDownstreamLineUUID
+	}
+	if !output.UnknownRoot["preserve"] || len(output.Inbounds) != 3 || output.Inbounds[0].Tag != "before" || output.Inbounds[0].Keep != 1 || output.Inbounds[1].Tag != "source-b" || output.Inbounds[1].Ordinary != "keep" || output.Inbounds[2].Tag != "after" || output.Inbounds[2].Keep != 2 || output.Inbounds[1].Chain["downstream_line_uuid"] != wantDownstream {
+		t.Fatalf("fixture merge did not preserve scoped host state: %s", sidecarBytes)
+	}
+
+	m.publishFile = func(string, *string) error { return errors.New("replay attempted to republish output") }
+	if err := m.Apply(context.Background(), bytes.NewReader(f.Document), f.TaskID, f.LeaseID, f.TaskScriptSHA256); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := readJournal(m.journalPath(f.TaskID, f.LeaseID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.Phase != "terminal_desired" || replayed.FragmentOutputSHA256 != j.FragmentOutputSHA256 || replayed.SidecarOutputSHA256 != j.SidecarOutputSHA256 {
+		t.Fatalf("fixture replay did not use journaled output authority: %+v", replayed)
+	}
+}
+
+func testCurrentSidecar(expected *string, extras map[string]any) string {
+	inbound := map[string]any{"tag": "source", "line_uuid": sourceUUID}
+	if expected != nil {
+		inbound["chain"] = map[string]any{"downstream_line_uuid": *expected}
+	}
+	top := map[string]any{"schema": semanticSidecarMetadataSchema, "inbounds": []any{inbound}}
+	for key, value := range extras {
+		top[key] = value
+	}
+	raw, err := json.Marshal(top)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
+}
+
 func assertFile(t *testing.T, p, want string) {
 	t.Helper()
 	b, err := os.ReadFile(p)

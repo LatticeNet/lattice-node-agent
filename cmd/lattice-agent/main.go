@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1226,7 +1227,7 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 		if err := validateDurablePair(leased, manager, cfg.LinechainReady); err != nil {
 			return err
 		}
-		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v1" && leased.DurableProtocol != "netguard-v1" {
+		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v2" && leased.DurableProtocol != "netguard-v1" {
 			return fmt.Errorf("unsupported durable protocol %q", leased.DurableProtocol)
 		}
 		if !leased.DurableResult {
@@ -1366,21 +1367,25 @@ func captureLinechainAuthority(manager *linechain.Manager, outbox taskResultOutb
 	for _, entry := range entries {
 		key := entry.Task.ID + "\x00" + entry.Task.LeaseID
 		ref, hasJournal := journals[key]
-		if hasJournal && entry.DurableProtocol != "linechain-e3-v1" {
+		if hasJournal && entry.DurableProtocol != "linechain-e3-v2" {
 			return nil, fmt.Errorf("linechain journal %s has mismatched outbox protocol", entry.Task.ID)
 		}
-		if hasJournal && entry.DurableProtocol == "linechain-e3-v1" {
+		if hasJournal && entry.DurableProtocol == "linechain-e3-v2" {
 			if ref.TaskScriptSHA != linechainTaskScriptSHA(entry.Task.Script) {
 				return nil, fmt.Errorf("linechain journal %s does not match the exact outbox task script", entry.Task.ID)
 			}
+			artifactSHA, err := linechainArtifactSHAFromTaskScript(entry.Task.Script)
+			if err != nil || artifactSHA != ref.ArtifactSHA256 {
+				return nil, fmt.Errorf("linechain journal %s does not match the issued artifact in the exact outbox script", entry.Task.ID)
+			}
 			matchedE3[key] = struct{}{}
 		}
-		if entry.State == "leased" && entry.DurableProtocol == "linechain-e3-v1" {
+		if entry.State == "leased" && entry.DurableProtocol == "linechain-e3-v2" {
 			if !hasJournal {
 				return nil, fmt.Errorf("leased E3 outbox %s lacks exact linechain journal", entry.Task.ID)
 			}
 		}
-		if entry.State == "completed" && entry.DurableProtocol == "linechain-e3-v1" && hasJournal {
+		if entry.State == "completed" && entry.DurableProtocol == "linechain-e3-v2" && hasJournal {
 			if !ref.Terminal || entry.Result == nil || ref.Result == nil || !sameTaskResult(*entry.Result, *ref.Result) {
 				return nil, fmt.Errorf("completed E3 outbox %s conflicts with linechain terminal result", entry.Task.ID)
 			}
@@ -1393,7 +1398,7 @@ func captureLinechainAuthority(manager *linechain.Manager, outbox taskResultOutb
 	}
 	authority := make(map[string]linechain.RecoveryAuthority, len(journals))
 	for key, ref := range journals {
-		authority[key] = linechain.RecoveryAuthority{TaskScriptSHA: ref.TaskScriptSHA, CombinedSHA256: ref.CombinedSHA256, Phase: ref.Phase, ResultSHA256: taskResultPointerSHA(ref.Result), JournalSHA256: ref.JournalSHA256}
+		authority[key] = linechain.RecoveryAuthority{TaskScriptSHA: ref.TaskScriptSHA, ArtifactSHA256: ref.ArtifactSHA256, Phase: ref.Phase, ResultSHA256: taskResultPointerSHA(ref.Result), JournalSHA256: ref.JournalSHA256}
 	}
 	return authority, nil
 }
@@ -1407,6 +1412,69 @@ func sameTaskResult(a, b model.TaskResult) bool {
 func linechainTaskScriptSHA(script string) string {
 	sum := sha256.Sum256([]byte(script))
 	return hex.EncodeToString(sum[:])
+}
+
+func linechainArtifactSHAFromTaskScript(script string) (string, error) {
+	const prefix = "# lattice-linechain-e3-v2\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '"
+	const suffix = "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n"
+	if !strings.HasPrefix(script, prefix) || !strings.HasSuffix(script, suffix) {
+		return "", fmt.Errorf("linechain task script is not the canonical v2 wrapper")
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(script, prefix), suffix)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode linechain task document: %w", err)
+	}
+	fields, err := decodeUniqueTopLevelFields(raw)
+	if err != nil {
+		return "", fmt.Errorf("decode linechain task document: %w", err)
+	}
+	var version int
+	var protocol, artifact string
+	if err := json.Unmarshal(fields["version"], &version); err != nil || version != 2 {
+		return "", fmt.Errorf("linechain task document version is invalid")
+	}
+	if err := json.Unmarshal(fields["durable_protocol"], &protocol); err != nil || protocol != "linechain-e3-v2" {
+		return "", fmt.Errorf("linechain task document protocol is invalid")
+	}
+	if err := json.Unmarshal(fields["artifact_sha256"], &artifact); err != nil || !guardManagedSHARe.MatchString(artifact) {
+		return "", fmt.Errorf("linechain task document artifact is invalid")
+	}
+	return artifact, nil
+}
+
+func decodeUniqueTopLevelFields(raw []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("document must be an object")
+	}
+	fields := make(map[string]json.RawMessage)
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("document field name is invalid")
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate document field %s", name)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[name] = value
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected trailing data")
+	}
+	return fields, nil
 }
 
 func taskResultPointerSHA(result *model.TaskResult) string {
@@ -1428,17 +1496,17 @@ func validateDurablePair(task leasedAgentTask, manager *linechain.Manager, ready
 		}
 		return nil
 	}
-	if task.DurableProtocol != "linechain-e3-v1" && task.DurableProtocol != "netguard-v1" {
+	if task.DurableProtocol != "linechain-e3-v2" && task.DurableProtocol != "netguard-v1" {
 		return fmt.Errorf("durable task has unsupported protocol %q", task.DurableProtocol)
 	}
-	if task.DurableProtocol == "linechain-e3-v1" && (manager == nil || !ready) {
+	if task.DurableProtocol == "linechain-e3-v2" && (manager == nil || !ready) {
 		return fmt.Errorf("linechain task received while durable linechain is unavailable")
 	}
 	return nil
 }
 
 func isLinechainTask(task leasedAgentTask) bool {
-	return task.DurableResult && task.DurableProtocol == "linechain-e3-v1"
+	return task.DurableResult && task.DurableProtocol == "linechain-e3-v2"
 }
 
 func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
@@ -1481,7 +1549,7 @@ func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain boo
 		// Pending entries predate typed lease metadata; retain only the exact
 		// helper namespace marker during cleanup recovery. Live classification is
 		// always driven by durable_protocol on the leased response.
-		if retain && entry.DurableProtocol == "linechain-e3-v1" {
+		if retain && entry.DurableProtocol == "linechain-e3-v2" {
 			continue
 		}
 		if err := outbox.Remove(entry); err != nil {

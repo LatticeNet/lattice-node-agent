@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	journalVersion  = 1
+	journalVersion  = 2
 	maxDocumentSize = 4 << 20
 	maxArtifactSize = maxDocumentSize
 )
@@ -32,67 +32,78 @@ var linechainBasenameRE = regexp.MustCompile(`^lattice-linechain-[0-9a-f]{20}\.j
 // Document is the bounded server-rendered input consumed by -linechain-apply.
 // Desired content is never copied into the journal; only its digest is stored.
 type Document struct {
-	Version                int     `json:"version"`
-	Operation              string  `json:"operation"`
-	ConfigDir              string  `json:"-"`
-	FragmentBasename       string  `json:"fragment_basename,omitempty"`
-	FragmentPath           string  `json:"-"`
-	SidecarPath            string  `json:"-"`
-	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
-	Fragment               *string `json:"fragment,omitempty"`
-	Sidecar                *string `json:"sidecar,omitempty"`
-	FragmentSHA256         string  `json:"fragment_sha256,omitempty"`
-	SidecarSHA256          string  `json:"sidecar_sha256,omitempty"`
-	CombinedSHA256         string  `json:"combined_sha256"`
+	Version                int            `json:"version"`
+	DurableProtocol        string         `json:"durable_protocol"`
+	Operation              string         `json:"operation"`
+	ConfigDir              string         `json:"-"`
+	FragmentBasename       string         `json:"fragment_basename"`
+	FragmentPath           string         `json:"-"`
+	SidecarPath            string         `json:"-"`
+	Fragment               *string        `json:"fragment"`
+	SidecarPatch           SidecarPatchV2 `json:"sidecar_patch"`
+	PreviousFragmentSHA256 *string        `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string        `json:"fragment_sha256"`
+	SidecarPatchSHA256     string         `json:"sidecar_patch_sha256"`
+	ArtifactSHA256         string         `json:"artifact_sha256"`
+	SidecarPatchCanonical  []byte         `json:"-"`
+	SidecarOutput          *string        `json:"-"`
 }
 
 // wireDocumentV2 is the only server-controlled shape accepted by Apply.
 // Host paths and the ordinary-writer sidecar predecessor are intentionally not
 // representable on the wire; Apply derives paths from the local layout.
 type wireDocumentV2 struct {
-	Version                int     `json:"version"`
-	Operation              string  `json:"operation"`
-	FragmentBasename       string  `json:"fragment_basename"`
-	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
-	Fragment               *string `json:"fragment,omitempty"`
-	Sidecar                *string `json:"sidecar,omitempty"`
-	FragmentSHA256         string  `json:"fragment_sha256,omitempty"`
-	SidecarSHA256          string  `json:"sidecar_sha256,omitempty"`
-	CombinedSHA256         string  `json:"combined_sha256"`
+	Version                int            `json:"version"`
+	DurableProtocol        string         `json:"durable_protocol"`
+	Operation              string         `json:"operation"`
+	FragmentBasename       string         `json:"fragment_basename"`
+	Fragment               *string        `json:"fragment"`
+	SidecarPatch           SidecarPatchV2 `json:"sidecar_patch"`
+	PreviousFragmentSHA256 *string        `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string        `json:"fragment_sha256"`
+	SidecarPatchSHA256     string         `json:"sidecar_patch_sha256"`
+	ArtifactSHA256         string         `json:"artifact_sha256"`
 }
 
-// BindDocument computes the deterministic desired artifact binding.
+// BindDocument computes canonical test/server fixture bindings. Apply validates
+// issued bindings and never calls this after reading or merging host state.
 func BindDocument(d Document) Document {
-	d.FragmentSHA256 = digestPtr(d.Fragment)
-	d.SidecarSHA256 = digestPtr(d.Sidecar)
-	var pair []byte
-	if d.Fragment != nil {
-		pair = append(pair, []byte(*d.Fragment)...)
+	if d.DurableProtocol == "" {
+		d.DurableProtocol = "linechain-e3-v2"
 	}
-	pair = append(pair, 0)
-	if d.Sidecar != nil {
-		pair = append(pair, []byte(*d.Sidecar)...)
+	if d.Fragment == nil {
+		d.FragmentSHA256 = nil
+	} else {
+		value := digest([]byte(*d.Fragment))
+		d.FragmentSHA256 = &value
 	}
-	d.CombinedSHA256 = digest(pair)
+	patch, _ := json.Marshal(d.SidecarPatch)
+	d.SidecarPatchCanonical = patch
+	d.SidecarPatchSHA256 = digest(patch)
+	binding := semanticArtifactBindingV2{Schema: semanticArtifactSchema, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		PreviousFragmentSHA256: d.PreviousFragmentSHA256, FragmentSHA256: d.FragmentSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256}
+	canonical, _ := canonicalSemanticArtifactBinding(binding)
+	d.ArtifactSHA256 = digest(canonical)
 	return d
 }
 
 type journal struct {
-	Version        int               `json:"version"`
-	TaskID         string            `json:"task_id"`
-	LeaseID        string            `json:"lease_id"`
-	FragmentPath   string            `json:"fragment_path"`
-	SidecarPath    string            `json:"sidecar_path"`
-	FragmentOld    string            `json:"fragment_old_sha256,omitempty"`
-	SidecarOld     string            `json:"sidecar_old_sha256,omitempty"`
-	FragmentNew    string            `json:"fragment_desired_sha256,omitempty"`
-	SidecarNew     string            `json:"sidecar_desired_sha256,omitempty"`
-	CombinedNew    string            `json:"combined_desired_sha256"`
-	TaskScriptSHA  string            `json:"task_script_sha256"`
-	FragmentHadOld bool              `json:"fragment_had_old"`
-	SidecarHadOld  bool              `json:"sidecar_had_old"`
-	Phase          string            `json:"phase"`
-	Result         *model.TaskResult `json:"result,omitempty"`
+	Version              int               `json:"version"`
+	TaskID               string            `json:"task_id"`
+	LeaseID              string            `json:"lease_id"`
+	FragmentPath         string            `json:"fragment_path"`
+	SidecarPath          string            `json:"sidecar_path"`
+	FragmentOld          string            `json:"fragment_old_sha256,omitempty"`
+	SidecarOld           string            `json:"sidecar_old_sha256,omitempty"`
+	ArtifactSHA256       string            `json:"artifact_sha256"`
+	SidecarPatchSHA256   string            `json:"sidecar_patch_sha256"`
+	FragmentOutputSHA256 string            `json:"fragment_output_sha256,omitempty"`
+	SidecarOutputSHA256  string            `json:"sidecar_output_sha256"`
+	TaskScriptSHA        string            `json:"task_script_sha256"`
+	FragmentHadOld       bool              `json:"fragment_had_old"`
+	SidecarHadOld        bool              `json:"sidecar_had_old"`
+	Phase                string            `json:"phase"`
+	Result               *model.TaskResult `json:"result,omitempty"`
 }
 
 type Manager struct {
@@ -317,14 +328,36 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID, taskS
 	if wire.Version != 2 {
 		return fmt.Errorf("unsupported linechain document version %d", wire.Version)
 	}
+	if wire.DurableProtocol != "linechain-e3-v2" {
+		return fmt.Errorf("unsupported linechain durable protocol %q", wire.DurableProtocol)
+	}
+	rawFields, err := decodeUniqueJSONObject(raw)
+	if err != nil {
+		return fmt.Errorf("decode linechain document fields: %w", err)
+	}
+	for _, name := range []string{"version", "durable_protocol", "operation", "fragment_basename", "fragment", "sidecar_patch", "previous_fragment_sha256", "fragment_sha256", "sidecar_patch_sha256", "artifact_sha256"} {
+		if _, ok := rawFields[name]; !ok {
+			return fmt.Errorf("linechain document field %s must be present", name)
+		}
+	}
 	if filepath.Base(wire.FragmentBasename) != wire.FragmentBasename || !linechainBasenameRE.MatchString(wire.FragmentBasename) {
 		return fmt.Errorf("fragment_basename is invalid")
 	}
+	patch, patchCanonical, err := canonicalSemanticSidecarPatch(rawFields["sidecar_patch"])
+	if err != nil {
+		return err
+	}
+	binding := semanticArtifactBindingV2{Schema: semanticArtifactSchema, Operation: wire.Operation, FragmentBasename: wire.FragmentBasename,
+		PreviousFragmentSHA256: wire.PreviousFragmentSHA256, FragmentSHA256: wire.FragmentSHA256, SidecarPatchSHA256: wire.SidecarPatchSHA256}
+	if err := verifySemanticArtifactBinding(wire.Fragment, patchCanonical, binding, wire.ArtifactSHA256); err != nil {
+		return err
+	}
 	d := Document{
-		Version: wire.Version, Operation: wire.Operation, ConfigDir: m.configDir,
+		Version: wire.Version, DurableProtocol: wire.DurableProtocol, Operation: wire.Operation, ConfigDir: m.configDir,
 		FragmentBasename: wire.FragmentBasename, FragmentPath: filepath.Join(m.configDir, wire.FragmentBasename), SidecarPath: m.sidecarPath,
-		PreviousFragmentSHA256: wire.PreviousFragmentSHA256, Fragment: wire.Fragment, Sidecar: wire.Sidecar,
-		FragmentSHA256: wire.FragmentSHA256, SidecarSHA256: wire.SidecarSHA256, CombinedSHA256: wire.CombinedSHA256,
+		PreviousFragmentSHA256: wire.PreviousFragmentSHA256, Fragment: wire.Fragment, SidecarPatch: patch,
+		FragmentSHA256: wire.FragmentSHA256, SidecarPatchSHA256: wire.SidecarPatchSHA256, ArtifactSHA256: wire.ArtifactSHA256,
+		SidecarPatchCanonical: patchCanonical,
 	}
 	if err := m.validateDocument(d); err != nil {
 		return err
@@ -344,18 +377,26 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID, taskS
 	if err != nil {
 		return err
 	}
-	if err := requirePrevious("fragment", fragmentOld, fragmentHad, d.PreviousFragmentSHA256); err != nil {
+	previousFragmentSHA := ""
+	if d.PreviousFragmentSHA256 != nil {
+		previousFragmentSHA = *d.PreviousFragmentSHA256
+	}
+	if err := requirePrevious("fragment", fragmentOld, fragmentHad, previousFragmentSHA); err != nil {
 		return err
 	}
-	mergedSidecar, err := mergeSidecar(sidecarOld, sidecarHad, d.Sidecar)
+	if !sidecarHad {
+		return fmt.Errorf("current semantic sidecar is required")
+	}
+	mergedSidecar, err := mergeManagedSidecar(sidecarOld, d.SidecarPatch)
 	if err != nil {
 		return err
 	}
-	d.Sidecar = mergedSidecar
-	d = BindDocument(d)
+	mergedSidecarText := string(mergedSidecar)
+	d.SidecarOutput = &mergedSidecarText
 	j := journal{Version: journalVersion, TaskID: taskID, LeaseID: leaseID, FragmentPath: d.FragmentPath, SidecarPath: d.SidecarPath,
 		FragmentOld: digestMaybe(fragmentOld, fragmentHad), SidecarOld: digestMaybe(sidecarOld, sidecarHad), FragmentHadOld: fragmentHad, SidecarHadOld: sidecarHad,
-		FragmentNew: digestPtr(d.Fragment), SidecarNew: digestPtr(d.Sidecar), CombinedNew: d.CombinedSHA256, TaskScriptSHA: scriptBinding, Phase: "prepared"}
+		ArtifactSHA256: d.ArtifactSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256,
+		FragmentOutputSHA256: digestPtr(d.Fragment), SidecarOutputSHA256: digestPtr(d.SidecarOutput), TaskScriptSHA: scriptBinding, Phase: "prepared"}
 	if err := m.writeBackup(path+".fragment.old", fragmentOld, fragmentHad); err != nil {
 		return err
 	}
@@ -372,7 +413,7 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID, taskS
 	if err := m.writeJournal(path, j); err != nil {
 		return err
 	}
-	if err := m.publishFile(d.SidecarPath, d.Sidecar); err != nil {
+	if err := m.publishFile(d.SidecarPath, d.SidecarOutput); err != nil {
 		return m.rollback(ctx, path, &j, d, fmt.Errorf("publish sidecar: %w", err))
 	}
 	j.Phase = "pair_published"
@@ -386,49 +427,38 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID, taskS
 	return m.writeJournal(path, j)
 }
 
-func mergeSidecar(current []byte, currentExists bool, desired *string) (*string, error) {
-	if desired == nil {
-		return nil, nil
+func decodeUniqueJSONObject(raw []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("must be an object")
 	}
-	merged := map[string]any{}
-	if currentExists {
-		if err := json.Unmarshal(current, &merged); err != nil {
-			return nil, fmt.Errorf("decode current semantic sidecar: %w", err)
-		}
-		if err := validateSidecarObject("current", merged); err != nil {
+	fields := make(map[string]json.RawMessage)
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
 			return nil, err
 		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("object field name is invalid")
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate field %s", name)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[name] = value
 	}
-	want := map[string]any{}
-	if err := json.Unmarshal([]byte(*desired), &want); err != nil {
-		return nil, fmt.Errorf("decode desired semantic sidecar: %w", err)
-	}
-	if err := validateSidecarObject("desired", want); err != nil {
+	if _, err := dec.Token(); err != nil {
 		return nil, err
 	}
-	for key, value := range want {
-		merged[key] = value
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected trailing data")
 	}
-	b, err := json.Marshal(merged)
-	if err != nil {
-		return nil, fmt.Errorf("encode semantic sidecar: %w", err)
-	}
-	b = append(b, '\n')
-	s := string(b)
-	return &s, nil
-}
-
-func validateSidecarObject(label string, value map[string]any) error {
-	if value == nil {
-		return fmt.Errorf("%s semantic sidecar must be a non-null object", label)
-	}
-	if value["schema"] != "lattice.singbox-metadata.v2" {
-		return fmt.Errorf("%s semantic sidecar has unsupported schema", label)
-	}
-	if _, ok := value["inbounds"].([]any); !ok {
-		return fmt.Errorf("%s semantic sidecar inbounds must be an array", label)
-	}
-	return nil
+	return fields, nil
 }
 
 // JournalRef is the bounded identity needed to cross-check outbox authority.
@@ -438,12 +468,12 @@ type JournalRef struct {
 	Result          *model.TaskResult
 	Terminal        bool
 	TaskScriptSHA   string
-	CombinedSHA256  string
+	ArtifactSHA256  string
 	JournalSHA256   string
 }
 
 type RecoveryAuthority struct {
-	TaskScriptSHA, CombinedSHA256, Phase, ResultSHA256, JournalSHA256 string
+	TaskScriptSHA, ArtifactSHA256, Phase, ResultSHA256, JournalSHA256 string
 }
 
 func (m *Manager) Snapshot() ([]JournalRef, error) {
@@ -475,7 +505,7 @@ func (m *Manager) Snapshot() ([]JournalRef, error) {
 		if err := m.validateJournal(filepath.Join(m.dir, entry.Name()), j); err != nil {
 			return nil, err
 		}
-		refs = append(refs, JournalRef{TaskID: j.TaskID, LeaseID: j.LeaseID, Phase: j.Phase, Result: j.Result, Terminal: journalTerminal(j.Phase), TaskScriptSHA: j.TaskScriptSHA, CombinedSHA256: j.CombinedNew, JournalSHA256: journalSHA(j)})
+		refs = append(refs, JournalRef{TaskID: j.TaskID, LeaseID: j.LeaseID, Phase: j.Phase, Result: j.Result, Terminal: journalTerminal(j.Phase), TaskScriptSHA: j.TaskScriptSHA, ArtifactSHA256: j.ArtifactSHA256, JournalSHA256: journalSHA(j)})
 	}
 	return refs, nil
 }
@@ -510,7 +540,8 @@ func (m *Manager) validateJournal(path string, j journal) error {
 	}
 	if (j.FragmentHadOld && !validSHA(j.FragmentOld)) || (!j.FragmentHadOld && j.FragmentOld != "") ||
 		(j.SidecarHadOld && !validSHA(j.SidecarOld)) || (!j.SidecarHadOld && j.SidecarOld != "") ||
-		(j.FragmentNew != "" && !validSHA(j.FragmentNew)) || !validSHA(j.SidecarNew) || !validSHA(j.CombinedNew) || !validSHA(j.TaskScriptSHA) {
+		(j.FragmentOutputSHA256 != "" && !validSHA(j.FragmentOutputSHA256)) || !validSHA(j.SidecarOutputSHA256) ||
+		!validSHA(j.SidecarPatchSHA256) || !validSHA(j.ArtifactSHA256) || !validSHA(j.TaskScriptSHA) {
 		return fmt.Errorf("linechain journal artifact digest shape is invalid")
 	}
 	if terminal {
@@ -562,28 +593,32 @@ func (m *Manager) validateDocument(d Document) error {
 	if d.Version != 2 {
 		return fmt.Errorf("unsupported linechain document version %d", d.Version)
 	}
+	if d.DurableProtocol != "linechain-e3-v2" {
+		return fmt.Errorf("unsupported linechain durable protocol %q", d.DurableProtocol)
+	}
 	if d.FragmentBasename == "" {
 		return fmt.Errorf("v2 fragment_basename is required")
 	}
 	switch d.Operation {
 	case "create":
-		if d.PreviousFragmentSHA256 != "" || d.Fragment == nil || d.Sidecar == nil {
+		if d.PreviousFragmentSHA256 != nil || d.Fragment == nil || d.FragmentSHA256 == nil || d.SidecarPatch.DesiredDownstreamLineUUID == nil {
 			return fmt.Errorf("create document has inconsistent old/desired shape")
 		}
 	case "replace":
-		if d.PreviousFragmentSHA256 == "" || d.Fragment == nil || d.Sidecar == nil {
+		if d.PreviousFragmentSHA256 == nil || d.Fragment == nil || d.FragmentSHA256 == nil || d.SidecarPatch.ExpectedDownstreamLineUUID == nil || d.SidecarPatch.DesiredDownstreamLineUUID == nil {
 			return fmt.Errorf("replace document has inconsistent old/desired shape")
 		}
 	case "remove":
-		if d.PreviousFragmentSHA256 == "" || d.Fragment != nil || d.Sidecar == nil {
+		if d.PreviousFragmentSHA256 == nil || d.Fragment != nil || d.FragmentSHA256 != nil || d.SidecarPatch.ExpectedDownstreamLineUUID == nil || d.SidecarPatch.DesiredDownstreamLineUUID != nil {
 			return fmt.Errorf("remove document has inconsistent old/desired shape")
 		}
 	default:
 		return fmt.Errorf("unsupported linechain operation %q", d.Operation)
 	}
-	bound := BindDocument(d)
-	if d.FragmentSHA256 != bound.FragmentSHA256 || d.SidecarSHA256 != bound.SidecarSHA256 || d.CombinedSHA256 != bound.CombinedSHA256 {
-		return fmt.Errorf("linechain desired artifact digest binding mismatch")
+	binding := semanticArtifactBindingV2{Schema: semanticArtifactSchema, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		PreviousFragmentSHA256: d.PreviousFragmentSHA256, FragmentSHA256: d.FragmentSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256}
+	if err := verifySemanticArtifactBinding(d.Fragment, d.SidecarPatchCanonical, binding, d.ArtifactSHA256); err != nil {
+		return err
 	}
 	configDir := filepath.Clean(d.ConfigDir)
 	if !m.Configured() {
@@ -620,8 +655,8 @@ func (m *Manager) validateDocument(d Document) error {
 	if err := validateParents(d.SidecarPath); err != nil {
 		return err
 	}
-	for _, want := range []string{d.PreviousFragmentSHA256} {
-		if want != "" && !validSHA(want) {
+	for _, want := range []*string{d.PreviousFragmentSHA256, d.FragmentSHA256} {
+		if want != nil && !validSHA(*want) {
 			return fmt.Errorf("previous artifact digest is invalid")
 		}
 	}
@@ -750,7 +785,7 @@ func (m *Manager) recoverOne(ctx context.Context, path string, complete func(mod
 	}
 	if len(expected) > 0 && expected[0] != nil {
 		want := expected[0]
-		if journalSHA(j) != want.JournalSHA256 || j.TaskScriptSHA != want.TaskScriptSHA || j.CombinedNew != want.CombinedSHA256 || j.Phase != want.Phase || resultSHA(j.Result) != want.ResultSHA256 {
+		if journalSHA(j) != want.JournalSHA256 || j.TaskScriptSHA != want.TaskScriptSHA || j.ArtifactSHA256 != want.ArtifactSHA256 || j.Phase != want.Phase || resultSHA(j.Result) != want.ResultSHA256 {
 			return fmt.Errorf("linechain journal changed after authority capture")
 		}
 	}
@@ -853,7 +888,7 @@ func pairMatches(j journal, desired bool) bool {
 		return false
 	}
 	if desired {
-		return digestMaybe(a, ah) == j.FragmentNew && digestMaybe(b, bh) == j.SidecarNew
+		return digestMaybe(a, ah) == j.FragmentOutputSHA256 && digestMaybe(b, bh) == j.SidecarOutputSHA256
 	}
 	return ah == j.FragmentHadOld && bh == j.SidecarHadOld && digestMaybe(a, ah) == j.FragmentOld && digestMaybe(b, bh) == j.SidecarOld
 }

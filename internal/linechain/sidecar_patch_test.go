@@ -16,7 +16,7 @@ const (
 func stringPtr(value string) *string { return &value }
 
 func patchBytes(expected, desired *string) []byte {
-	b, err := json.Marshal(semanticSidecarPatchV2{Schema: semanticSidecarSchema, SourceLineUUID: sourceUUID, SourceInboundTag: "source", ExpectedDownstreamLineUUID: expected, DesiredDownstreamLineUUID: desired})
+	b, err := json.Marshal(SidecarPatchV2{Schema: semanticSidecarPatchSchema, SourceLineUUID: sourceUUID, SourceInboundTag: "source", ExpectedDownstreamLineUUID: expected, DesiredDownstreamLineUUID: desired})
 	if err != nil {
 		panic(err)
 	}
@@ -94,27 +94,79 @@ func TestMergeManagedSidecarRejectsIdentityAndBaseDrift(t *testing.T) {
 	}
 }
 
-func TestSemanticBindingNeverRewritesIssuedDigests(t *testing.T) {
+func TestSemanticArtifactBindingNeverRewritesIssuedDigests(t *testing.T) {
 	fragment := `{"outbounds":[]}`
 	patch := patchBytes(nil, stringPtr(newUUID))
-	issued := semanticSidecarBinding{PatchSHA256: digest(patch), ArtifactSHA256: semanticArtifactDigest(&fragment, patch)}
-	if err := verifySemanticSidecarBinding(&fragment, patch, issued); err != nil {
+	fragmentSHA := digest([]byte(fragment))
+	binding := semanticArtifactBindingV2{
+		Schema: semanticArtifactSchema, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json",
+		PreviousFragmentSHA256: nil, FragmentSHA256: &fragmentSHA, SidecarPatchSHA256: digest(patch),
+	}
+	canonical, err := canonicalSemanticArtifactBinding(binding)
+	if err != nil {
 		t.Fatal(err)
 	}
-	for name, mutate := range map[string]func(*semanticSidecarBinding){
-		"patch":    func(v *semanticSidecarBinding) { v.PatchSHA256 = digest([]byte("other")) },
-		"artifact": func(v *semanticSidecarBinding) { v.ArtifactSHA256 = digest([]byte("other")) },
+	issuedArtifactSHA := digest(canonical)
+	if err := verifySemanticArtifactBinding(&fragment, patch, binding, issuedArtifactSHA); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("patch", func(t *testing.T) {
+		mismatch := binding
+		mismatch.SidecarPatchSHA256 = digest([]byte("other"))
+		before := mismatch
+		if err := verifySemanticArtifactBinding(&fragment, patch, mismatch, issuedArtifactSHA); err == nil {
+			t.Fatal("patch mismatch accepted")
+		}
+		if mismatch != before {
+			t.Fatalf("issued binding rewritten: %+v -> %+v", before, mismatch)
+		}
+	})
+	for name, value := range map[string]string{
+		"fragment": digest([]byte("other")),
+		"artifact": digest([]byte("other artifact")),
 	} {
 		t.Run(name, func(t *testing.T) {
-			mismatch := issued
-			mutate(&mismatch)
+			mismatch := binding
+			artifactSHA := issuedArtifactSHA
+			if name == "fragment" {
+				mismatch.FragmentSHA256 = &value
+			} else {
+				artifactSHA = value
+			}
 			before := mismatch
-			if err := verifySemanticSidecarBinding(&fragment, patch, mismatch); err == nil {
+			if err := verifySemanticArtifactBinding(&fragment, patch, mismatch, artifactSHA); err == nil {
 				t.Fatal("mismatch accepted")
 			}
 			if mismatch != before {
-				t.Fatalf("issued digest rewritten: %+v -> %+v", before, mismatch)
+				t.Fatalf("issued binding rewritten: %+v -> %+v", before, mismatch)
 			}
 		})
+	}
+}
+
+func TestCanonicalSemanticBindingMatchesServerVector(t *testing.T) {
+	const (
+		patchJSON    = `{"schema":"lattice.singbox-linechain-sidecar-patch.v1","source_line_uuid":"22222222-2222-4222-8222-222222222222","source_inbound_tag":"source-b","expected_downstream_line_uuid":null,"desired_downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}`
+		patchSHA     = "7394c9367aa36d0e37e1e6bb70d3de70afc1d6792f56754741ba118ca2137188"
+		artifactJSON = `{"schema":"lattice.singbox-linechain-artifact.v2","operation":"create","fragment_basename":"lattice-linechain-0123456789abcdef0123.json","previous_fragment_sha256":null,"fragment_sha256":"0000000000000000000000000000000000000000000000000000000000000000","sidecar_patch_sha256":"7394c9367aa36d0e37e1e6bb70d3de70afc1d6792f56754741ba118ca2137188"}`
+		artifactSHA  = "bb59094488756276a385921951eaac3e36dc604eb4a03c4cb2e1a52797aee261"
+	)
+	patch, canonicalPatch, err := canonicalSemanticSidecarPatch([]byte(patchJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonicalPatch) != patchJSON || digest(canonicalPatch) != patchSHA {
+		t.Fatalf("server patch vector drift: bytes=%s sha=%s", canonicalPatch, digest(canonicalPatch))
+	}
+	zeroSHA := strings.Repeat("0", 64)
+	canonicalArtifact, err := canonicalSemanticArtifactBinding(semanticArtifactBindingV2{
+		Schema: semanticArtifactSchema, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json",
+		FragmentSHA256: &zeroSHA, SidecarPatchSHA256: digest(canonicalPatch),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if patch.SourceLineUUID != "22222222-2222-4222-8222-222222222222" || string(canonicalArtifact) != artifactJSON || digest(canonicalArtifact) != artifactSHA {
+		t.Fatalf("server artifact vector drift: bytes=%s sha=%s", canonicalArtifact, digest(canonicalArtifact))
 	}
 }
