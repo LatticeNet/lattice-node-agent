@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,6 +26,8 @@ const (
 	maxDocumentSize = 4 << 20
 	maxDiagnostic   = 4096
 )
+
+var linechainBasenameRE = regexp.MustCompile(`^lattice-linechain-[0-9a-f]{20}\.json$`)
 
 // Document is the bounded server-rendered input consumed by -linechain-apply.
 // Desired content is never copied into the journal; only its digest is stored.
@@ -253,7 +256,7 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	// deterministic basename; full paths are derived from the locally resolved
 	// sing-box layout and cannot redirect writes.
 	if d.FragmentBasename != "" {
-		if filepath.Base(d.FragmentBasename) != d.FragmentBasename || strings.Contains(d.FragmentBasename, "..") || !strings.HasPrefix(d.FragmentBasename, "lattice-linechain-") || filepath.Ext(d.FragmentBasename) != ".json" {
+		if filepath.Base(d.FragmentBasename) != d.FragmentBasename || !linechainBasenameRE.MatchString(d.FragmentBasename) {
 			return fmt.Errorf("fragment_basename is invalid")
 		}
 		if d.FragmentPath != "" && filepath.Clean(d.FragmentPath) != filepath.Join(m.configDir, d.FragmentBasename) {
