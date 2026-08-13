@@ -381,7 +381,7 @@ func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
 		case "/api/agent/tasks":
 			fetches++
 			if fetches == 1 {
-				b, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+				b, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "linechain-e3-v1"}})
 				return testResponse(http.StatusOK, string(b)), nil
 			}
 			return testResponse(http.StatusOK, "[]"), nil
