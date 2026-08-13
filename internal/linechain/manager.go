@@ -246,6 +246,9 @@ func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID string
 	if err := dec.Decode(&d); err != nil {
 		return fmt.Errorf("decode linechain document: %w", err)
 	}
+	if d.Version == 2 && (d.ConfigDir != "" || d.FragmentPath != "" || d.SidecarPath != "") {
+		return fmt.Errorf("v2 documents must not contain server-supplied paths")
+	}
 	// Artifact locations are agent-owned. The server may provide only the
 	// deterministic basename; full paths are derived from the locally resolved
 	// sing-box layout and cannot redirect writes.
