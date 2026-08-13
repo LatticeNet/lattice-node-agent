@@ -194,6 +194,9 @@ func (s *Store) Complete(result model.TaskResult) (committed bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	if entry.State == stateDone && entry.Result != nil && reflect.DeepEqual(*entry.Result, result) {
+		return false, nil
+	}
 	if entry.State != stateLeased {
 		return false, fmt.Errorf("task lease %s is not awaiting completion", result.TaskID)
 	}

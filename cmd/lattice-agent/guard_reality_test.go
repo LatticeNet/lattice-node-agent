@@ -65,7 +65,7 @@ func TestWriteGuardManagedSHAOnlyOutputsCanonicalHashOnSuccess(t *testing.T) {
 
 func TestReportedCapabilitiesAdvertiseGuardManagedSHA(t *testing.T) {
 	got := reportedCapabilities()
-	if !reflect.DeepEqual(got, []string{guardManagedSHACapability}) {
+	if !reflect.DeepEqual(got, []string{durableTaskResultCapability, guardManagedSHACapability}) {
 		t.Fatalf("reported capabilities = %#v", got)
 	}
 }

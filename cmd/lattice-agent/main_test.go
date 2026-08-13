@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -38,8 +39,8 @@ func (r *countingTaskRunner) Run(task model.Task) model.TaskResult {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.3" {
-		t.Fatalf("version = %q, want 0.3.3", version)
+	if version != "0.3.4-alpha.1" {
+		t.Fatalf("version = %q, want 0.3.4-alpha.1", version)
 	}
 }
 
@@ -48,13 +49,13 @@ func TestCompatibilityPayloadIsEmbedded(t *testing.T) {
 	if got.ServerMin == "" || got.DashboardMin == "" || got.Channel == "" {
 		t.Fatalf("compatibility metadata must be embedded: %+v", got)
 	}
-	if got.Channel != "stable" {
-		t.Fatalf("compatibility channel = %q, want stable", got.Channel)
+	if got.Channel != "alpha" {
+		t.Fatalf("compatibility channel = %q, want alpha", got.Channel)
 	}
 	// The floors stay on design-15 prerelease coordinates on purpose: no stable
 	// server or dashboard satisfies this agent yet (stable server is still v0.2.1),
 	// so naming a stable floor here would be a claim the ecosystem cannot back.
-	if got.ServerMin != "v0.2.2-alpha.2" || got.DashboardMin != "v0.2.2-alpha.7" {
+	if got.ServerMin != "v0.2.2-alpha.19" || got.DashboardMin != "v0.2.2-alpha.7" {
 		t.Fatalf("compatibility floor = %+v, want coordinated design-15 alpha", got)
 	}
 }
@@ -258,7 +259,7 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 			httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				switch r.URL.Path {
 				case "/api/agent/tasks":
-					if r.Header.Get(agentCapabilitiesHeader) != guardManagedSHACapability {
+					if r.Header.Get(agentCapabilitiesHeader) != strings.Join(reportedCapabilities(), ",") {
 						return testResponse(http.StatusBadRequest, "missing lease-time capability"), nil
 					}
 					fetchCalls++
@@ -305,6 +306,91 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 				t.Fatalf("pending after acknowledgement = %+v, err=%v", pending, err)
 			}
 		})
+	}
+}
+
+type linechainTaskRunner struct {
+	manager *linechain.Manager
+	doc     []byte
+	calls   int
+}
+
+func (r *linechainTaskRunner) Run(task model.Task) model.TaskResult {
+	r.calls++
+	err := r.manager.Apply(context.Background(), bytes.NewReader(r.doc), task.ID, task.LeaseID)
+	result := model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
+	if err != nil {
+		result.ExitCode = -1
+		result.Error = err.Error()
+	}
+	return result
+}
+
+func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	root := t.TempDir()
+	txnDir := filepath.Join(root, "txn")
+	manager, err := linechain.Open(txnDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	outbox, err := taskoutbox.Open(filepath.Join(root, "outbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	conf := filepath.Join(root, "conf")
+	if err := os.Mkdir(conf, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fragmentPath := filepath.Join(conf, "lattice-linechain-chain.json")
+	sidecarPath := filepath.Join(root, "lattice-metadata.json")
+	fragment := "{\"outbounds\":[]}"
+	sidecar := "{\"schema\":\"lattice.singbox-metadata.v2\",\"inbounds\":[]}"
+	doc, err := json.Marshal(linechain.Document{Version: 1, ConfigDir: conf, FragmentPath: fragmentPath, SidecarPath: sidecarPath, Fragment: &fragment, Sidecar: &sidecar, SingBoxBinary: "true", RestartCommand: []string{"true"}, VerifyCommand: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{ID: "task-chain", LeaseID: "lease-chain", Interpreter: "sh", Script: `"$LATTICE_AGENT_BIN" -linechain-apply`, TimeoutSec: 10, OutputLimit: 1024}
+	runner := &linechainTaskRunner{manager: manager, doc: doc}
+	fetches := 0
+	posts := 0
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/agent/tasks":
+			fetches++
+			if fetches == 1 {
+				b, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+				return testResponse(http.StatusOK, string(b)), nil
+			}
+			return testResponse(http.StatusOK, "[]"), nil
+		case "/api/agent/task-result":
+			posts++
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		default:
+			return testResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}
+	if err := runTasks(cfg, runner, outbox, manager); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTasks(cfg, runner, outbox, manager); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 1 || posts != 1 {
+		t.Fatalf("runner calls=%d posts=%d", runner.calls, posts)
+	}
+	if entries, err := os.ReadDir(txnDir); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".json") {
+				t.Fatalf("journal not cleaned: %s", e.Name())
+			}
+		}
 	}
 }
 

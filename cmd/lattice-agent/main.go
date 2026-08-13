@@ -27,6 +27,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
+	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
@@ -37,10 +38,10 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.3"
-var compatServerMin = "v0.2.2-alpha.2"
+var version = "0.3.4-alpha.1"
+var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
-var compatChannel = "stable"
+var compatChannel = "alpha"
 
 type agentCompatibility struct {
 	ServerMin    string `json:"server_min"`
@@ -62,16 +63,17 @@ func compatibilityPayload() agentCompatibility {
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 const (
-	defaultDebugMaxLineBytes  = 4096
-	defaultDebugMaxBatchLines = 100
-	debugSinkMaxLines         = 1000
-	guardRealityReportTimeout = 10 * time.Second
-	guardManagedSHACapability = "netguard-managed-sha-v1"
-	agentCapabilitiesHeader   = "X-Lattice-Agent-Capabilities"
+	defaultDebugMaxLineBytes    = 4096
+	defaultDebugMaxBatchLines   = 100
+	debugSinkMaxLines           = 1000
+	guardRealityReportTimeout   = 10 * time.Second
+	guardManagedSHACapability   = "netguard-managed-sha-v1"
+	durableTaskResultCapability = "durable-task-result-v1"
+	agentCapabilitiesHeader     = "X-Lattice-Agent-Capabilities"
 )
 
 func reportedCapabilities() []string {
-	return []string{guardManagedSHACapability}
+	return []string{durableTaskResultCapability, guardManagedSHACapability}
 }
 
 type agentConfig struct {
@@ -154,6 +156,7 @@ type agentConfig struct {
 	SingBoxMeta           string
 	LogStateDir           string
 	TaskOutboxDir         string
+	LinechainTxnDir       string
 }
 
 type agentRuntimePayload struct {
@@ -189,6 +192,7 @@ func main() {
 	var printVersion bool
 	var printCompat bool
 	var printGuardManagedSHA bool
+	var applyLinechain bool
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
@@ -247,6 +251,8 @@ func main() {
 	flag.StringVar(&cfg.SingBoxMeta, "singbox-meta", env("LATTICE_SINGBOX_META", ""), "design-15 sing-box sidecar metadata path for -singbox-discover (default /etc/sing-box/lattice-metadata.json)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
 	flag.StringVar(&cfg.TaskOutboxDir, "task-outbox-dir", os.Getenv("LATTICE_TASK_OUTBOX_DIR"), "base directory for durable task-result journals (default: log state dir, or the user cache directory for manual runs)")
+	flag.StringVar(&cfg.LinechainTxnDir, "linechain-txn-dir", os.Getenv("LATTICE_LINECHAIN_TXN_DIR"), "private directory for crash-recoverable linechain transactions")
+	flag.BoolVar(&applyLinechain, "linechain-apply", false, "apply one bounded linechain document from stdin and exit")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.BoolVar(&printCompat, "compat-json", false, "print embedded server/dashboard compatibility metadata and exit")
 	flag.BoolVar(&printGuardManagedSHA, "guard-managed-sha", false, "print the canonical SHA-256 of the managed lattice_guard nft table and exit")
@@ -264,6 +270,21 @@ func main() {
 	if printGuardManagedSHA {
 		if err := writeGuardManagedSHA(context.Background(), os.Stdout, guardreality.CollectManagedTableSHA); err != nil {
 			log.Fatalf("guard managed SHA collection failed: %v", err)
+		}
+		return
+	}
+	if applyLinechain {
+		dir, err := linechainTransactionDir(cfg)
+		if err != nil {
+			log.Fatalf("linechain transaction path failed: %v", err)
+		}
+		manager, err := linechain.OpenHelper(dir)
+		if err != nil {
+			log.Fatalf("linechain transaction manager failed: %v", err)
+		}
+		defer manager.Close()
+		if err := manager.Apply(context.Background(), os.Stdin, os.Getenv("LATTICE_TASK_ID"), os.Getenv("LATTICE_TASK_LEASE_ID")); err != nil {
+			log.Fatalf("linechain apply failed: %v", err)
 		}
 		return
 	}
@@ -331,6 +352,18 @@ func main() {
 		log.Fatalf("task result outbox initialization failed: %v", err)
 	}
 	defer taskResults.Close()
+	linechainDir, err := linechainTransactionDir(cfg)
+	if err != nil {
+		log.Fatalf("linechain transaction path failed: %v", err)
+	}
+	linechainManager, err := linechain.Open(linechainDir)
+	if err != nil {
+		log.Fatalf("linechain transaction manager initialization failed: %v", err)
+	}
+	defer linechainManager.Close()
+	if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
+		log.Fatalf("linechain recovery blocked readiness: %v", err)
+	}
 	agentBinary, err := os.Executable()
 	if err != nil {
 		log.Fatalf("resolve lattice-agent executable failed: %v", err)
@@ -381,13 +414,18 @@ func main() {
 
 	runner := taskexec.Runner{
 		AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(),
-		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary,
+		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary, LinechainTxnDir: linechainDir,
 	}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
+		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
+			log.Printf("linechain recovery blocked cycle: %v", err)
+			<-ticker.C
+			continue
+		}
 		if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 			debugf(cfg, "agent config fetch failed: %v", err)
 		} else {
@@ -405,7 +443,7 @@ func main() {
 		if err := reportSingBoxInventory(cfg); err != nil {
 			log.Printf("singbox discover error: %v", err)
 		}
-		if err := runTasks(cfg, runner, taskResults); err != nil {
+		if err := runTasks(cfg, runner, taskResults, linechainManager); err != nil {
 			log.Printf("task poll error: %v", err)
 		}
 		if assigned, err := fetchMonitors(cfg); err != nil {
@@ -1118,7 +1156,16 @@ type leasedAgentTask struct {
 	DurableResult bool `json:"durable_result"`
 }
 
-func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error {
+func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, managers ...*linechain.Manager) error {
+	var manager *linechain.Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	if manager != nil {
+		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
+			return err
+		}
+	}
 	if err := outbox.RecoverInterrupted(cfg.NodeID); err != nil {
 		return fmt.Errorf("recover interrupted task results: %w", err)
 	}
@@ -1191,6 +1238,12 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error
 		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
 		result := runner.Run(task)
 		result.NodeID = cfg.NodeID
+		if manager != nil && isLinechainTask(task) {
+			result, err = manager.ResolveAfterRun(context.Background(), task, result)
+			if err != nil {
+				return fmt.Errorf("resolve linechain task %s: %w", task.ID, err)
+			}
+		}
 		debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
 		completed, completeErr := outbox.Complete(result)
 		if completeErr != nil {
@@ -1203,17 +1256,46 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox) error
 				if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
 					return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
 				}
+				if manager != nil && isLinechainTask(task) {
+					if cleanupErr := manager.Cleanup(task.ID, task.LeaseID); cleanupErr != nil {
+						return fmt.Errorf("%v; cleanup confirmed linechain task: %w", journalErr, cleanupErr)
+					}
+				}
 				if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
 					return fmt.Errorf("%v; upload confirmed task result: %w", journalErr, flushErr)
 				}
 			}
 			return journalErr
 		}
+		if manager != nil && isLinechainTask(task) {
+			if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
+				return fmt.Errorf("cleanup linechain task %s after durable outbox completion: %w", task.ID, err)
+			}
+		}
 		if err := flushTaskResults(cfg, outbox); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func isLinechainTask(task model.Task) bool {
+	return strings.Contains(task.Script, "-linechain-apply")
+}
+
+func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
+	return manager.RequireRecovered(ctx, func(result model.TaskResult) error {
+		committed, err := outbox.Complete(result)
+		if err == nil {
+			return nil
+		}
+		if committed {
+			return outbox.ConfirmDurability()
+		}
+		// An exact completed outbox may remain after a crash before transaction
+		// cleanup. Complete implementations treat that replay idempotently.
+		return err
+	}, nodeID)
 }
 
 func flushTaskResults(cfg agentConfig, outbox taskResultOutbox) error {
@@ -1251,6 +1333,26 @@ func taskResultOutboxDir(cfg agentConfig) (string, error) {
 	}
 	nodeHash := sha256.Sum256([]byte(cfg.Server + "\x00" + cfg.NodeID))
 	return filepath.Join(base, "task-outbox", fmt.Sprintf("%x", nodeHash[:])), nil
+}
+
+func linechainTransactionDir(cfg agentConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.LinechainTxnDir)
+	if dir == "" {
+		base := strings.TrimSpace(cfg.LogStateDir)
+		if base == "" {
+			cacheDir, err := os.UserCacheDir()
+			if err != nil {
+				return "", err
+			}
+			base = filepath.Join(cacheDir, "lattice-agent")
+		}
+		dir = filepath.Join(base, "linechain-txn")
+	}
+	dir = filepath.Clean(dir)
+	if !filepath.IsAbs(dir) || dir == string(filepath.Separator) {
+		return "", fmt.Errorf("linechain transaction directory must be absolute and non-root")
+	}
+	return dir, nil
 }
 
 func postAgentJSON(cfg agentConfig, path string, payload map[string]any, out any) error {

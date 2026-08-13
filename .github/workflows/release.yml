@@ -58,7 +58,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           ARTIFACT: ${{ matrix.artifact }}
-          LATTICE_COMPAT_SERVER_MIN: v0.2.2-alpha.2
+          LATTICE_COMPAT_SERVER_MIN: v0.2.2-alpha.19
           LATTICE_COMPAT_DASHBOARD_MIN: v0.2.2-alpha.7
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
