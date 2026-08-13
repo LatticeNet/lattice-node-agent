@@ -41,7 +41,7 @@ cleanup() {
   process_snapshot="$e2e_root/processes"
   pgid_snapshot="$e2e_root/pgids"
   ps -axo pid=,pgid=,command= | awk -v runtime="$runtime_root" -v agent_test="$agent_test_bin" '
-    index($0, "awk -v runtime=") == 0 && (index($0, runtime) || index($0, agent_test)) { print }
+    (($3 == "sing-box" && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
   ' >"$process_snapshot"
   if [ -s "$process_snapshot" ]; then
     echo "linechain E2E leaked process for runtime root $runtime_root" >&2
@@ -65,7 +65,7 @@ cleanup() {
       fi
     done <"$pgid_snapshot"
     ps -axo pid=,pgid=,command= | awk -v runtime="$runtime_root" -v agent_test="$agent_test_bin" '
-      index($0, "awk -v runtime=") == 0 && (index($0, runtime) || index($0, agent_test)) { print }
+      (($3 == "sing-box" && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
     ' >"$process_snapshot"
     if [ -s "$process_snapshot" ]; then
       echo "linechain E2E runtime process scan remained non-empty" >&2
