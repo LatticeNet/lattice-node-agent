@@ -18,6 +18,26 @@ runtime_root="$e2e_root/runtime"
 mkdir -m 700 "$runtime_root"
 agent_bin="$e2e_root/lattice-agent"
 agent_test_bin="$e2e_root/lattice-agent.test"
+scanner_regression() {
+  matches=$(printf '%s\n' \
+    "101 100 $bin run -C $runtime_root" \
+    "102 100 sing-box run -C $runtime_root" \
+    "103 100 $agent_test_bin --runtime-root $runtime_root" \
+    "104 100 awk -v runtime=$runtime_root" | awk -v runtime="$runtime_root" -v singbox_bin="$bin" -v agent_test="$agent_test_bin" '
+      (($3 == singbox_bin && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
+    ')
+  [ "$(printf '%s\n' "$matches" | grep -c .)" -eq 2 ] || {
+    echo "process scanner regression failed: unexpected matches" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+  }
+  printf '%s\n' "$matches" | grep -F "$bin run -C $runtime_root" >/dev/null || exit 1
+  printf '%s\n' "$matches" | grep -F "$agent_test_bin --runtime-root $runtime_root" >/dev/null || exit 1
+}
+if [ "${LATTICE_LINECHAIN_SCANNER_REGRESSION:-}" = 1 ]; then
+  scanner_regression
+  exit 0
+fi
 server_dir="${LATTICE_SERVER_E2E_DIR:-}"
 if [ -z "$server_dir" ]; then
   for candidate in ../../lattice-server/.wt/worker3-task18-server ../../lattice-server; do
@@ -40,8 +60,8 @@ cleanup() {
   trap - EXIT HUP INT TERM
   process_snapshot="$e2e_root/processes"
   pgid_snapshot="$e2e_root/pgids"
-  ps -axo pid=,pgid=,command= | awk -v runtime="$runtime_root" -v agent_test="$agent_test_bin" '
-    (($3 == "sing-box" && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
+  ps -axo pid=,pgid=,command= | awk -v runtime="$runtime_root" -v singbox_bin="$bin" -v agent_test="$agent_test_bin" '
+    (($3 == singbox_bin && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
   ' >"$process_snapshot"
   if [ -s "$process_snapshot" ]; then
     echo "linechain E2E leaked process for runtime root $runtime_root" >&2
@@ -64,8 +84,8 @@ cleanup() {
         status=1
       fi
     done <"$pgid_snapshot"
-    ps -axo pid=,pgid=,command= | awk -v runtime="$runtime_root" -v agent_test="$agent_test_bin" '
-      (($3 == "sing-box" && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
+    ps -axo pid=,pgid=,command= | awk -v runtime="$runtime_root" -v singbox_bin="$bin" -v agent_test="$agent_test_bin" '
+      (($3 == singbox_bin && $4 == "run" && $5 == "-C" && index($0, runtime)) || ($3 == agent_test && index($0, runtime))) { print }
     ' >"$process_snapshot"
     if [ -s "$process_snapshot" ]; then
       echo "linechain E2E runtime process scan remained non-empty" >&2
