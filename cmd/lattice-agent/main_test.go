@@ -364,7 +364,7 @@ func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	task := model.Task{ID: "task-chain", LeaseID: "lease-chain", Interpreter: "sh", Script: `"$LATTICE_AGENT_BIN" -linechain-apply`, TimeoutSec: 10, OutputLimit: 1024}
+	task := model.Task{ID: "task-chain", LeaseID: "lease-chain", Interpreter: "sh", Script: "# lattice-linechain-e3-v1\n\"$LATTICE_LINECHAIN_TXN_DIR\"=1 \"$LATTICE_AGENT_BIN\" -linechain-apply", TimeoutSec: 10, OutputLimit: 1024}
 	runner := &linechainTaskRunner{manager: manager, doc: doc, afterApply: func() {
 		manager.ConfigureCleanupForTest(func(path string) error {
 			if strings.HasSuffix(path, ".json") {

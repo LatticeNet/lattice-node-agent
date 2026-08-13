@@ -1317,7 +1317,8 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 }
 
 func isLinechainTask(task model.Task) bool {
-	return strings.Contains(task.Script, "-linechain-apply")
+	const marker = "# lattice-linechain-e3-v1\n"
+	return strings.HasPrefix(task.Script, marker) && strings.Contains(task.Script, "-linechain-apply") && strings.Contains(task.Script, "LATTICE_LINECHAIN_TXN_DIR")
 }
 
 func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
