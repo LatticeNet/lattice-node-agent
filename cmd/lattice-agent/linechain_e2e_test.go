@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -44,6 +45,7 @@ const (
 	linechainE2EOutboxEnv       = "LATTICE_LINECHAIN_E2E_OUTBOX"
 	linechainE2ETaskJSONEnv     = "LATTICE_LINECHAIN_E2E_TASK_JSON"
 	linechainE2EBeginResultEnv  = "LATTICE_LINECHAIN_E2E_BEGIN_RESULT"
+	linechainE2EAckResultEnv    = "LATTICE_LINECHAIN_E2E_ACK_RESULT"
 )
 
 // TestLinechainE2EBeginHelper durably records the exact server lease before
@@ -73,6 +75,26 @@ func TestLinechainE2EBeginHelper(t *testing.T) {
 		}
 	}
 	writeE2EJSON(t, resultPath, map[string]any{"committed": committed, "task_id": task.ID, "lease_id": task.LeaseID})
+}
+
+// TestLinechainE2EAckHelper durably removes only the exact result acknowledged
+// by the server after its successful replay response.
+func TestLinechainE2EAckHelper(t *testing.T) {
+	resultPath := os.Getenv(linechainE2EAckResultEnv)
+	if resultPath == "" {
+		return
+	}
+	taskID, leaseID := mustEnv(t, linechainE2ETaskEnv), mustEnv(t, linechainE2ELeaseEnv)
+	outbox, err := taskoutbox.Open(mustAbsoluteEnv(t, linechainE2EOutboxEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	entry := pendingE2EEntry(t, outbox, taskID, leaseID)
+	if err := outbox.Remove(entry); err != nil {
+		t.Fatal(err)
+	}
+	writeE2EJSON(t, resultPath, map[string]string{"task_id": taskID, "lease_id": leaseID})
 }
 
 var managedE2EProcesses = struct {
@@ -292,6 +314,7 @@ func TestLinechainE2ERecoverHelper(t *testing.T) {
 		return
 	}
 	root := mustAbsoluteEnv(t, linechainE2ERootEnv)
+	taskID, leaseID := mustEnv(t, linechainE2ETaskEnv), mustEnv(t, linechainE2ELeaseEnv)
 	consumeE2ECrashMarker(t, mustAbsoluteEnv(t, linechainE2ECrashMarkerEnv))
 	m := openE2EManager(t, mustExecutableEnv(t, linechainE2EBinEnv), root, mustAbsoluteEnv(t, linechainE2EConfigEnv), mustAbsoluteEnv(t, linechainE2ESidecarEnv), filepath.Join(root, "txn"), mustEnvPort(linechainE2EBPortEnv))
 	defer m.Close()
@@ -313,7 +336,7 @@ func TestLinechainE2ERecoverHelper(t *testing.T) {
 	}, "node-b", authority); err != nil {
 		t.Fatal(err)
 	}
-	writeE2EJSON(t, resultPath, pendingE2EResult(t, outbox))
+	writeE2EJSON(t, resultPath, pendingE2EResult(t, outbox, taskID, leaseID))
 }
 
 // TestLinechainE2EResolveHelper converts a successful helper run into the
@@ -347,16 +370,27 @@ func TestLinechainE2EResolveHelper(t *testing.T) {
 	if err := m.Cleanup(taskID, leaseID); err != nil {
 		t.Fatal(err)
 	}
-	writeE2EJSON(t, resultPath, pendingE2EResult(t, outbox))
+	writeE2EJSON(t, resultPath, pendingE2EResult(t, outbox, taskID, leaseID))
 }
 
-func pendingE2EResult(t *testing.T, outbox *taskoutbox.Store) model.TaskResult {
+func pendingE2EEntry(t *testing.T, outbox *taskoutbox.Store, taskID, leaseID string) taskoutbox.Entry {
 	t.Helper()
 	entries, err := outbox.Pending()
-	if err != nil || len(entries) != 1 || entries[0].Result == nil {
+	if err != nil {
 		t.Fatalf("durable result handoff: entries=%+v err=%v", entries, err)
 	}
-	return *entries[0].Result
+	for _, entry := range entries {
+		if entry.Task.ID == taskID && entry.Task.LeaseID == leaseID && entry.Result != nil {
+			return entry
+		}
+	}
+	t.Fatalf("durable result %s/%s not found: %+v", taskID, leaseID, entries)
+	return taskoutbox.Entry{}
+}
+
+func pendingE2EResult(t *testing.T, outbox *taskoutbox.Store, taskID, leaseID string) model.TaskResult {
+	t.Helper()
+	return *pendingE2EEntry(t, outbox, taskID, leaseID).Result
 }
 
 func TestLinechainE2EDurableResultSurvivesOutboxReopen(t *testing.T) {
@@ -384,8 +418,93 @@ func TestLinechainE2EDurableResultSurvivesOutboxReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got := pendingE2EResult(t, reopened); !sameTaskResult(got, result) {
+	second := model.Task{ID: "task-second", LeaseID: "lease-second", Script: "# lattice-linechain-e3-v2\nsecond"}
+	if _, err := reopened.BeginWithProtocol(second, "linechain-e3-v2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Complete(model.TaskResult{TaskID: second.ID, LeaseID: second.LeaseID, ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.ConfirmDurability(); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingE2EResult(t, reopened, task.ID, task.LeaseID); !sameTaskResult(got, result) {
 		t.Fatalf("reopened result changed: got=%+v want=%+v", got, result)
+	}
+	if err := reopened.Remove(pendingE2EEntry(t, reopened, task.ID, task.LeaseID)); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingE2EResult(t, reopened, second.ID, second.LeaseID); got.TaskID != second.ID {
+		t.Fatalf("ack removed wrong durable result: %+v", got)
+	}
+}
+
+func TestLinechainE2ERecoveryDoesNotCleanupBeforeDurableResult(t *testing.T) {
+	root := t.TempDir()
+	configDir, txnDir := filepath.Join(root, "conf"), filepath.Join(root, "txn")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := filepath.Join(root, "sidecar.json")
+	writeFile(t, sidecar, `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source-b","line_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}]}`)
+	m, err := linechain.Open(txnDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.ConfigureLayout(configDir, sidecar); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureCommands("/usr/bin/true", []string{"/usr/bin/true"}, []string{"/usr/bin/true"}); err != nil {
+		t.Fatal(err)
+	}
+	fragment := `{"outbounds":[],"route":{"rules":[]}}`
+	target := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	document := marshalE2EDocument(t, bindE2EDocument("create", "lattice-linechain-0123456789abcdef0123.json", "", &fragment, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "source-b", nil, &target))
+	script := "# lattice-linechain-e3-v2\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '" + base64.StdEncoding.EncodeToString(document) + "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n"
+	task := model.Task{ID: "task-fault", LeaseID: "lease-fault", Script: script}
+	if err := m.Apply(context.Background(), bytes.NewReader(document), task.ID, task.LeaseID, linechainTaskScriptSHA(script)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.ResolveAfterRun(context.Background(), task, model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outboxDir := filepath.Join(root, "outbox")
+	outbox, err := taskoutbox.Open(outboxDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbox.Complete(result); err == nil {
+		t.Fatal("Complete without Begin unexpectedly succeeded")
+	}
+	if refs, err := m.Snapshot(); err != nil || len(refs) != 1 || !refs[0].Terminal {
+		t.Fatalf("transaction cleaned before durable result: refs=%+v err=%v", refs, err)
+	}
+	if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := captureLinechainAuthority(m, outbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RequireRecoveredAuthorized(context.Background(), func(got model.TaskResult) error {
+		if !sameTaskResult(got, result) {
+			return fmt.Errorf("recovered result changed")
+		}
+		_, err := outbox.Complete(got)
+		if err != nil {
+			return err
+		}
+		return outbox.ConfirmDurability()
+	}, "node-b", authority); err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := m.Snapshot(); err != nil || len(refs) != 0 {
+		t.Fatalf("transaction survived durable recovery: refs=%+v err=%v", refs, err)
+	}
+	if got := pendingE2EResult(t, outbox, task.ID, task.LeaseID); !sameTaskResult(got, result) {
+		t.Fatalf("durable recovered result changed: %+v", got)
 	}
 }
 
