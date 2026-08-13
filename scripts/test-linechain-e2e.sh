@@ -15,6 +15,7 @@ printf '%s\n' "$version" | grep -Eq '^sing-box version 1\.13\.[0-9]+' || {
 probe="$(mktemp -d "${TMPDIR:-/tmp}/lattice-sing-box-check.XXXXXX")"
 e2e_root="$(mktemp -d "${TMPDIR:-/tmp}/lattice-linechain-e2e.XXXXXX")"
 agent_bin="$e2e_root/lattice-agent"
+agent_test_bin="$e2e_root/lattice-agent.test"
 server_dir="${LATTICE_SERVER_E2E_DIR:-}"
 if [ -z "$server_dir" ]; then
   for candidate in ../../lattice-server/.wt/worker3-task18-server ../../lattice-server; do
@@ -67,10 +68,9 @@ JSON
 printf '%s\n' "linechain E2E binary: $(printf '%s\n' "$version" | sed -n '1p')"
 
 go build -trimpath -o "$agent_bin" ./cmd/lattice-agent
+go test -c -tags=linechain_e2e -o "$agent_test_bin" ./cmd/lattice-agent
 (
   cd "$server_dir"
-  LATTICE_AGENT_E2E_BIN="$agent_bin" LATTICE_SINGBOX_E2E_BIN="$bin" \
+  LATTICE_AGENT_E2E_BIN="$agent_bin" LATTICE_AGENT_E2E_TEST_BIN="$agent_test_bin" LATTICE_SINGBOX_E2E_BIN="$bin" \
     go test -tags=linechain_lifecycle_e2e ./internal/server -run '^TestLineChainPersistentServerAgentLifecycleE2E$' -count=1 -v
 )
-
-LATTICE_SINGBOX_E2E_BIN="$bin" LATTICE_LINECHAIN_E2E_ROOT="$e2e_root" go test -tags=linechain_e2e ./cmd/lattice-agent -run '^TestLinechainRealSingBoxE2E$' -count=1 -v

@@ -37,6 +37,7 @@ const (
 	linechainE2ETaskEnv        = "LATTICE_LINECHAIN_E2E_TASK"
 	linechainE2ELeaseEnv       = "LATTICE_LINECHAIN_E2E_LEASE"
 	linechainE2ECrashMarkerEnv = "LATTICE_LINECHAIN_E2E_CRASH_MARKER"
+	linechainE2ERecoveryResult = "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT"
 )
 
 var managedE2EProcesses = struct {
@@ -243,6 +244,32 @@ func TestLinechainE2EApplyHelper(t *testing.T) {
 	defer m.Close()
 	configureE2EManager(t, m)
 	if err := m.Apply(context.Background(), os.Stdin, os.Getenv(linechainE2ETaskEnv), os.Getenv(linechainE2ELeaseEnv), os.Getenv("LATTICE_LINECHAIN_TASK_SCRIPT_SHA256")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLinechainE2ERecoverHelper is a child-only startup recovery entry point.
+// It writes the recovered result only after RequireRecovered has restored the
+// old artifacts and restarted the managed B process.
+func TestLinechainE2ERecoverHelper(t *testing.T) {
+	resultPath := os.Getenv(linechainE2ERecoveryResult)
+	if resultPath == "" {
+		return
+	}
+	m := openE2EManager(t, os.Getenv(linechainE2EBinEnv), os.Getenv(linechainE2ERootEnv), os.Getenv(linechainE2EConfigEnv), os.Getenv(linechainE2ESidecarEnv), filepath.Join(os.Getenv(linechainE2ERootEnv), "txn"), mustEnvPort(linechainE2EBPortEnv))
+	defer m.Close()
+	var recovered model.TaskResult
+	if err := m.RequireRecovered(context.Background(), func(result model.TaskResult) error {
+		recovered = result
+		return nil
+	}, "node-b"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
