@@ -257,11 +257,10 @@ func decodeJSONObject(raw []byte, dst *map[string]json.RawMessage) error {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return fmt.Errorf("must be a non-null object")
 	}
-	if err := json.Unmarshal(raw, dst); err != nil {
+	fields, err := decodeUniqueJSONObject(raw)
+	if err != nil {
 		return err
 	}
-	if *dst == nil {
-		return fmt.Errorf("must be a non-null object")
-	}
+	*dst = fields
 	return nil
 }

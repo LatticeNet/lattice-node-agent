@@ -365,6 +365,56 @@ func TestApplyRejectsSymlinkAndInvalidCurrentSidecar(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsDuplicateSidecarAuthorityWithoutMutation(t *testing.T) {
+	const (
+		uuid       = `11111111-1111-4111-8111-1111111111aa`
+		downstream = `33333333-3333-4333-8333-333333333333`
+	)
+	cases := map[string]string{
+		"root inbounds":              `{"schema":"lattice.singbox-metadata.v2","inbounds":[],"inbounds":[{"tag":"source","line_uuid":"` + uuid + `"}]}`,
+		"inbound line_uuid":          `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source","line_uuid":"` + uuid + `","line_uuid":"` + uuid + `"}]}`,
+		"inbound tag":                `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source","tag":"source","line_uuid":"` + uuid + `"}]}`,
+		"inbound chain":              `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source","line_uuid":"` + uuid + `","chain":{"downstream_line_uuid":"` + downstream + `"},"chain":{"downstream_line_uuid":"` + downstream + `"}}]}`,
+		"chain downstream_line_uuid": `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source","line_uuid":"` + uuid + `","chain":{"downstream_line_uuid":"` + downstream + `","downstream_line_uuid":"` + downstream + `"}}]}`,
+	}
+	for name, current := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, _ := testManager(t)
+			root := t.TempDir()
+			configDir := filepath.Join(root, "conf")
+			mustMkdir(t, configDir)
+			sidecarPath := filepath.Join(root, "lattice-metadata.json")
+			if err := os.WriteFile(sidecarPath, []byte(current), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.ConfigureLayout(configDir, sidecarPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+				t.Fatal(err)
+			}
+			fragment := `{}`
+			doc := Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testSidecarPatch("create")}
+			if err := applyDocErr(m, doc, "task-duplicate-"+name, "lease"); err == nil || !strings.Contains(err.Error(), "duplicate field") {
+				t.Fatalf("duplicate sidecar authority error = %v", err)
+			}
+			assertFile(t, sidecarPath, current)
+			if _, err := os.Lstat(filepath.Join(configDir, doc.FragmentBasename)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fragment mutated before duplicate rejection: %v", err)
+			}
+			entries, err := os.ReadDir(m.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasSuffix(entry.Name(), ".json") || strings.Contains(entry.Name(), ".old") {
+					t.Fatalf("journal mutation before duplicate rejection: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
 func TestSnapshotRejectsRenamedAndDuplicateJournalIdentity(t *testing.T) {
 	for _, duplicate := range []bool{false, true} {
 		t.Run(map[bool]string{false: "renamed", true: "duplicate"}[duplicate], func(t *testing.T) {
