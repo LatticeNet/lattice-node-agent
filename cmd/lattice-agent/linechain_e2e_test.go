@@ -25,6 +25,7 @@ import (
 
 	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
+	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -40,7 +41,39 @@ const (
 	linechainE2ERecoveryResult  = "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT"
 	linechainE2EResolveResult   = "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT"
 	linechainE2EInventoryResult = "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT"
+	linechainE2EOutboxEnv       = "LATTICE_LINECHAIN_E2E_OUTBOX"
+	linechainE2ETaskJSONEnv     = "LATTICE_LINECHAIN_E2E_TASK_JSON"
+	linechainE2EBeginResultEnv  = "LATTICE_LINECHAIN_E2E_BEGIN_RESULT"
 )
+
+// TestLinechainE2EBeginHelper durably records the exact server lease before
+// its script is allowed to execute.
+func TestLinechainE2EBeginHelper(t *testing.T) {
+	resultPath := os.Getenv(linechainE2EBeginResultEnv)
+	if resultPath == "" {
+		return
+	}
+	var task model.Task
+	raw, err := os.ReadFile(mustAbsoluteEnv(t, linechainE2ETaskJSONEnv))
+	if err != nil || json.Unmarshal(raw, &task) != nil {
+		t.Fatalf("decode exact leased task: %v", err)
+	}
+	outbox, err := taskoutbox.Open(mustAbsoluteEnv(t, linechainE2EOutboxEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	committed, err := outbox.BeginWithProtocol(task, "linechain-e3-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed {
+		if err := outbox.ConfirmDurability(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeE2EJSON(t, resultPath, map[string]any{"committed": committed, "task_id": task.ID, "lease_id": task.LeaseID})
+}
 
 var managedE2EProcesses = struct {
 	sync.Mutex
@@ -262,19 +295,25 @@ func TestLinechainE2ERecoverHelper(t *testing.T) {
 	consumeE2ECrashMarker(t, mustAbsoluteEnv(t, linechainE2ECrashMarkerEnv))
 	m := openE2EManager(t, mustExecutableEnv(t, linechainE2EBinEnv), root, mustAbsoluteEnv(t, linechainE2EConfigEnv), mustAbsoluteEnv(t, linechainE2ESidecarEnv), filepath.Join(root, "txn"), mustEnvPort(linechainE2EBPortEnv))
 	defer m.Close()
-	var recovered model.TaskResult
-	called := false
-	if err := m.RequireRecovered(context.Background(), func(result model.TaskResult) error {
-		called = true
-		recovered = result
-		return nil
-	}, "node-b"); err != nil {
+	outbox, err := taskoutbox.Open(mustAbsoluteEnv(t, linechainE2EOutboxEnv))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !called || recovered.TaskID == "" || recovered.LeaseID == "" {
-		t.Fatalf("recovery emitted no exact task result: %+v", recovered)
+	defer outbox.Close()
+	authority, err := captureLinechainAuthority(m, outbox)
+	if err != nil {
+		t.Fatal(err)
 	}
-	writeE2EJSON(t, resultPath, recovered)
+	if err := m.RequireRecoveredAuthorized(context.Background(), func(result model.TaskResult) error {
+		committed, completeErr := outbox.Complete(result)
+		if completeErr != nil && !committed {
+			return completeErr
+		}
+		return outbox.ConfirmDurability()
+	}, "node-b", authority); err != nil {
+		t.Fatal(err)
+	}
+	writeE2EJSON(t, resultPath, pendingE2EResult(t, outbox))
 }
 
 // TestLinechainE2EResolveHelper converts a successful helper run into the
@@ -289,14 +328,65 @@ func TestLinechainE2EResolveHelper(t *testing.T) {
 	leaseID := mustEnv(t, linechainE2ELeaseEnv)
 	m := openE2EManager(t, mustExecutableEnv(t, linechainE2EBinEnv), root, mustAbsoluteEnv(t, linechainE2EConfigEnv), mustAbsoluteEnv(t, linechainE2ESidecarEnv), filepath.Join(root, "txn"), mustEnvPort(linechainE2EBPortEnv))
 	defer m.Close()
+	outbox, err := taskoutbox.Open(mustAbsoluteEnv(t, linechainE2EOutboxEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
 	result, err := m.ResolveAfterRun(context.Background(), model.Task{ID: taskID, LeaseID: leaseID}, model.TaskResult{TaskID: taskID, LeaseID: leaseID, ExitCode: 0, FinishedAt: time.Now().UTC()})
 	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := outbox.Complete(result)
+	if err != nil && !committed {
+		t.Fatal(err)
+	}
+	if err := outbox.ConfirmDurability(); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Cleanup(taskID, leaseID); err != nil {
 		t.Fatal(err)
 	}
-	writeE2EJSON(t, resultPath, result)
+	writeE2EJSON(t, resultPath, pendingE2EResult(t, outbox))
+}
+
+func pendingE2EResult(t *testing.T, outbox *taskoutbox.Store) model.TaskResult {
+	t.Helper()
+	entries, err := outbox.Pending()
+	if err != nil || len(entries) != 1 || entries[0].Result == nil {
+		t.Fatalf("durable result handoff: entries=%+v err=%v", entries, err)
+	}
+	return *entries[0].Result
+}
+
+func TestLinechainE2EDurableResultSurvivesOutboxReopen(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "outbox")
+	task := model.Task{ID: "task-reopen", LeaseID: "lease-reopen", Script: "# lattice-linechain-e3-v2\nexact"}
+	outbox, err := taskoutbox.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil || !committed {
+		t.Fatalf("begin: committed=%v err=%v", committed, err)
+	}
+	result := model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
+	if committed, err := outbox.Complete(result); err != nil || !committed {
+		t.Fatalf("complete: committed=%v err=%v", committed, err)
+	}
+	if err := outbox.ConfirmDurability(); err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := taskoutbox.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := pendingE2EResult(t, reopened); !sameTaskResult(got, result) {
+		t.Fatalf("reopened result changed: got=%+v want=%+v", got, result)
+	}
 }
 
 // TestLinechainE2EInventoryHelper publishes the inventory discovered from the
