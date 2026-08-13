@@ -84,14 +84,16 @@ the task fails before the script runs. This is workdir containment, not a full
 mount namespace: scripts can still read or write other host paths allowed to
 the agent user.
 
-Task leases and completed results are durably journaled before execution and
-upload. The outbox uses a private, server-and-node-specific subdirectory under
-`LATTICE_LOG_STATE_DIR`; manual runs without that setting use the current
-user's cache directory. Override the base directory with
-`LATTICE_TASK_OUTBOX_DIR` or `-task-outbox-dir`. If the lease cannot be written,
-the task does not run. After a restart, completed results are retried first and
-an interrupted task is reported as an unknown outcome rather than executed a
-second time.
+NetGuard apply leases explicitly marked `durable_result` by the server are
+journaled before execution and upload. This scope matches NetGuard's atomic
+server-side result/approval/binding transition; heterogeneous legacy tasks keep
+their historical one-shot delivery semantics. The outbox uses a private,
+server-and-node-specific subdirectory under `LATTICE_LOG_STATE_DIR`; manual runs
+without that setting use the current user's cache directory. Override the base
+directory with `LATTICE_TASK_OUTBOX_DIR` or `-task-outbox-dir`. If a marked lease
+cannot be written, it does not run. After a restart, completed marked results
+are retried first and an interrupted marked task is reported as an unknown
+outcome rather than executed a second time.
 
 For least-privilege Linux systemd installs, set `LATTICE_AGENT_RUN_USER` before
 running `scripts/install.sh`:
@@ -311,7 +313,7 @@ missing checksum manifest aborts the install before the binary is written.
 - `LATTICE_AGENT_ALLOW_EXEC=1` enables bounded task execution.
 - `LATTICE_AGENT_ALLOW_ROOT_EXEC=1` permits task execution while the agent runs
   as root.
-- `LATTICE_TASK_OUTBOX_DIR` overrides the durable result-journal base. The
+- `LATTICE_TASK_OUTBOX_DIR` overrides the durable NetGuard result-journal base. The
   installer creates a private `task-outbox` leaf beneath that base and
   preserves it across reconfiguration; otherwise journals share
   `LATTICE_LOG_STATE_DIR`.

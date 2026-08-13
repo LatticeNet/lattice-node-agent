@@ -263,7 +263,7 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 					}
 					fetchCalls++
 					if fetchCalls == 1 {
-						data, _ := json.Marshal([]model.Task{task})
+						data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
 						return testResponse(http.StatusOK, string(data)), nil
 					}
 					return testResponse(http.StatusOK, `[]`), nil
@@ -407,6 +407,7 @@ type beginFailingOutbox struct {
 
 func (o beginFailingOutbox) Begin(model.Task) (bool, error)          { return o.committed, o.err }
 func (o beginFailingOutbox) Complete(model.TaskResult) (bool, error) { return true, nil }
+func (o beginFailingOutbox) ConfirmDurability() error                { return nil }
 func (o beginFailingOutbox) RecoverInterrupted(string) error         { return nil }
 func (o beginFailingOutbox) Pending() ([]taskoutbox.Entry, error)    { return nil, nil }
 func (o beginFailingOutbox) Remove(taskoutbox.Entry) error           { return nil }
@@ -415,7 +416,7 @@ func TestRunTasksJournalFailurePreventsExecution(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
-	data, _ := json.Marshal([]model.Task{task})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
 	var reported model.TaskResult
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/api/agent/tasks" {
@@ -452,7 +453,7 @@ func TestRunTasksPublishedJournalFailureDoesNotPostConflictingDirectResult(t *te
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
-	data, _ := json.Marshal([]model.Task{task})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
 	postCalls := 0
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/api/agent/tasks" {
@@ -472,6 +473,168 @@ func TestRunTasksPublishedJournalFailureDoesNotPostConflictingDirectResult(t *te
 	}
 	if runner.calls != 0 || postCalls != 0 {
 		t.Fatalf("published journal ambiguity ran or directly reported task: runner=%d posts=%d", runner.calls, postCalls)
+	}
+}
+
+func TestRunTasksExactRedeliveryDoesNotExecuteExistingJournal(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must run once"}
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/agent/tasks" {
+			t.Fatalf("unexpected request for already-journaled lease: %s", r.URL.Path)
+		}
+		return testResponse(http.StatusOK, string(data)), nil
+	})}
+	runner := &countingTaskRunner{}
+	if err := runTasks(
+		agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"},
+		runner,
+		beginFailingOutbox{committed: false},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("exact redelivery executed an existing journal: calls=%d", runner.calls)
+	}
+}
+
+func TestRunTasksKeepsGenericTasksOutsideDurableNetGuardProtocol(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-generic", LeaseID: "lease-generic", Interpreter: "sh", Script: "echo generic"}
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task}})
+	posts := 0
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/agent/tasks":
+			return testResponse(http.StatusOK, string(data)), nil
+		case "/api/agent/task-result":
+			posts++
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		default:
+			return testResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	runner := &countingTaskRunner{result: model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID}}
+	if err := runTasks(
+		agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"},
+		runner,
+		beginFailingOutbox{err: errors.New("generic task must not journal")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 1 || posts != 1 {
+		t.Fatalf("generic task delivery = runner %d posts %d, want one direct execution/result", runner.calls, posts)
+	}
+}
+
+type completePublishingOutbox struct {
+	task       model.Task
+	result     *model.TaskResult
+	confirmErr error
+	confirmed  int
+	removed    int
+}
+
+func (o *completePublishingOutbox) Begin(task model.Task) (bool, error) {
+	o.task = task
+	return true, nil
+}
+
+func (o *completePublishingOutbox) Complete(result model.TaskResult) (bool, error) {
+	o.result = &result
+	return true, errors.New("directory sync failed")
+}
+
+func (o *completePublishingOutbox) ConfirmDurability() error {
+	o.confirmed++
+	return o.confirmErr
+}
+
+func (o *completePublishingOutbox) RecoverInterrupted(string) error { return nil }
+
+func (o *completePublishingOutbox) Pending() ([]taskoutbox.Entry, error) {
+	if o.result == nil {
+		return nil, nil
+	}
+	return []taskoutbox.Entry{{Task: o.task, Result: o.result}}, nil
+}
+
+func (o *completePublishingOutbox) Remove(taskoutbox.Entry) error {
+	o.removed++
+	o.result = nil
+	return nil
+}
+
+func TestRunTasksConfirmsAndUploadsResultPublishedBeforeDirectorySyncFailure(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo once"}
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	posts := 0
+	var posted model.TaskResult
+	outbox := &completePublishingOutbox{}
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/agent/tasks":
+			return testResponse(http.StatusOK, string(data)), nil
+		case "/api/agent/task-result":
+			if outbox.confirmed != 1 {
+				t.Fatalf("result posted before local durability confirmation: confirms=%d", outbox.confirmed)
+			}
+			posts++
+			var body struct {
+				Result model.TaskResult `json:"result"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			posted = body.Result
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		default:
+			return testResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	runner := &countingTaskRunner{result: model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0, Stdout: "exact"}}
+	err := runTasks(agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}, runner, outbox)
+	if err == nil || !strings.Contains(err.Error(), "directory sync failed") {
+		t.Fatalf("runTasks error = %v, want published-result sync warning", err)
+	}
+	if runner.calls != 1 || posts != 1 || outbox.confirmed != 1 || outbox.removed != 1 {
+		t.Fatalf("published result was not confirmed and uploaded exactly once: runner=%d confirms=%d posts=%d removed=%d", runner.calls, outbox.confirmed, posts, outbox.removed)
+	}
+	if posted.TaskID != task.ID || posted.LeaseID != task.LeaseID || posted.NodeID != "node-a" || posted.Stdout != "exact" {
+		t.Fatalf("immediate upload changed result: %+v", posted)
+	}
+}
+
+func TestRunTasksDoesNotUploadUnconfirmedPublishedResult(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo once"}
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	posts := 0
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/agent/tasks":
+			return testResponse(http.StatusOK, string(data)), nil
+		case "/api/agent/task-result":
+			posts++
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		default:
+			return testResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	runner := &countingTaskRunner{result: model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0}}
+	outbox := &completePublishingOutbox{confirmErr: errors.New("directory still unavailable")}
+	err := runTasks(agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}, runner, outbox)
+	if err == nil || !strings.Contains(err.Error(), "confirm published task result") {
+		t.Fatalf("runTasks error = %v, want durability confirmation error", err)
+	}
+	if runner.calls != 1 || outbox.confirmed != 1 || posts != 0 || outbox.removed != 0 {
+		t.Fatalf("unconfirmed result escaped locally: runner=%d confirms=%d posts=%d removed=%d", runner.calls, outbox.confirmed, posts, outbox.removed)
 	}
 }
 
