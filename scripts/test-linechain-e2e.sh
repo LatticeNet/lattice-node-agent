@@ -27,7 +27,8 @@ if [ -z "$server_dir" ]; then
 fi
 [ -n "$server_dir" ] && [ -f "$server_dir/go.mod" ] || { echo "LATTICE_SERVER_E2E_DIR must identify the frozen lattice-server worktree" >&2; exit 1; }
 git -C "$server_dir" diff --quiet 67dc25bc6740657449b6c206cf537b22398bc289 HEAD -- . \
-  ':(exclude)internal/server/server_linechain_lifecycle_e2e_test.go' || {
+  ':(exclude)internal/server/server_linechain_lifecycle_e2e_test.go' \
+  ':(exclude)internal/server/server_linechain_lifecycle_net_e2e_test.go' || {
   echo "LATTICE_SERVER_E2E_DIR must match the frozen server plus Task21 Reality repair tree" >&2
   exit 1
 }
