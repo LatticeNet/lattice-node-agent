@@ -1233,7 +1233,15 @@ func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manag
 			}
 			continue
 		}
-		committed, err := outbox.Begin(task)
+		var committed bool
+		var err error
+		if typed, ok := outbox.(interface {
+			BeginWithProtocol(model.Task, string) (bool, error)
+		}); ok {
+			committed, err = typed.BeginWithProtocol(task, leased.DurableProtocol)
+		} else {
+			committed, err = outbox.Begin(task)
+		}
 		if err != nil {
 			journalErr := fmt.Errorf("journal task lease %s before execution: %w", task.ID, err)
 			if committed {
