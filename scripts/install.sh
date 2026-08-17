@@ -17,6 +17,7 @@ token="${LATTICE_NODE_TOKEN:-}"
 bin_path="${LATTICE_AGENT_BIN:-$LATTICE_HOME/lattice-agent}"
 env_path="${LATTICE_AGENT_ENV:-$LATTICE_HOME/lattice-agent.env}"
 state_dir="${LATTICE_AGENT_STATE:-$LATTICE_HOME/state}"
+linechain_txn_dir="${LATTICE_LINECHAIN_TXN_DIR:-$state_dir/linechain-txn}"
 service_name="${LATTICE_AGENT_SERVICE:-lattice-agent}"
 run_user="${LATTICE_AGENT_RUN_USER:-}"
 run_group="${LATTICE_AGENT_RUN_GROUP:-}"
@@ -83,6 +84,7 @@ if [ "$(id -u)" -ne 0 ]; then
       LATTICE_TASK_CGROUP_CPU_MAX="${LATTICE_TASK_CGROUP_CPU_MAX:-}" \
       LATTICE_TASK_WORK_ROOT="${LATTICE_TASK_WORK_ROOT:-}" \
       LATTICE_TASK_OUTBOX_DIR="${LATTICE_TASK_OUTBOX_DIR:-}" \
+      LATTICE_LINECHAIN_TXN_DIR="$linechain_txn_dir" \
       LATTICE_AGENT_ALLOW_TERMINAL="${LATTICE_AGENT_ALLOW_TERMINAL:-}" \
       LATTICE_TERMINAL_TRANSPORT="${LATTICE_TERMINAL_TRANSPORT:-}" \
       LATTICE_IP_MODE="${LATTICE_IP_MODE:-}" LATTICE_IP_RESOLVERS="${LATTICE_IP_RESOLVERS:-}" \
@@ -196,7 +198,7 @@ load_existing_config() {
     LATTICE_AGENT_ALLOW_EXEC LATTICE_AGENT_ALLOW_ROOT_EXEC LATTICE_NO_EXEC \
     LATTICE_TASK_CGROUP_ROOT LATTICE_TASK_CGROUP_MEMORY_MAX \
     LATTICE_TASK_CGROUP_PIDS_MAX LATTICE_TASK_CGROUP_CPU_MAX \
-    LATTICE_TASK_WORK_ROOT LATTICE_TASK_OUTBOX_DIR \
+    LATTICE_TASK_WORK_ROOT LATTICE_TASK_OUTBOX_DIR LATTICE_LINECHAIN_TXN_DIR \
     LATTICE_AGENT_ALLOW_TERMINAL LATTICE_TERMINAL_TRANSPORT LATTICE_IP_MODE \
     LATTICE_IP_RESOLVERS LATTICE_IP_SCRIPT LATTICE_PUBLIC_IP LATTICE_PUBLIC_IP6 \
     LATTICE_SSH_ALERTS LATTICE_SINGBOX_DISCOVER LATTICE_SINGBOX_BIN \
@@ -303,6 +305,23 @@ apply_service_identity_permissions() {
     chown "$run_user:$run_group" "$task_outbox_leaf" || die "cannot assign $task_outbox_leaf to $run_user:$run_group"
     chmod 0700 "$task_outbox_leaf" 2>/dev/null || true
   fi
+  chown "$run_user:$run_group" "$linechain_txn_dir" || die "cannot assign $linechain_txn_dir to $run_user:$run_group"
+  chmod 0700 "$linechain_txn_dir" 2>/dev/null || true
+}
+
+prepare_linechain_txn_dir() {
+  case "$linechain_txn_dir" in
+    /|/bin|/boot|/dev|/etc|/lib|/lib32|/lib64|/proc|/root|/sbin|/sys|/usr|/var)
+      die "LATTICE_LINECHAIN_TXN_DIR must not be a filesystem or system root: $linechain_txn_dir" ;;
+    /*) ;;
+    *) die "LATTICE_LINECHAIN_TXN_DIR must be an absolute path" ;;
+  esac
+  [ ! -L "$linechain_txn_dir" ] || die "LATTICE_LINECHAIN_TXN_DIR must not be a symlink: $linechain_txn_dir"
+  if [ -e "$linechain_txn_dir" ] && [ ! -d "$linechain_txn_dir" ]; then
+    die "LATTICE_LINECHAIN_TXN_DIR must be a directory: $linechain_txn_dir"
+  fi
+  mkdir -p "$linechain_txn_dir" || die "cannot create LATTICE_LINECHAIN_TXN_DIR=$linechain_txn_dir"
+  chmod 0700 "$linechain_txn_dir" 2>/dev/null || true
 }
 
 prepare_task_work_root() {
@@ -421,6 +440,7 @@ fi
 mkdir -p "$state_dir"
 prepare_task_work_root
 prepare_task_outbox_root
+prepare_linechain_txn_dir
 chmod 0750 "$LATTICE_HOME" 2>/dev/null || true
 apply_service_identity_permissions
 
@@ -475,6 +495,7 @@ LATTICE_TASK_CGROUP_PIDS_MAX=$(quote_env "${LATTICE_TASK_CGROUP_PIDS_MAX:-64}")
 LATTICE_TASK_CGROUP_CPU_MAX=$(quote_env "${LATTICE_TASK_CGROUP_CPU_MAX:-100000 100000}")
 LATTICE_TASK_WORK_ROOT=$(quote_env "${LATTICE_TASK_WORK_ROOT:-}")
 LATTICE_TASK_OUTBOX_DIR=$(quote_env "${LATTICE_TASK_OUTBOX_DIR:-}")
+LATTICE_LINECHAIN_TXN_DIR=$(quote_env "$linechain_txn_dir")
 LATTICE_AGENT_ALLOW_TERMINAL=$(quote_env "${LATTICE_AGENT_ALLOW_TERMINAL:-0}")
 LATTICE_TERMINAL_TRANSPORT=$(quote_env "${LATTICE_TERMINAL_TRANSPORT:-poll}")
 LATTICE_IP_MODE=$(quote_env "${LATTICE_IP_MODE:-auto}")
@@ -567,6 +588,7 @@ EOF
     <key>LATTICE_TASK_CGROUP_CPU_MAX</key><string>$(xml_escape "${LATTICE_TASK_CGROUP_CPU_MAX:-100000 100000}")</string>
     <key>LATTICE_TASK_WORK_ROOT</key><string>$(xml_escape "${LATTICE_TASK_WORK_ROOT:-}")</string>
     <key>LATTICE_TASK_OUTBOX_DIR</key><string>$(xml_escape "${LATTICE_TASK_OUTBOX_DIR:-}")</string>
+    <key>LATTICE_LINECHAIN_TXN_DIR</key><string>$(xml_escape "$linechain_txn_dir")</string>
     <key>LATTICE_AGENT_ALLOW_TERMINAL</key><string>$(xml_escape "${LATTICE_AGENT_ALLOW_TERMINAL:-0}")</string>
     <key>LATTICE_TERMINAL_TRANSPORT</key><string>$(xml_escape "${LATTICE_TERMINAL_TRANSPORT:-poll}")</string>
     <key>LATTICE_IP_MODE</key><string>$(xml_escape "${LATTICE_IP_MODE:-auto}")</string>

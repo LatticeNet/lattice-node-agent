@@ -35,6 +35,7 @@ type Entry struct {
 	Version            int               `json:"version"`
 	State              string            `json:"state"`
 	Task               model.Task        `json:"task"`
+	DurableProtocol    string            `json:"durable_protocol,omitempty"`
 	Result             *model.TaskResult `json:"result,omitempty"`
 	ExecutionStartedAt time.Time         `json:"execution_started_at"`
 	UpdatedAt          time.Time         `json:"updated_at"`
@@ -157,6 +158,15 @@ func (s *Store) Close() error {
 // must not be executed again. A true result means this call published the new
 // lease journal, even if a subsequent directory sync reported an error.
 func (s *Store) Begin(task model.Task) (committed bool, err error) {
+	return s.begin(task, "")
+}
+
+// BeginWithProtocol records the leased delivery discriminator for recovery.
+func (s *Store) BeginWithProtocol(task model.Task, protocol string) (bool, error) {
+	return s.begin(task, protocol)
+}
+
+func (s *Store) begin(task model.Task, protocol string) (committed bool, err error) {
 	if strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.LeaseID) == "" {
 		return false, fmt.Errorf("task id and lease id are required for durable execution")
 	}
@@ -167,7 +177,7 @@ func (s *Store) Begin(task model.Task) (committed bool, err error) {
 	key := entryKey(task.ID, task.LeaseID)
 	for _, entry := range entries {
 		if entry.Task.ID == task.ID {
-			if entry.key == key && reflect.DeepEqual(entry.Task, task) {
+			if entry.key == key && reflect.DeepEqual(entry.Task, task) && entry.DurableProtocol == protocol {
 				return false, nil
 			}
 			return false, fmt.Errorf("task %s was redelivered with a different lease or content", task.ID)
@@ -181,6 +191,7 @@ func (s *Store) Begin(task model.Task) (committed bool, err error) {
 		Version:            entryVersion,
 		State:              stateLeased,
 		Task:               task,
+		DurableProtocol:    protocol,
 		ExecutionStartedAt: now,
 		UpdatedAt:          now,
 	})
@@ -193,6 +204,9 @@ func (s *Store) Complete(result model.TaskResult) (committed bool, err error) {
 	entry, err := s.read(key)
 	if err != nil {
 		return false, err
+	}
+	if entry.State == stateDone && entry.Result != nil && reflect.DeepEqual(*entry.Result, result) {
+		return false, nil
 	}
 	if entry.State != stateLeased {
 		return false, fmt.Errorf("task lease %s is not awaiting completion", result.TaskID)
@@ -235,6 +249,9 @@ func (s *Store) RecoverInterrupted(nodeID string) error {
 	for _, entry := range entries {
 		if entry.State != stateLeased {
 			continue
+		}
+		if entry.DurableProtocol == "linechain-e3-v2" {
+			return fmt.Errorf("leased E3 task %s requires linechain journal recovery before generic outbox recovery", entry.Task.ID)
 		}
 		now := time.Now().UTC()
 		result := model.TaskResult{
@@ -289,6 +306,15 @@ func (s *Store) Pending() ([]Entry, error) {
 		return pending[i].UpdatedAt.Before(pending[j].UpdatedAt)
 	})
 	return pending, nil
+}
+
+// Snapshot returns a bounded copy of every leased and completed entry.
+func (s *Store) Snapshot() ([]Entry, error) {
+	entries, err := s.readAll()
+	if err != nil {
+		return nil, err
+	}
+	return append([]Entry(nil), entries...), nil
 }
 
 // Remove atomically unlinks an acknowledged outbox entry and syncs the
@@ -363,6 +389,9 @@ func (s *Store) read(key string) (Entry, error) {
 	}
 	if entry.Version != entryVersion || entry.Task.ID == "" || entry.Task.LeaseID == "" {
 		return Entry{}, fmt.Errorf("invalid task result journal: %s", path)
+	}
+	if strings.HasPrefix(entry.DurableProtocol, "linechain-e3-") && entry.DurableProtocol != "linechain-e3-v2" {
+		return Entry{}, fmt.Errorf("unsupported persisted linechain durable protocol %q", entry.DurableProtocol)
 	}
 	if key != entryKey(entry.Task.ID, entry.Task.LeaseID) {
 		return Entry{}, fmt.Errorf("task result journal key mismatch: %s", path)

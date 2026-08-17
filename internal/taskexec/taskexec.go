@@ -3,6 +3,8 @@ package taskexec
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -29,8 +31,13 @@ var allowedInterpreters = map[string]string{
 // because applyResourceLimits is a no-op there.
 const (
 	// maxFileSizeBytes caps the size of any single file the task may write,
-	// preventing a runaway script from filling the disk.
-	maxFileSizeBytes = 8 * 1024 * 1024 // 8 MiB
+	// preventing a runaway script from filling the disk. It must still fit the
+	// largest legitimate payload a task downloads — the agent's own release
+	// binary (~tens of MiB): the 2026-08-12 fleet upgrade died to SIGXFSZ
+	// (exit 153) on 18 nodes when this was 8 MiB. The server-side update script
+	// also lifts the cap itself, so this value only guards non-update tasks and
+	// future agents whose update already ran.
+	maxFileSizeBytes = 256 * 1024 * 1024 // 256 MiB
 	// maxProcessHeadroom is the extra number of processes/threads a task may
 	// add above the agent user's current Linux-wide usage. RLIMIT_NPROC is
 	// scoped to the real UID rather than the task process tree, so using a fixed
@@ -163,6 +170,11 @@ type Runner struct {
 	// Trusted server-authored scripts use it for one-shot helper modes without
 	// depending on PATH or inheriting the service process environment.
 	AgentBinary string
+	// LinechainTxnDir is the private transaction root passed only to trusted
+	// server-authored helper invocations.
+	LinechainTxnDir      string
+	LinechainConfigDir   string
+	LinechainSidecarPath string
 	// getUID returns the effective uid of the agent process. It is a field so
 	// tests can simulate "running as root" without actually being root. When
 	// nil it defaults to os.Geteuid.
@@ -287,7 +299,14 @@ func (r Runner) effectiveUID() int {
 	return os.Geteuid()
 }
 
-func (r Runner) Run(task model.Task) model.TaskResult {
+func (r Runner) Run(task model.Task) model.TaskResult { return r.run(task, false) }
+
+// RunLinechain runs an already validated E3 lease with the private host-local
+// linechain authority in its environment. Callers must select this path from
+// durable protocol metadata, never from script contents.
+func (r Runner) RunLinechain(task model.Task) model.TaskResult { return r.run(task, true) }
+
+func (r Runner) run(task model.Task, trustedLinechain bool) model.TaskResult {
 	start := time.Now().UTC()
 	result := model.TaskResult{
 		TaskID:    task.ID,
@@ -387,6 +406,16 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 	}
 	if filepath.IsAbs(r.AgentBinary) {
 		cmd.Env = append(cmd.Env, "LATTICE_AGENT_BIN="+r.AgentBinary)
+	}
+	if trustedLinechain && filepath.IsAbs(r.LinechainTxnDir) {
+		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_TXN_DIR="+r.LinechainTxnDir)
+	}
+	if trustedLinechain && filepath.IsAbs(r.LinechainConfigDir) && filepath.IsAbs(r.LinechainSidecarPath) {
+		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_CONFIG_DIR="+r.LinechainConfigDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+r.LinechainSidecarPath)
+	}
+	if trustedLinechain {
+		sum := sha256.Sum256([]byte(task.Script))
+		cmd.Env = append(cmd.Env, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+hex.EncodeToString(sum[:]))
 	}
 
 	var stdout, stderr cappedBuffer

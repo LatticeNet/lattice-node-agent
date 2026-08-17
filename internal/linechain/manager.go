@@ -1,0 +1,1075 @@
+// Package linechain applies the two host-local artifacts that define a
+// sing-box line chain as one crash-recoverable transaction.
+package linechain
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+)
+
+const (
+	journalVersion  = 2
+	maxDocumentSize = 4 << 20
+	maxArtifactSize = maxDocumentSize
+)
+
+var linechainBasenameRE = regexp.MustCompile(`^lattice-linechain-[0-9a-f]{20}\.json$`)
+
+// Document is the bounded server-rendered input consumed by -linechain-apply.
+// Desired content is never copied into the journal; only its digest is stored.
+type Document struct {
+	Version                int            `json:"version"`
+	DurableProtocol        string         `json:"durable_protocol"`
+	Operation              string         `json:"operation"`
+	ConfigDir              string         `json:"-"`
+	FragmentBasename       string         `json:"fragment_basename"`
+	FragmentPath           string         `json:"-"`
+	SidecarPath            string         `json:"-"`
+	Fragment               *string        `json:"fragment"`
+	SidecarPatch           SidecarPatchV2 `json:"sidecar_patch"`
+	PreviousFragmentSHA256 *string        `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string        `json:"fragment_sha256"`
+	SidecarPatchSHA256     string         `json:"sidecar_patch_sha256"`
+	ArtifactSHA256         string         `json:"artifact_sha256"`
+	SidecarPatchCanonical  []byte         `json:"-"`
+	SidecarOutput          *string        `json:"-"`
+}
+
+// wireDocumentV2 is the only server-controlled shape accepted by Apply.
+// Host paths and the ordinary-writer sidecar predecessor are intentionally not
+// representable on the wire; Apply derives paths from the local layout.
+type wireDocumentV2 struct {
+	Version                int            `json:"version"`
+	DurableProtocol        string         `json:"durable_protocol"`
+	Operation              string         `json:"operation"`
+	FragmentBasename       string         `json:"fragment_basename"`
+	Fragment               *string        `json:"fragment"`
+	SidecarPatch           SidecarPatchV2 `json:"sidecar_patch"`
+	PreviousFragmentSHA256 *string        `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string        `json:"fragment_sha256"`
+	SidecarPatchSHA256     string         `json:"sidecar_patch_sha256"`
+	ArtifactSHA256         string         `json:"artifact_sha256"`
+}
+
+// BindDocument computes canonical test/server fixture bindings. Apply validates
+// issued bindings and never calls this after reading or merging host state.
+func BindDocument(d Document) Document {
+	if d.DurableProtocol == "" {
+		d.DurableProtocol = "linechain-e3-v2"
+	}
+	if d.Fragment == nil {
+		d.FragmentSHA256 = nil
+	} else {
+		value := digest([]byte(*d.Fragment))
+		d.FragmentSHA256 = &value
+	}
+	patch, _ := json.Marshal(d.SidecarPatch)
+	d.SidecarPatchCanonical = patch
+	d.SidecarPatchSHA256 = digest(patch)
+	binding := semanticArtifactBindingV2{Schema: semanticArtifactSchema, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		PreviousFragmentSHA256: d.PreviousFragmentSHA256, FragmentSHA256: d.FragmentSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256}
+	canonical, _ := canonicalSemanticArtifactBinding(binding)
+	d.ArtifactSHA256 = digest(canonical)
+	return d
+}
+
+type journal struct {
+	Version              int               `json:"version"`
+	TaskID               string            `json:"task_id"`
+	LeaseID              string            `json:"lease_id"`
+	FragmentPath         string            `json:"fragment_path"`
+	SidecarPath          string            `json:"sidecar_path"`
+	FragmentOld          string            `json:"fragment_old_sha256,omitempty"`
+	SidecarOld           string            `json:"sidecar_old_sha256,omitempty"`
+	ArtifactSHA256       string            `json:"artifact_sha256"`
+	SidecarPatchSHA256   string            `json:"sidecar_patch_sha256"`
+	FragmentOutputSHA256 string            `json:"fragment_output_sha256,omitempty"`
+	SidecarOutputSHA256  string            `json:"sidecar_output_sha256"`
+	TaskScriptSHA        string            `json:"task_script_sha256"`
+	FragmentHadOld       bool              `json:"fragment_had_old"`
+	SidecarHadOld        bool              `json:"sidecar_had_old"`
+	Phase                string            `json:"phase"`
+	Result               *model.TaskResult `json:"result,omitempty"`
+}
+
+type Manager struct {
+	dir            string
+	lock           *os.File
+	run            func(context.Context, string, ...string) ([]byte, error)
+	configDir      string
+	sidecarPath    string
+	remove         func(string) error
+	publishFile    func(string, *string) error
+	writeJournal   func(string, any) error
+	syncDirectory  func(string) error
+	singBoxBinary  string
+	restartCommand []string
+	verifyCommand  []string
+}
+
+func (m *Manager) ConfigureLayout(configDir, sidecarPath string) error {
+	configDir = filepath.Clean(strings.TrimSpace(configDir))
+	sidecarPath = filepath.Clean(strings.TrimSpace(sidecarPath))
+	if !filepath.IsAbs(configDir) || !filepath.IsAbs(sidecarPath) {
+		return fmt.Errorf("linechain layout paths must be absolute")
+	}
+	resolvedConfig, err := filepath.EvalSymlinks(configDir)
+	if err != nil {
+		return fmt.Errorf("resolve linechain config directory: %w", err)
+	}
+	resolvedSidecarParent, err := filepath.EvalSymlinks(filepath.Dir(sidecarPath))
+	if err != nil {
+		return fmt.Errorf("resolve linechain sidecar directory: %w", err)
+	}
+	for label, root := range map[string]string{"config": resolvedConfig, "sidecar": resolvedSidecarParent} {
+		info, err := os.Lstat(root)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedPath(info) || info.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("linechain %s root is not a trusted private directory", label)
+		}
+	}
+	configDir = filepath.Clean(resolvedConfig)
+	sidecarPath = filepath.Join(filepath.Clean(resolvedSidecarParent), filepath.Base(sidecarPath))
+	if err := validateParents(filepath.Join(configDir, "placeholder")); err != nil {
+		return err
+	}
+	if err := validateParents(sidecarPath); err != nil {
+		return err
+	}
+	m.configDir = configDir
+	m.sidecarPath = sidecarPath
+	return nil
+}
+func (m *Manager) Configured() bool { return m != nil && m.configDir != "" && m.sidecarPath != "" }
+
+// ConfigureCommands is an integration-test seam. Production uses fixed local
+// command vectors; task documents cannot select executables or arguments.
+func (m *Manager) ConfigureCommands(binary string, restart, verify []string) error {
+	if strings.TrimSpace(binary) == "" || len(restart) == 0 || len(verify) == 0 {
+		return fmt.Errorf("linechain command vectors must be non-empty")
+	}
+	m.singBoxBinary = binary
+	m.restartCommand = append([]string(nil), restart...)
+	m.verifyCommand = append([]string(nil), verify...)
+	return nil
+}
+
+// ConfigureCleanupForTest injects cleanup fault seams for crash-boundary tests.
+func (m *Manager) ConfigureCleanupForTest(remove func(string) error, syncDirectory func(string) error) {
+	if remove == nil {
+		remove = os.Remove
+	}
+	if syncDirectory == nil {
+		syncDirectory = syncDir
+	}
+	m.remove = remove
+	m.syncDirectory = syncDirectory
+}
+
+// ConfigureMutationForTest injects atomic publication and journal-write faults.
+func (m *Manager) ConfigureMutationForTest(publishFile func(string, *string) error, writeJournal func(string, any) error) {
+	if publishFile == nil {
+		publishFile = publish
+	}
+	if writeJournal == nil {
+		writeJournal = writeJSON
+	}
+	m.publishFile = publishFile
+	m.writeJournal = writeJournal
+}
+
+// Open takes exclusive ownership of a private absolute transaction directory.
+func Open(dir string) (*Manager, error) {
+	m, err := open(dir)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := lockManager(filepath.Join(m.dir, ".lock"))
+	if err != nil {
+		return nil, fmt.Errorf("linechain transaction manager already open: %w", err)
+	}
+	m.lock = lock
+	if err := syncDir(m.dir); err != nil {
+		_ = unlockManager(lock)
+		m.lock = nil
+		return nil, err
+	}
+	return m, nil
+}
+
+// OpenHelper opens the transaction directory without taking the manager lock.
+// It is used only by a child helper spawned by the lock-owning agent.
+func OpenHelper(dir string) (*Manager, error) { return open(dir) }
+
+func open(dir string) (*Manager, error) {
+	dir = filepath.Clean(strings.TrimSpace(dir))
+	if dir == "." || !filepath.IsAbs(dir) || dir == string(filepath.Separator) {
+		return nil, fmt.Errorf("linechain transaction directory must be absolute and non-root")
+	}
+	if err := makeDurablePrivateDir(dir, syncDir); err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("linechain transaction path must be a real directory")
+	}
+	if !ownedPath(info) || info.Mode().Perm() != 0o700 {
+		return nil, fmt.Errorf("linechain transaction directory must be agent-owned with exact mode 0700")
+	}
+	m := &Manager{dir: dir}
+	m.remove = os.Remove
+	m.publishFile = publish
+	m.writeJournal = writeJSON
+	m.syncDirectory = syncDir
+	m.singBoxBinary = "sing-box"
+	m.restartCommand = []string{"systemctl", "restart", "sing-box"}
+	m.verifyCommand = []string{"systemctl", "is-active", "--quiet", "sing-box"}
+	m.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	}
+	return m, nil
+}
+
+func makeDurablePrivateDir(dir string, syncDirectory func(string) error) error {
+	dir = filepath.Clean(dir)
+	missing := []string{}
+	current := dir
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return fmt.Errorf("path component must be a real directory: %s", current)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		missing = append(missing, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			return fmt.Errorf("no existing parent for linechain transaction directory")
+		}
+		current = parent
+	}
+	if parent := filepath.Dir(current); parent != current {
+		if err := syncDirectory(parent); err != nil {
+			return fmt.Errorf("confirm existing directory %s: %w", current, err)
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		path := missing[i]
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return fmt.Errorf("sync parent after creating %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) Close() error {
+	if m == nil || m.lock == nil {
+		return nil
+	}
+	err := unlockManager(m.lock)
+	m.lock = nil
+	return err
+}
+
+func (m *Manager) journalPath(taskID, leaseID string) string {
+	s := sha256.Sum256([]byte(taskID + "\x00" + leaseID))
+	return filepath.Join(m.dir, hex.EncodeToString(s[:])+".json")
+}
+
+// Apply reads and applies one document. It is intended for the early-exit
+// helper mode and obtains task identity from the runner's minimal environment.
+func (m *Manager) Apply(ctx context.Context, r io.Reader, taskID, leaseID, taskScriptSHA string) error {
+	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(leaseID) == "" {
+		return fmt.Errorf("task and lease identity are required")
+	}
+	scriptBinding := strings.TrimSpace(taskScriptSHA)
+	if !validSHA(scriptBinding) {
+		return fmt.Errorf("linechain task script binding is required and must be lowercase SHA-256")
+	}
+	raw, err := io.ReadAll(io.LimitReader(r, maxDocumentSize+1))
+	if err != nil {
+		return fmt.Errorf("read linechain document: %w", err)
+	}
+	if len(raw) > maxDocumentSize {
+		return fmt.Errorf("linechain document exceeds %d bytes", maxDocumentSize)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var wire wireDocumentV2
+	if err := dec.Decode(&wire); err != nil {
+		return fmt.Errorf("decode linechain document: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err == nil {
+		return fmt.Errorf("decode linechain document: unexpected trailing data")
+	} else if !errors.Is(err, io.EOF) {
+		return fmt.Errorf("decode linechain document trailing data: %w", err)
+	}
+	if wire.Version != 2 {
+		return fmt.Errorf("unsupported linechain document version %d", wire.Version)
+	}
+	if wire.DurableProtocol != "linechain-e3-v2" {
+		return fmt.Errorf("unsupported linechain durable protocol %q", wire.DurableProtocol)
+	}
+	rawFields, err := decodeUniqueJSONObject(raw)
+	if err != nil {
+		return fmt.Errorf("decode linechain document fields: %w", err)
+	}
+	for _, name := range []string{"version", "durable_protocol", "operation", "fragment_basename", "fragment", "sidecar_patch", "previous_fragment_sha256", "fragment_sha256", "sidecar_patch_sha256", "artifact_sha256"} {
+		if _, ok := rawFields[name]; !ok {
+			return fmt.Errorf("linechain document field %s must be present", name)
+		}
+	}
+	if filepath.Base(wire.FragmentBasename) != wire.FragmentBasename || !linechainBasenameRE.MatchString(wire.FragmentBasename) {
+		return fmt.Errorf("fragment_basename is invalid")
+	}
+	patch, patchCanonical, err := canonicalSemanticSidecarPatch(rawFields["sidecar_patch"])
+	if err != nil {
+		return err
+	}
+	binding := semanticArtifactBindingV2{Schema: semanticArtifactSchema, Operation: wire.Operation, FragmentBasename: wire.FragmentBasename,
+		PreviousFragmentSHA256: wire.PreviousFragmentSHA256, FragmentSHA256: wire.FragmentSHA256, SidecarPatchSHA256: wire.SidecarPatchSHA256}
+	if err := verifySemanticArtifactBinding(wire.Fragment, patchCanonical, binding, wire.ArtifactSHA256); err != nil {
+		return err
+	}
+	d := Document{
+		Version: wire.Version, DurableProtocol: wire.DurableProtocol, Operation: wire.Operation, ConfigDir: m.configDir,
+		FragmentBasename: wire.FragmentBasename, FragmentPath: filepath.Join(m.configDir, wire.FragmentBasename), SidecarPath: m.sidecarPath,
+		PreviousFragmentSHA256: wire.PreviousFragmentSHA256, Fragment: wire.Fragment, SidecarPatch: patch,
+		FragmentSHA256: wire.FragmentSHA256, SidecarPatchSHA256: wire.SidecarPatchSHA256, ArtifactSHA256: wire.ArtifactSHA256,
+		SidecarPatchCanonical: patchCanonical,
+	}
+	if err := m.validateDocument(d); err != nil {
+		return err
+	}
+	path := m.journalPath(taskID, leaseID)
+	if _, err := os.Lstat(path); err == nil {
+		return m.recoverOne(ctx, path, nil, "", scriptBinding)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	fragmentOld, fragmentHad, err := readCurrent(d.FragmentPath)
+	if err != nil {
+		return err
+	}
+	sidecarOld, sidecarHad, err := readCurrent(d.SidecarPath)
+	if err != nil {
+		return err
+	}
+	previousFragmentSHA := ""
+	if d.PreviousFragmentSHA256 != nil {
+		previousFragmentSHA = *d.PreviousFragmentSHA256
+	}
+	if err := requirePrevious("fragment", fragmentOld, fragmentHad, previousFragmentSHA); err != nil {
+		return err
+	}
+	if !sidecarHad {
+		return fmt.Errorf("current semantic sidecar is required")
+	}
+	mergedSidecar, err := mergeManagedSidecar(sidecarOld, d.SidecarPatch)
+	if err != nil {
+		return err
+	}
+	mergedSidecarText := string(mergedSidecar)
+	d.SidecarOutput = &mergedSidecarText
+	j := journal{Version: journalVersion, TaskID: taskID, LeaseID: leaseID, FragmentPath: d.FragmentPath, SidecarPath: d.SidecarPath,
+		FragmentOld: digestMaybe(fragmentOld, fragmentHad), SidecarOld: digestMaybe(sidecarOld, sidecarHad), FragmentHadOld: fragmentHad, SidecarHadOld: sidecarHad,
+		ArtifactSHA256: d.ArtifactSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256,
+		FragmentOutputSHA256: digestPtr(d.Fragment), SidecarOutputSHA256: digestPtr(d.SidecarOutput), TaskScriptSHA: scriptBinding, Phase: "prepared"}
+	if err := m.writeBackup(path+".fragment.old", fragmentOld, fragmentHad); err != nil {
+		return err
+	}
+	if err := m.writeBackup(path+".sidecar.old", sidecarOld, sidecarHad); err != nil {
+		return err
+	}
+	if err := m.writeJournal(path, j); err != nil {
+		return err
+	}
+	if err := m.publishFile(d.FragmentPath, d.Fragment); err != nil {
+		return m.rollback(ctx, path, &j, d, fmt.Errorf("publish fragment: %w", err))
+	}
+	j.Phase = "fragment_published"
+	if err := m.writeJournal(path, j); err != nil {
+		return err
+	}
+	if err := m.publishFile(d.SidecarPath, d.SidecarOutput); err != nil {
+		return m.rollback(ctx, path, &j, d, fmt.Errorf("publish sidecar: %w", err))
+	}
+	j.Phase = "pair_published"
+	if err := m.writeJournal(path, j); err != nil {
+		return err
+	}
+	if err := m.checkRestartVerify(ctx, d); err != nil {
+		return m.rollback(ctx, path, &j, d, err)
+	}
+	j.Phase = "desired_verified"
+	return m.writeJournal(path, j)
+}
+
+func decodeUniqueJSONObject(raw []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("must be an object")
+	}
+	fields := make(map[string]json.RawMessage)
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("object field name is invalid")
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate field %s", name)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[name] = value
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected trailing data")
+	}
+	return fields, nil
+}
+
+// JournalRef is the bounded identity needed to cross-check outbox authority.
+type JournalRef struct {
+	TaskID, LeaseID string
+	Phase           string
+	Result          *model.TaskResult
+	Terminal        bool
+	TaskScriptSHA   string
+	ArtifactSHA256  string
+	JournalSHA256   string
+}
+
+type RecoveryAuthority struct {
+	TaskScriptSHA, ArtifactSHA256, Phase, ResultSHA256, JournalSHA256 string
+}
+
+func (m *Manager) Snapshot() ([]JournalRef, error) {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]JournalRef, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if len(refs) >= 1024 {
+			return nil, fmt.Errorf("linechain journal capacity exceeded")
+		}
+		j, err := readJournal(filepath.Join(m.dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		key := j.TaskID + "\x00" + j.LeaseID
+		if _, ok := seen[key]; ok {
+			return nil, fmt.Errorf("duplicate linechain journal identity: %s", j.TaskID)
+		}
+		seen[key] = struct{}{}
+		if entry.Name() != filepath.Base(m.journalPath(j.TaskID, j.LeaseID)) {
+			return nil, fmt.Errorf("linechain journal filename does not match task and lease: %s", entry.Name())
+		}
+		if err := m.validateJournal(filepath.Join(m.dir, entry.Name()), j); err != nil {
+			return nil, err
+		}
+		refs = append(refs, JournalRef{TaskID: j.TaskID, LeaseID: j.LeaseID, Phase: j.Phase, Result: j.Result, Terminal: journalTerminal(j.Phase), TaskScriptSHA: j.TaskScriptSHA, ArtifactSHA256: j.ArtifactSHA256, JournalSHA256: journalSHA(j)})
+	}
+	return refs, nil
+}
+
+func (m *Manager) validateJournal(path string, j journal) error {
+	if !m.Configured() {
+		return fmt.Errorf("linechain journal exists before runtime layout is configured")
+	}
+	if filepath.Clean(path) != m.journalPath(j.TaskID, j.LeaseID) {
+		return fmt.Errorf("linechain journal filename does not match task and lease")
+	}
+	fragmentName := filepath.Base(j.FragmentPath)
+	if filepath.Clean(j.FragmentPath) != filepath.Join(m.configDir, fragmentName) || !linechainBasenameRE.MatchString(fragmentName) {
+		return fmt.Errorf("linechain journal fragment path is outside local authority")
+	}
+	if filepath.Clean(j.SidecarPath) != m.sidecarPath {
+		return fmt.Errorf("linechain journal sidecar path is outside local authority")
+	}
+	validPhase := map[string]bool{
+		"prepared": true, "fragment_published": true, "pair_published": true, "desired_verified": true,
+		"old_restored": true, "terminal_desired": true, "terminal_old": true,
+	}
+	if !validPhase[j.Phase] {
+		return fmt.Errorf("linechain journal has unknown phase %q", j.Phase)
+	}
+	terminal := journalTerminal(j.Phase)
+	if terminal != (j.Result != nil) {
+		return fmt.Errorf("linechain journal phase/result shape is inconsistent")
+	}
+	if j.Result != nil && (j.Result.TaskID != j.TaskID || j.Result.LeaseID != j.LeaseID || j.Result.FinishedAt.IsZero()) {
+		return fmt.Errorf("linechain journal terminal result does not match its identity")
+	}
+	if (j.FragmentHadOld && !validSHA(j.FragmentOld)) || (!j.FragmentHadOld && j.FragmentOld != "") ||
+		(j.SidecarHadOld && !validSHA(j.SidecarOld)) || (!j.SidecarHadOld && j.SidecarOld != "") ||
+		(j.FragmentOutputSHA256 != "" && !validSHA(j.FragmentOutputSHA256)) || !validSHA(j.SidecarOutputSHA256) ||
+		!validSHA(j.SidecarPatchSHA256) || !validSHA(j.ArtifactSHA256) || !validSHA(j.TaskScriptSHA) {
+		return fmt.Errorf("linechain journal artifact digest shape is invalid")
+	}
+	if terminal {
+		return nil
+	}
+	for _, backup := range []struct {
+		path   string
+		exists bool
+		want   string
+	}{
+		{path: path + ".fragment.old", exists: j.FragmentHadOld, want: j.FragmentOld},
+		{path: path + ".sidecar.old", exists: j.SidecarHadOld, want: j.SidecarOld},
+	} {
+		data, exists, err := readValidatedFile(backup.path, true)
+		if err != nil {
+			return err
+		}
+		if exists != backup.exists || (exists && digest(data) != backup.want) {
+			return fmt.Errorf("linechain journal backup shape does not match authority")
+		}
+	}
+	return nil
+}
+
+func journalTerminal(phase string) bool {
+	return phase == "terminal_desired" || phase == "terminal_old"
+}
+
+func resultSHA(result *model.TaskResult) string {
+	if result == nil {
+		return ""
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	return digest(b)
+}
+
+func journalSHA(j journal) string {
+	b, err := json.Marshal(j)
+	if err != nil {
+		return ""
+	}
+	return digest(b)
+}
+
+func (m *Manager) validateDocument(d Document) error {
+	if d.Version != 2 {
+		return fmt.Errorf("unsupported linechain document version %d", d.Version)
+	}
+	if d.DurableProtocol != "linechain-e3-v2" {
+		return fmt.Errorf("unsupported linechain durable protocol %q", d.DurableProtocol)
+	}
+	if d.FragmentBasename == "" {
+		return fmt.Errorf("v2 fragment_basename is required")
+	}
+	switch d.Operation {
+	case "create":
+		if d.PreviousFragmentSHA256 != nil || d.Fragment == nil || d.FragmentSHA256 == nil || d.SidecarPatch.DesiredDownstreamLineUUID == nil {
+			return fmt.Errorf("create document has inconsistent old/desired shape")
+		}
+	case "replace":
+		if d.PreviousFragmentSHA256 == nil || d.Fragment == nil || d.FragmentSHA256 == nil || d.SidecarPatch.ExpectedDownstreamLineUUID == nil || d.SidecarPatch.DesiredDownstreamLineUUID == nil {
+			return fmt.Errorf("replace document has inconsistent old/desired shape")
+		}
+	case "remove":
+		if d.PreviousFragmentSHA256 == nil || d.Fragment != nil || d.FragmentSHA256 != nil || d.SidecarPatch.ExpectedDownstreamLineUUID == nil || d.SidecarPatch.DesiredDownstreamLineUUID != nil {
+			return fmt.Errorf("remove document has inconsistent old/desired shape")
+		}
+	default:
+		return fmt.Errorf("unsupported linechain operation %q", d.Operation)
+	}
+	binding := semanticArtifactBindingV2{Schema: semanticArtifactSchema, Operation: d.Operation, FragmentBasename: d.FragmentBasename,
+		PreviousFragmentSHA256: d.PreviousFragmentSHA256, FragmentSHA256: d.FragmentSHA256, SidecarPatchSHA256: d.SidecarPatchSHA256}
+	if err := verifySemanticArtifactBinding(d.Fragment, d.SidecarPatchCanonical, binding, d.ArtifactSHA256); err != nil {
+		return err
+	}
+	configDir := filepath.Clean(d.ConfigDir)
+	if !m.Configured() {
+		return fmt.Errorf("linechain runtime layout is unresolved")
+	}
+	if configDir != m.configDir {
+		return fmt.Errorf("config_dir does not match the locally resolved sing-box directory")
+	}
+	if !filepath.IsAbs(configDir) || configDir == string(filepath.Separator) {
+		return fmt.Errorf("config_dir must be absolute and non-root")
+	}
+	for _, p := range []string{d.FragmentPath, d.SidecarPath} {
+		if !filepath.IsAbs(p) || filepath.Clean(p) == string(filepath.Separator) {
+			return fmt.Errorf("artifact path must be absolute and non-root")
+		}
+		if strings.Contains(filepath.Clean(p), "..") {
+			return fmt.Errorf("artifact path escapes its directory")
+		}
+	}
+	if filepath.Clean(d.FragmentPath) == filepath.Clean(d.SidecarPath) {
+		return fmt.Errorf("fragment and sidecar paths must differ")
+	}
+	fragmentName := filepath.Base(d.FragmentPath)
+	if filepath.Dir(filepath.Clean(d.FragmentPath)) != configDir || !linechainBasenameRE.MatchString(fragmentName) {
+		return fmt.Errorf("fragment path is outside the server-owned linechain config namespace")
+	}
+	wantSidecar := m.sidecarPath
+	if filepath.Clean(d.SidecarPath) != wantSidecar {
+		return fmt.Errorf("sidecar path must match locally resolved %s", wantSidecar)
+	}
+	if err := validateParents(d.FragmentPath); err != nil {
+		return err
+	}
+	if err := validateParents(d.SidecarPath); err != nil {
+		return err
+	}
+	for _, want := range []*string{d.PreviousFragmentSHA256, d.FragmentSHA256} {
+		if want != nil && !validSHA(*want) {
+			return fmt.Errorf("previous artifact digest is invalid")
+		}
+	}
+	return nil
+}
+
+func (m *Manager) checkRestartVerify(ctx context.Context, d Document) error {
+	if _, err := m.run(ctx, m.singBoxBinary, "check", "-C", m.configDir); err != nil {
+		return fmt.Errorf("sing-box check failed")
+	}
+	restart := m.restartCommand
+	if _, err := m.run(ctx, restart[0], restart[1:]...); err != nil {
+		return fmt.Errorf("sing-box restart failed")
+	}
+	verify := m.verifyCommand
+	if _, err := m.run(ctx, verify[0], verify[1:]...); err != nil {
+		return fmt.Errorf("sing-box active verification failed")
+	}
+	return nil
+}
+
+// ResolveAfterRun converts the host transaction into one stable terminal result.
+func (m *Manager) ResolveAfterRun(ctx context.Context, task model.Task, result model.TaskResult) (model.TaskResult, error) {
+	path := m.journalPath(task.ID, task.LeaseID)
+	j, err := readJournal(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && (result.ExitCode != 0 || result.Error != "") {
+			if result.FinishedAt.IsZero() {
+				result.FinishedAt = time.Now().UTC()
+			}
+			return result, nil
+		}
+		return result, err
+	}
+	if j.Result != nil {
+		return *j.Result, nil
+	}
+	if result.FinishedAt.IsZero() {
+		result.FinishedAt = time.Now().UTC()
+	}
+	if result.ExitCode == 0 && result.Error == "" && j.Phase == "desired_verified" {
+		if !pairMatches(j, true) {
+			return result, fmt.Errorf("desired linechain pair is not exact")
+		}
+		if verifyErr := m.checkRestartVerify(ctx, Document{}); verifyErr == nil {
+			j.Phase = "terminal_desired"
+		} else {
+			if err := m.restoreOld(path, &j); err != nil {
+				return result, fmt.Errorf("post-run desired runtime verification failed: %v; restore old pair: %w", verifyErr, err)
+			}
+			if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+				return result, fmt.Errorf("post-run desired runtime verification failed: %v; old runtime recovery failed: %w", verifyErr, err)
+			}
+			result.ExitCode = -1
+			result.Error = "desired linechain runtime verification failed after helper return; exact old pair restored and verified"
+			j.Phase = "terminal_old"
+		}
+	} else {
+		if err := m.restoreOld(path, &j); err != nil {
+			return result, err
+		}
+		if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+			return result, fmt.Errorf("verify restored old linechain runtime after helper failure: %w", err)
+		}
+		if result.ExitCode == 0 {
+			result.ExitCode = -1
+		}
+		if result.Error == "" {
+			result.Error = "linechain helper did not leave a verified desired pair; exact old pair restored"
+		}
+		j.Phase = "terminal_old"
+	}
+	j.Result = &result
+	if err := m.writeJournal(path, j); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// RequireRecovered resolves all non-terminal journals before network activity.
+// complete is called only with a stable exact result; cleanup follows its
+// confirmed durable completion.
+func (m *Manager) RequireRecovered(ctx context.Context, complete func(model.TaskResult) error, nodeID string) error {
+	return m.RequireRecoveredAuthorized(ctx, complete, nodeID, nil)
+}
+
+func (m *Manager) RequireRecoveredAuthorized(ctx context.Context, complete func(model.TaskResult) error, nodeID string, authority map[string]RecoveryAuthority) error {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(m.dir, entry.Name())
+		var expected *RecoveryAuthority
+		if authority != nil {
+			j, err := readJournal(path)
+			if err != nil {
+				return err
+			}
+			value, ok := authority[j.TaskID+"\x00"+j.LeaseID]
+			if !ok {
+				return fmt.Errorf("linechain recovery journal is outside captured authority")
+			}
+			expected = &value
+		}
+		if err := m.recoverOne(ctx, path, complete, nodeID, "", expected); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) recoverOne(ctx context.Context, path string, complete func(model.TaskResult) error, nodeID, expectedScriptSHA string, expected ...*RecoveryAuthority) error {
+	j, err := readJournal(path)
+	if err != nil {
+		return err
+	}
+	if err := m.validateJournal(path, j); err != nil {
+		return err
+	}
+	if expectedScriptSHA != "" && j.TaskScriptSHA != expectedScriptSHA {
+		return fmt.Errorf("linechain retry task script does not match journal authority")
+	}
+	if len(expected) > 0 && expected[0] != nil {
+		want := expected[0]
+		if journalSHA(j) != want.JournalSHA256 || j.TaskScriptSHA != want.TaskScriptSHA || j.ArtifactSHA256 != want.ArtifactSHA256 || j.Phase != want.Phase || resultSHA(j.Result) != want.ResultSHA256 {
+			return fmt.Errorf("linechain journal changed after authority capture")
+		}
+	}
+	if j.Result == nil {
+		result := model.TaskResult{TaskID: j.TaskID, LeaseID: j.LeaseID, NodeID: nodeID, ExitCode: -1, Error: "linechain transaction interrupted; exact old pair restored", FinishedAt: time.Now().UTC()}
+		if j.Phase == "desired_verified" && pairMatches(j, true) {
+			if verifyErr := m.checkRestartVerify(ctx, Document{}); verifyErr == nil {
+				result.ExitCode = 0
+				result.Error = ""
+				j.Phase = "terminal_desired"
+			} else {
+				if err := m.restoreOld(path, &j); err != nil {
+					return fmt.Errorf("recover desired runtime verification failed: %v; restore old pair: %w", verifyErr, err)
+				}
+				if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+					return fmt.Errorf("recover desired runtime verification failed: %v; old runtime recovery failed: %w", verifyErr, err)
+				}
+				result.Error = "recovered desired runtime verification failed; exact old pair restored and verified"
+				j.Phase = "terminal_old"
+			}
+		} else {
+			if err := m.restoreOld(path, &j); err != nil {
+				return err
+			}
+			if err := m.checkRestartVerify(ctx, Document{}); err != nil {
+				return fmt.Errorf("recover old linechain pair service state: %w", err)
+			}
+			j.Phase = "terminal_old"
+		}
+		j.Result = &result
+		if err := m.writeJournal(path, j); err != nil {
+			return err
+		}
+	}
+	if complete != nil {
+		if err := complete(*j.Result); err != nil {
+			return err
+		}
+		return m.Cleanup(j.TaskID, j.LeaseID)
+	}
+	return nil
+}
+
+func (m *Manager) Cleanup(taskID, leaseID string) error {
+	path := m.journalPath(taskID, leaseID)
+	for _, p := range []string{path + ".fragment.old", path + ".sidecar.old", path} {
+		if err := m.remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return m.syncDirectory(m.dir)
+}
+
+func (m *Manager) rollback(ctx context.Context, path string, j *journal, d Document, cause error) error {
+	if err := m.restoreOld(path, j); err != nil {
+		return fmt.Errorf("%v; rollback failed: %w", cause, err)
+	}
+	if err := m.checkRestartVerify(ctx, d); err != nil {
+		return fmt.Errorf("%v; exact old pair restored but service recovery failed: %v", cause, err)
+	}
+	return cause
+}
+
+func (m *Manager) restoreOld(path string, j *journal) error {
+	for _, a := range []struct {
+		dst, backup string
+		had         bool
+		want        string
+	}{{j.FragmentPath, path + ".fragment.old", j.FragmentHadOld, j.FragmentOld}, {j.SidecarPath, path + ".sidecar.old", j.SidecarHadOld, j.SidecarOld}} {
+		if a.had {
+			data, exists, err := readValidatedFile(a.backup, true)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return fmt.Errorf("required linechain backup is missing")
+			}
+			if digest(data) != a.want {
+				return fmt.Errorf("backup digest mismatch")
+			}
+			s := string(data)
+			if err := m.publishFile(a.dst, &s); err != nil {
+				return err
+			}
+		} else if err := m.publishFile(a.dst, nil); err != nil {
+			return err
+		}
+	}
+	if !pairMatches(*j, false) {
+		return fmt.Errorf("restored pair digest mismatch")
+	}
+	j.Phase = "old_restored"
+	return m.writeJournal(path, *j)
+}
+
+func pairMatches(j journal, desired bool) bool {
+	a, ah, e1 := readCurrent(j.FragmentPath)
+	b, bh, e2 := readCurrent(j.SidecarPath)
+	if e1 != nil || e2 != nil {
+		return false
+	}
+	if desired {
+		return digestMaybe(a, ah) == j.FragmentOutputSHA256 && digestMaybe(b, bh) == j.SidecarOutputSHA256
+	}
+	return ah == j.FragmentHadOld && bh == j.SidecarHadOld && digestMaybe(a, ah) == j.FragmentOld && digestMaybe(b, bh) == j.SidecarOld
+}
+
+func readCurrent(path string) ([]byte, bool, error) {
+	return readValidatedFile(path, false)
+}
+
+func readValidatedFile(path string, private bool) ([]byte, bool, error) {
+	f, err := openNoFollow(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() || !ownedPath(info) || (private && info.Mode().Perm()&0o077 != 0) {
+		return nil, false, fmt.Errorf("linechain file is not a trusted regular file: %s", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxArtifactSize+1))
+	if err == nil && len(b) > maxArtifactSize {
+		return nil, false, fmt.Errorf("linechain file exceeds %d bytes: %s", maxArtifactSize, path)
+	}
+	return b, true, err
+}
+func requirePrevious(name string, data []byte, exists bool, want string) error {
+	if want == "" {
+		if exists {
+			return fmt.Errorf("unexpected existing %s artifact", name)
+		}
+		return nil
+	}
+	if !exists || digest(data) != strings.ToLower(want) {
+		return fmt.Errorf("%s artifact does not match previous digest", name)
+	}
+	return nil
+}
+func digest(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
+func digestPtr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return digest([]byte(*s))
+}
+func digestMaybe(b []byte, exists bool) string {
+	if !exists {
+		return ""
+	}
+	return digest(b)
+}
+func validSHA(s string) bool {
+	b, e := hex.DecodeString(s)
+	return e == nil && len(b) == sha256.Size && s == strings.ToLower(s)
+}
+func (m *Manager) writeBackup(path string, data []byte, exists bool) error {
+	if !exists {
+		return nil
+	}
+	return writeFile(path, data)
+}
+func publish(path string, content *string) error {
+	if err := validateParents(path); err != nil {
+		return err
+	}
+	if content == nil {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncDir(filepath.Dir(path))
+	}
+	return writeFile(path, []byte(*content))
+}
+func validateParents(path string) error {
+	dir := filepath.Dir(path)
+	for {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if (!info.IsDir() && info.Mode()&os.ModeSymlink == 0) || (dir == filepath.Dir(path) && info.Mode()&os.ModeSymlink != 0) {
+			return fmt.Errorf("artifact parent must be a real directory")
+		}
+		if dir == filepath.Dir(path) && !ownedPath(info) {
+			return fmt.Errorf("artifact parent must be owned by the agent user")
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return nil
+}
+func writeFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".lattice-linechain-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(name, path); err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err == nil {
+		err = f.Sync()
+		_ = f.Close()
+	}
+	if err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+func writeJSON(path string, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return writeFile(path, b)
+}
+func readJournal(path string) (journal, error) {
+	f, err := openNoFollow(path)
+	if err != nil {
+		return journal{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return journal{}, err
+	}
+	if !info.Mode().IsRegular() || !ownedPath(info) || info.Mode().Perm()&0o077 != 0 {
+		return journal{}, fmt.Errorf("invalid linechain journal")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxDocumentSize+1))
+	if err != nil {
+		return journal{}, err
+	}
+	if len(b) > maxDocumentSize {
+		return journal{}, fmt.Errorf("linechain journal exceeds %d bytes", maxDocumentSize)
+	}
+	var j journal
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err = dec.Decode(&j); err != nil {
+		return j, err
+	}
+	var trailing any
+	if err = dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return j, fmt.Errorf("linechain journal has trailing data")
+		}
+		return j, err
+	}
+	if j.Version != journalVersion || j.TaskID == "" || j.LeaseID == "" {
+		return j, fmt.Errorf("invalid linechain journal identity")
+	}
+	return j, nil
+}
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}

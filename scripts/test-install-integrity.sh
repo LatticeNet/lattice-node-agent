@@ -121,7 +121,12 @@ for expected in \
   'chown "$run_user:$run_group" "$state_dir"' \
   'LATTICE_TASK_OUTBOX_DIR="${LATTICE_TASK_OUTBOX_DIR:-}"' \
   'LATTICE_TASK_OUTBOX_DIR=$(quote_env "${LATTICE_TASK_OUTBOX_DIR:-}")' \
-  'chown "$run_user:$run_group" "$task_outbox_leaf"'
+  'chown "$run_user:$run_group" "$task_outbox_leaf"' \
+  'LATTICE_LINECHAIN_TXN_DIR="$linechain_txn_dir"' \
+  'LATTICE_LINECHAIN_TXN_DIR=$(quote_env "$linechain_txn_dir")' \
+  'prepare_linechain_txn_dir' \
+  'chmod 0700 "$linechain_txn_dir"' \
+  'chown "$run_user:$run_group" "$linechain_txn_dir"'
 do
   if ! grep -Fq "$expected" "$ROOT/scripts/install.sh"; then
     echo "installer non-root systemd contract missing: $expected" >&2

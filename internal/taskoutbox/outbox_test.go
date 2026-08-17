@@ -395,6 +395,24 @@ func TestOpenRefusesConcurrentOwnerWithoutChangingJournal(t *testing.T) {
 	defer second.Close()
 }
 
+func TestOpenRejectsPersistedLegacyLinechainProtocol(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := testTask()
+	if _, err := store.BeginWithProtocol(task, "linechain-e3-v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "unsupported persisted linechain durable protocol") {
+		t.Fatalf("legacy linechain outbox error = %v", err)
+	}
+}
+
 func testTask() model.Task {
 	return model.Task{
 		ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo done",

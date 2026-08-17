@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,11 +15,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
+	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func TestMain(m *testing.M) {
+	if taskexec.MaybeRunChildShim(os.Args) {
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
@@ -38,8 +48,8 @@ func (r *countingTaskRunner) Run(task model.Task) model.TaskResult {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.3" {
-		t.Fatalf("version = %q, want 0.3.3", version)
+	if version != "0.3.4-alpha.1" {
+		t.Fatalf("version = %q, want 0.3.4-alpha.1", version)
 	}
 }
 
@@ -48,13 +58,13 @@ func TestCompatibilityPayloadIsEmbedded(t *testing.T) {
 	if got.ServerMin == "" || got.DashboardMin == "" || got.Channel == "" {
 		t.Fatalf("compatibility metadata must be embedded: %+v", got)
 	}
-	if got.Channel != "stable" {
-		t.Fatalf("compatibility channel = %q, want stable", got.Channel)
+	if got.Channel != "alpha" {
+		t.Fatalf("compatibility channel = %q, want alpha", got.Channel)
 	}
 	// The floors stay on design-15 prerelease coordinates on purpose: no stable
 	// server or dashboard satisfies this agent yet (stable server is still v0.2.1),
 	// so naming a stable floor here would be a claim the ecosystem cannot back.
-	if got.ServerMin != "v0.2.2-alpha.2" || got.DashboardMin != "v0.2.2-alpha.7" {
+	if got.ServerMin != "v0.2.2-alpha.19" || got.DashboardMin != "v0.2.2-alpha.7" {
 		t.Fatalf("compatibility floor = %+v, want coordinated design-15 alpha", got)
 	}
 }
@@ -258,12 +268,12 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 			httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				switch r.URL.Path {
 				case "/api/agent/tasks":
-					if r.Header.Get(agentCapabilitiesHeader) != guardManagedSHACapability {
+					if r.Header.Get(agentCapabilitiesHeader) != strings.Join(reportedCapabilities(), ",") {
 						return testResponse(http.StatusBadRequest, "missing lease-time capability"), nil
 					}
 					fetchCalls++
 					if fetchCalls == 1 {
-						data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+						data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 						return testResponse(http.StatusOK, string(data)), nil
 					}
 					return testResponse(http.StatusOK, `[]`), nil
@@ -284,7 +294,7 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 					return testResponse(http.StatusNotFound, ""), nil
 				}
 			})}
-			cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}
+			cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret", LinechainReady: true}
 
 			if err := runTasks(cfg, runner, store); err == nil {
 				t.Fatal("first result upload should fail")
@@ -306,6 +316,455 @@ func TestRunTasksRetainsResultAcrossTransientServerFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+type linechainTaskRunner struct {
+	manager         *linechain.Manager
+	doc             []byte
+	linechainTaskID string
+	calls           int
+	callsByID       map[string]int
+	afterApply      func()
+}
+
+func (r *linechainTaskRunner) Run(task model.Task) model.TaskResult {
+	r.calls++
+	if r.callsByID == nil {
+		r.callsByID = map[string]int{}
+	}
+	r.callsByID[task.ID]++
+	result := model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
+	if task.ID != r.linechainTaskID {
+		return result
+	}
+	err := r.manager.Apply(context.Background(), bytes.NewReader(r.doc), task.ID, task.LeaseID, linechainTaskScriptSHA(task.Script))
+	if err == nil && r.afterApply != nil {
+		r.afterApply()
+	}
+	if err != nil {
+		result.ExitCode = -1
+		result.Error = err.Error()
+	}
+	return result
+}
+
+func (r *linechainTaskRunner) RunLinechain(task model.Task) model.TaskResult { return r.Run(task) }
+
+func TestRunTasksLinechainCompletesHandoffWithoutReplay(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	root := t.TempDir()
+	txnDir := filepath.Join(root, "txn")
+	manager, err := linechain.Open(txnDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	outbox, err := taskoutbox.Open(filepath.Join(root, "outbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	conf := filepath.Join(root, "conf")
+	if err := os.Mkdir(conf, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureLayout(conf, filepath.Join(root, "lattice-metadata.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	writeLinechainSourceSidecar(t, filepath.Join(root, "lattice-metadata.json"))
+	fragmentPath := filepath.Join(conf, "lattice-linechain-0123456789abcdef0123.json")
+	fragment := "{\"outbounds\":[]}"
+	docValue := linechain.BindDocument(linechain.Document{Version: 2, Operation: "create", FragmentBasename: filepath.Base(fragmentPath), Fragment: &fragment, SidecarPatch: testLinechainPatch("create")})
+	doc, err := json.Marshal(map[string]any{
+		"version": docValue.Version, "durable_protocol": docValue.DurableProtocol, "operation": docValue.Operation, "fragment_basename": docValue.FragmentBasename,
+		"fragment": docValue.Fragment, "sidecar_patch": docValue.SidecarPatch, "previous_fragment_sha256": docValue.PreviousFragmentSHA256,
+		"fragment_sha256": docValue.FragmentSHA256, "sidecar_patch_sha256": docValue.SidecarPatchSHA256, "artifact_sha256": docValue.ArtifactSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{ID: "task-chain", LeaseID: "lease-chain", Interpreter: "sh", Script: testLinechainApplyScript(doc), TimeoutSec: 10, OutputLimit: 1024}
+	genericTask := model.Task{ID: "task-generic", LeaseID: "lease-generic", Interpreter: "sh", Script: "echo generic"}
+	netguardTask := model.Task{ID: "task-netguard", LeaseID: "lease-netguard", Interpreter: "sh", Script: "echo netguard"}
+	runner := &linechainTaskRunner{manager: manager, doc: doc, linechainTaskID: task.ID, afterApply: func() {
+		manager.ConfigureCleanupForTest(func(path string) error {
+			if strings.HasSuffix(path, ".json") {
+				return errors.New("injected cleanup failure")
+			}
+			return os.Remove(path)
+		}, nil)
+	}}
+	fetches := 0
+	posts := 0
+	var posted []model.TaskResult
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/agent/tasks":
+			fetches++
+			if fetches == 1 {
+				b, _ := json.Marshal([]leasedAgentTask{
+					{Task: genericTask},
+					{Task: netguardTask, DurableResult: true, DurableProtocol: "netguard-v1"},
+					{Task: task, DurableResult: true, DurableProtocol: "linechain-e3-v2"},
+				})
+				return testResponse(http.StatusOK, string(b)), nil
+			}
+			return testResponse(http.StatusOK, "[]"), nil
+		case "/api/agent/task-result":
+			posts++
+			var body struct {
+				Result model.TaskResult `json:"result"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			posted = append(posted, body.Result)
+			return testResponse(http.StatusOK, `{"ok":true}`), nil
+		default:
+			return testResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	cfg := agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret", LinechainReady: true}
+	if err := runTasks(cfg, runner, outbox, manager); err == nil {
+		t.Fatal("cleanup failure should remain readiness-visible")
+	}
+	if pending, err := outbox.Pending(); err != nil || len(pending) != 1 {
+		t.Fatalf("completed result not retained: %+v %v", pending, err)
+	}
+	manager.ConfigureCleanupForTest(nil, nil)
+	if err := runTasks(cfg, runner, outbox, manager); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 3 || runner.callsByID[genericTask.ID] != 1 || runner.callsByID[netguardTask.ID] != 1 || runner.callsByID[task.ID] != 1 {
+		t.Fatalf("mixed task execution was replayed or skipped: total=%d byID=%v", runner.calls, runner.callsByID)
+	}
+	if posts != 4 || len(posted) != 4 || posted[0].TaskID != genericTask.ID || posted[1].TaskID != netguardTask.ID || !reflect.DeepEqual(posted[2], posted[3]) {
+		t.Fatalf("mixed result posts=%d results=%+v", posts, posted)
+	}
+	if entries, err := os.ReadDir(txnDir); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".json") {
+				t.Fatalf("journal not cleaned: %s", e.Name())
+			}
+		}
+	}
+}
+
+func TestLinechainAuthorityCrossCheckIsBidirectional(t *testing.T) {
+	newPair := func(t *testing.T) (*linechain.Manager, *taskoutbox.Store) {
+		t.Helper()
+		root := t.TempDir()
+		manager, err := linechain.Open(filepath.Join(root, "txn"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = manager.Close() })
+		outbox, err := taskoutbox.Open(filepath.Join(root, "outbox"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = outbox.Close() })
+		return manager, outbox
+	}
+	fragment := `{}`
+	doc := linechain.BindDocument(linechain.Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testLinechainPatch("create")})
+	rawDoc, err := json.Marshal(map[string]any{
+		"version": doc.Version, "durable_protocol": doc.DurableProtocol, "operation": doc.Operation, "fragment_basename": doc.FragmentBasename,
+		"fragment": doc.Fragment, "sidecar_patch": doc.SidecarPatch, "previous_fragment_sha256": doc.PreviousFragmentSHA256,
+		"fragment_sha256": doc.FragmentSHA256, "sidecar_patch_sha256": doc.SidecarPatchSHA256, "artifact_sha256": doc.ArtifactSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{ID: "task-chain", LeaseID: "lease-chain", Interpreter: "sh", Script: testLinechainApplyScript(rawDoc)}
+
+	t.Run("leased E3 without journal blocks require gate", func(t *testing.T) {
+		manager, outbox := newPair(t)
+		if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := requireLinechainRecovered(context.Background(), manager, outbox, "node-a"); err == nil || !strings.Contains(err.Error(), "lacks exact linechain journal") {
+			t.Fatalf("require gate error = %v", err)
+		}
+	})
+
+	t.Run("completed E3 without journal is allowed", func(t *testing.T) {
+		manager, outbox := newPair(t)
+		if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := outbox.Complete(model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := crossCheckLinechainAuthority(manager, outbox); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("journal without exact outbox is blocked", func(t *testing.T) {
+		manager, outbox := newPair(t)
+		createLinechainJournal(t, manager, task)
+		if err := crossCheckLinechainAuthority(manager, outbox); err == nil || !strings.Contains(err.Error(), "lacks exact") {
+			t.Fatalf("cross-check error = %v", err)
+		}
+	})
+
+	t.Run("journal with wrong protocol is blocked", func(t *testing.T) {
+		manager, outbox := newPair(t)
+		if _, err := outbox.BeginWithProtocol(task, "netguard-v1"); err != nil {
+			t.Fatal(err)
+		}
+		createLinechainJournal(t, manager, task)
+		if err := crossCheckLinechainAuthority(manager, outbox); err == nil || !strings.Contains(err.Error(), "mismatched outbox protocol") {
+			t.Fatalf("cross-check error = %v", err)
+		}
+	})
+
+	t.Run("same IDs with different script are blocked", func(t *testing.T) {
+		manager, outbox := newPair(t)
+		if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+			t.Fatal(err)
+		}
+		other := task
+		other.Script = "different approved artifact"
+		createLinechainJournal(t, manager, other)
+		if err := crossCheckLinechainAuthority(manager, outbox); err == nil || !strings.Contains(err.Error(), "exact outbox task script") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+
+	t.Run("journal artifact must match exact issued script", func(t *testing.T) {
+		root := t.TempDir()
+		txnDir := filepath.Join(root, "txn")
+		manager, err := linechain.Open(txnDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = manager.Close() })
+		outbox, err := taskoutbox.Open(filepath.Join(root, "outbox"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = outbox.Close() })
+		if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+			t.Fatal(err)
+		}
+		createLinechainJournal(t, manager, task)
+		entries, err := os.ReadDir(txnDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			path := filepath.Join(txnDir, entry.Name())
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var journal map[string]any
+			if err := json.Unmarshal(raw, &journal); err != nil {
+				t.Fatal(err)
+			}
+			journal["artifact_sha256"] = strings.Repeat("a", 64)
+			tampered, err := json.Marshal(journal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, tampered, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := crossCheckLinechainAuthority(manager, outbox); err == nil || !strings.Contains(err.Error(), "issued artifact") {
+			t.Fatalf("tampered journal artifact error = %v", err)
+		}
+	})
+
+	t.Run("completed E3 requires exact terminal result", func(t *testing.T) {
+		for _, mismatch := range []bool{false, true} {
+			t.Run(map[bool]string{false: "matching", true: "mismatched"}[mismatch], func(t *testing.T) {
+				manager, outbox := newPair(t)
+				if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+					t.Fatal(err)
+				}
+				createLinechainJournal(t, manager, task)
+				result := model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
+				if _, err := manager.ResolveAfterRun(context.Background(), task, result); err != nil {
+					t.Fatal(err)
+				}
+				outboxResult := result
+				if mismatch {
+					outboxResult.ExitCode = -1
+					outboxResult.Error = "different"
+				}
+				if _, err := outbox.Complete(outboxResult); err != nil {
+					t.Fatal(err)
+				}
+				err := crossCheckLinechainAuthority(manager, outbox)
+				if mismatch && (err == nil || !strings.Contains(err.Error(), "conflicts")) {
+					t.Fatalf("error=%v", err)
+				}
+				if !mismatch && err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	})
+
+	t.Run("completed E3 conflicts with nonterminal journal", func(t *testing.T) {
+		manager, outbox := newPair(t)
+		if _, err := outbox.BeginWithProtocol(task, "linechain-e3-v2"); err != nil {
+			t.Fatal(err)
+		}
+		createLinechainJournal(t, manager, task)
+		if _, err := outbox.Complete(model.TaskResult{TaskID: task.ID, LeaseID: task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := crossCheckLinechainAuthority(manager, outbox); err == nil || !strings.Contains(err.Error(), "conflicts") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
+func createLinechainJournal(t *testing.T, manager *linechain.Manager, task model.Task) {
+	t.Helper()
+	root := t.TempDir()
+	configDir := filepath.Join(root, "conf")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureLayout(configDir, filepath.Join(root, "lattice-metadata.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	writeLinechainSourceSidecar(t, filepath.Join(root, "lattice-metadata.json"))
+	fragment := `{}`
+	d := linechain.BindDocument(linechain.Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testLinechainPatch("create")})
+	raw, err := json.Marshal(map[string]any{
+		"version": d.Version, "durable_protocol": d.DurableProtocol, "operation": d.Operation, "fragment_basename": d.FragmentBasename,
+		"fragment": d.Fragment, "sidecar_patch": d.SidecarPatch, "previous_fragment_sha256": d.PreviousFragmentSHA256,
+		"fragment_sha256": d.FragmentSHA256, "sidecar_patch_sha256": d.SidecarPatchSHA256, "artifact_sha256": d.ArtifactSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), bytes.NewReader(raw), task.ID, task.LeaseID, linechainTaskScriptSHA(task.Script)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTaskexecRunsRealLinechainHelperShell(t *testing.T) {
+	root := t.TempDir()
+	txnDir := filepath.Join(root, "txn")
+	configDir := filepath.Join(root, "conf")
+	sidecarPath := filepath.Join(root, "lattice-metadata.json")
+	workdir := filepath.Join(root, "work")
+	for _, dir := range []string{configDir, workdir} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager, err := linechain.Open(txnDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	if err := manager.ConfigureLayout(configDir, sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	writeLinechainSourceSidecar(t, sidecarPath)
+	fragment := `{"outbounds":[]}`
+	d := linechain.BindDocument(linechain.Document{Version: 2, Operation: "create", FragmentBasename: "lattice-linechain-0123456789abcdef0123.json", Fragment: &fragment, SidecarPatch: testLinechainPatch("create")})
+	raw, err := json.Marshal(map[string]any{
+		"version": d.Version, "durable_protocol": d.DurableProtocol, "operation": d.Operation, "fragment_basename": d.FragmentBasename,
+		"fragment": d.Fragment, "sidecar_patch": d.SidecarPatch, "previous_fragment_sha256": d.PreviousFragmentSHA256,
+		"fragment_sha256": d.FragmentSHA256, "sidecar_patch_sha256": d.SidecarPatchSHA256, "artifact_sha256": d.ArtifactSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{
+		ID: "task-real-shell", LeaseID: "lease-real-shell", Interpreter: "sh",
+		Script:     "printf '%s' '" + string(raw) + "' | LATTICE_TEST_LINECHAIN_HELPER=1 \"$LATTICE_AGENT_BIN\" -test.run=TestTaskexecLinechainHelperProcess",
+		TimeoutSec: 20, OutputLimit: 4096,
+	}
+	runner := taskexec.Runner{
+		AllowExec: true, AllowRoot: true, WorkdirRoot: workdir, AgentBinary: testBinary,
+		LinechainTxnDir: txnDir, LinechainConfigDir: configDir, LinechainSidecarPath: sidecarPath,
+	}
+	result := runner.RunLinechain(task)
+	if result.ExitCode != 0 || result.Error != "" {
+		t.Fatalf("real taskexec helper failed: %+v stderr=%s", result, result.Stderr)
+	}
+	result, err = manager.ResolveAfterRun(context.Background(), task, result)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("resolve real taskexec helper: result=%+v err=%v", result, err)
+	}
+	if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTaskexecLinechainHelperProcess(t *testing.T) {
+	if os.Getenv("LATTICE_TEST_LINECHAIN_HELPER") != "1" {
+		return
+	}
+	manager, err := linechain.OpenHelper(os.Getenv("LATTICE_LINECHAIN_TXN_DIR"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureLayout(os.Getenv("LATTICE_LINECHAIN_CONFIG_DIR"), os.Getenv("LATTICE_LINECHAIN_SIDECAR_PATH")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureCommands("true", []string{"true"}, []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Apply(context.Background(), os.Stdin, os.Getenv("LATTICE_TASK_ID"), os.Getenv("LATTICE_TASK_LEASE_ID"), os.Getenv("LATTICE_LINECHAIN_TASK_SCRIPT_SHA256")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeLinechainSourceSidecar(t *testing.T, path string) {
+	t.Helper()
+	const sidecar = `{"schema":"lattice.singbox-metadata.v2","inbounds":[{"tag":"source","line_uuid":"11111111-1111-4111-8111-1111111111aa"}]}`
+	if err := os.WriteFile(path, []byte(sidecar), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testLinechainPatch(operation string) linechain.SidecarPatchV2 {
+	desired := "33333333-3333-4333-8333-333333333333"
+	patch := linechain.SidecarPatchV2{
+		Schema: "lattice.singbox-linechain-sidecar-patch.v1", SourceLineUUID: "11111111-1111-4111-8111-1111111111aa",
+		SourceInboundTag: "source", DesiredDownstreamLineUUID: &desired,
+	}
+	if operation != "create" {
+		patch.ExpectedDownstreamLineUUID = &desired
+	}
+	if operation == "remove" {
+		patch.DesiredDownstreamLineUUID = nil
+	}
+	return patch
+}
+
+func testLinechainApplyScript(document []byte) string {
+	return "# lattice-linechain-e3-v2\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '" + base64.StdEncoding.EncodeToString(document) + "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n"
 }
 
 func TestRunTasksRestartFlushesCompletedResultBeforeFetch(t *testing.T) {
@@ -416,7 +875,7 @@ func TestRunTasksJournalFailurePreventsExecution(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	var reported model.TaskResult
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/api/agent/tasks" {
@@ -453,7 +912,7 @@ func TestRunTasksPublishedJournalFailureDoesNotPostConflictingDirectResult(t *te
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must not run"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	postCalls := 0
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/api/agent/tasks" {
@@ -480,7 +939,7 @@ func TestRunTasksExactRedeliveryDoesNotExecuteExistingJournal(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "must run once"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/api/agent/tasks" {
 			t.Fatalf("unexpected request for already-journaled lease: %s", r.URL.Path)
@@ -530,6 +989,24 @@ func TestRunTasksKeepsGenericTasksOutsideDurableNetGuardProtocol(t *testing.T) {
 	}
 }
 
+func TestRunTasksRejectsUnknownDurableProtocolBeforeExecution(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	task := model.Task{ID: "task-unknown", LeaseID: "lease-unknown", Interpreter: "sh", Script: "must not run"}
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "unknown-v1"}})
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return testResponse(http.StatusOK, string(data)), nil
+	})}
+	runner := &countingTaskRunner{}
+	err := runTasks(agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "secret"}, runner, beginFailingOutbox{})
+	if err == nil || !strings.Contains(err.Error(), "unsupported protocol") {
+		t.Fatalf("error=%v", err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("unknown protocol executed: %d", runner.calls)
+	}
+}
+
 type completePublishingOutbox struct {
 	task       model.Task
 	result     *model.TaskResult
@@ -572,7 +1049,7 @@ func TestRunTasksConfirmsAndUploadsResultPublishedBeforeDirectorySyncFailure(t *
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo once"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	posts := 0
 	var posted model.TaskResult
 	outbox := &completePublishingOutbox{}
@@ -614,7 +1091,7 @@ func TestRunTasksDoesNotUploadUnconfirmedPublishedResult(t *testing.T) {
 	oldClient := httpClient
 	defer func() { httpClient = oldClient }()
 	task := model.Task{ID: "task-a", LeaseID: "lease-a", Interpreter: "sh", Script: "echo once"}
-	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true}})
+	data, _ := json.Marshal([]leasedAgentTask{{Task: task, DurableResult: true, DurableProtocol: "netguard-v1"}})
 	posts := 0
 	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
