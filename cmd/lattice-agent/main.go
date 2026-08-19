@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
@@ -33,7 +34,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.3"
+var version = "0.3.4"
 var compatServerMin = "v0.2.2-alpha.2"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "stable"
@@ -93,6 +94,11 @@ type agentConfig struct {
 	// against /api/health and exits. It is used by rollback-protected firewall
 	// apply tasks so the task shell never needs a node bearer token.
 	SelfcheckControlPlane bool
+	// GuardManagedSHA prints the canonical hash of the managed nftables table
+	// and exits. The NetGuard apply script has always called this; until now
+	// the flag did not exist, so every apply reported no hash and the server
+	// could not record what had been installed.
+	GuardManagedSHA bool
 	// UpdateNFTDomainSet runs a one-shot hostname -> nft named-set update and
 	// exits. It is used by rollback-protected firewall apply tasks before the
 	// control-plane selfcheck; it does not require or send the node token.
@@ -197,6 +203,7 @@ func main() {
 	flag.StringVar(&cfg.TerminalTransport, "terminal-transport", env("LATTICE_TERMINAL_TRANSPORT", terminalTransportPoll), "terminal transport when -allow-terminal is set: \"poll\" (default) or \"stream\" (agent-dialed WebSocket)")
 	flag.BoolVar(&cfg.LocalDebug, "debug", os.Getenv("LATTICE_AGENT_DEBUG") == "1", "enable verbose non-secret diagnostics")
 	flag.BoolVar(&cfg.SelfcheckControlPlane, "selfcheck-controlplane", false, "run one-shot unauthenticated /api/health reachability check and exit")
+	flag.BoolVar(&cfg.GuardManagedSHA, "guard-managed-sha", false, "print the canonical hash of the managed nftables table and exit")
 	flag.BoolVar(&cfg.UpdateNFTDomainSet, "update-nft-domain-set", false, "resolve a hostname and update existing nft control-plane named sets, then exit")
 	flag.StringVar(&cfg.NFTDomainHost, "host", "", "hostname for -update-nft-domain-set")
 	flag.StringVar(&cfg.NFTFamily, "family", "inet", "nft family for -update-nft-domain-set (inet, ip, or ip6)")
@@ -283,6 +290,13 @@ func main() {
 	if err := checkServerTransport(cfg.Server, cfg.AllowInsecureHTTP); err != nil {
 		log.Fatalf("refusing to start: %v", err)
 	}
+	if cfg.GuardManagedSHA {
+		// Printed on stdout with nothing else: the apply script captures this
+		// in a command substitution, and the server refuses a result that
+		// carries more than one hash.
+		fmt.Println(guardreality.ManagedSHA(context.Background()))
+		return
+	}
 	if cfg.SelfcheckControlPlane {
 		if err := selfcheckControlPlane(cfg.Server); err != nil {
 			log.Fatalf("control-plane selfcheck failed: %v", err)
@@ -361,6 +375,9 @@ func main() {
 		}
 		if err := reportSingBoxInventory(cfg); err != nil {
 			log.Printf("singbox discover error: %v", err)
+		}
+		if err := reportGuardReality(cfg); err != nil {
+			log.Printf("guard reality error: %v", err)
 		}
 		if err := runTasks(cfg, runner); err != nil {
 			log.Printf("task poll error: %v", err)
@@ -605,6 +622,24 @@ func (cfg agentConfig) taskSandboxOptions() taskexec.SandboxOptions {
 		Cgroup:      cfg.taskCgroupConfig(),
 		WorkdirRoot: cfg.TaskWorkRoot,
 	}
+}
+
+// reportGuardReality sends what this node's firewall actually is.
+//
+// The control plane has stored and compared these snapshots since NetGuard
+// landed, but nothing ever sent one: every node read "never reported" and drift
+// stayed permanently unknown, which is the least useful thing a firewall review
+// can say. Collection is read-only and best-effort — a box without nft or
+// without root still reports its listeners and interfaces, and a partial
+// snapshot is what distinguishes "I can see this machine but not its ruleset"
+// from "this machine is gone".
+func reportGuardReality(cfg agentConfig) error {
+	reality := guardreality.Collect(context.Background())
+	debugf(cfg, "guard reality collected: listeners=%d interfaces=%d foreign_tables=%d managed_sha=%t nft=%q",
+		len(reality.Listeners), len(reality.Interfaces), len(reality.ForeignTables), reality.ManagedSHA != "", reality.NFTVersion)
+	return postAgentJSON(cfg, "/api/agent/guard-reality", map[string]any{
+		"reality": reality,
+	}, nil)
 }
 
 func reportMetrics(cfg agentConfig) error {

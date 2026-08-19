@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -24,8 +25,8 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.3" {
-		t.Fatalf("version = %q, want 0.3.3", version)
+	if version != "0.3.4" {
+		t.Fatalf("version = %q, want 0.3.4", version)
 	}
 }
 
@@ -696,5 +697,48 @@ func requireErrorNotContains(t *testing.T, err error, unwanted string) {
 	}
 	if strings.Contains(err.Error(), unwanted) {
 		t.Fatalf("expected error not to contain %q, got %q", unwanted, err.Error())
+	}
+}
+
+// TestGuardRealityPayloadShape pins the wire shape the server's
+// /api/agent/guard-reality handler decodes. It reads {node_id, reality}; a
+// payload that nests the snapshot anywhere else is accepted by the transport
+// and silently stored as an empty snapshot, which is indistinguishable from a
+// node that never reported.
+func TestGuardRealityPayloadShape(t *testing.T) {
+	reality := guardreality.Collect(context.Background())
+	payload := map[string]any{"reality": reality, "node_id": "node-a"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		NodeID  string `json:"node_id"`
+		Reality struct {
+			CollectedAt string `json:"collected_at"`
+			Listeners   []struct {
+				Protocol string `json:"protocol"`
+				Port     int    `json:"port"`
+			} `json:"listeners"`
+			Interfaces []struct {
+				Name string `json:"name"`
+			} `json:"interfaces"`
+		} `json:"reality"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.NodeID != "node-a" {
+		t.Fatalf("node_id did not survive: %q", decoded.NodeID)
+	}
+	if decoded.Reality.CollectedAt == "" {
+		t.Fatal("collected_at is required by the server and must always be set")
+	}
+	// Listeners and interfaces are environment-dependent, so this asserts the
+	// shape rather than the contents: the fields must be present and decodable.
+	for _, listener := range decoded.Reality.Listeners {
+		if listener.Protocol == "" || listener.Port <= 0 {
+			t.Fatalf("a reported listener is unusable: %+v", listener)
+		}
 	}
 }
