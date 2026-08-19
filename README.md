@@ -77,7 +77,7 @@ LATTICE_TASK_WORK_ROOT=/opt/lattice/state/tasks
 ```
 
 Each task still gets a fresh private subdirectory that is removed after the
-task. The agent sets `PWD`, `HOME`, `TMPDIR`, and `XDG_RUNTIME_DIR` to that
+task. The agent sets `HOME`, `TMPDIR`, and `XDG_RUNTIME_DIR` to that
 directory so task-local temporary files do not spill into a shared temp path.
 The configured root must be absolute and not group/world writable; otherwise
 the task fails before the script runs. This is workdir containment, not a full
@@ -103,7 +103,7 @@ service profile or a separately delegated privileged helper.
 The node token is sent in the `Authorization: Bearer` header on every request.
 The loopback `http://127.0.0.1:8088` URL above is safe because the token never
 leaves the host. For a **remote** server the agent refuses to start on a
-cleartext `http://` URL (it would leak the token) — use `https://` instead. The
+cleartext `http://` URL (it would leak the token). Use `https://` instead. The
 `-allow-insecure-http` flag exists only as a deliberate escape hatch and is off
 by default.
 
@@ -226,7 +226,10 @@ lattice-agent \
   -proxy-usage-secret-file /etc/lattice/proxy-usage.secret
 ```
 
-`-proxy-usage-url` is mutually exclusive with `-proxy-usage-file`. The URL must
+The proxy usage source is a single choice, not a pair: `-proxy-usage-file`,
+`-proxy-usage-url`, `-proxy-usage-xray-api`, and `-singbox-stats-api` are all
+mutually exclusive, and the agent picks the first one set in that order
+(`cmd/lattice-agent/main.go`). The URL must
 use `http://` or `https://` and a loopback host (`127.0.0.0/8`, `::1`, or
 `localhost`); remote hosts and URL userinfo are refused before any request is
 sent. The optional local bearer secret is sent as `Authorization: Bearer` to
@@ -290,9 +293,19 @@ continuous-discovery inventory.
 ## Installer-persisted launch profile
 
 The dashboard's enroll and reconfigure commands set lattice-agent startup
-behavior through environment variables. `scripts/install.sh` persists these into
-`/opt/lattice/lattice-agent.env` (or the platform equivalent) so the service
-keeps the same behavior after restart:
+behavior through environment variables. `scripts/install.sh` persists most of
+these into `/opt/lattice/lattice-agent.env` (or the platform equivalent) so the
+service keeps the same behavior after restart.
+
+Three of the keys listed below are **not** persisted, as of 2026-08-19:
+`LATTICE_SINGBOX_META`, `LATTICE_SINGBOX_STATS_API`, and
+`LATTICE_PROXY_USAGE_SECRET_FILE` appear nowhere in `scripts/install.sh`, in
+neither the env heredoc nor the reconfigure preserve list. Set one of them and
+the agent honors it for the current process only; the next install or service
+restart drops it silently. Until the installer is fixed, write those three into
+the env file by hand after install, and re-apply them after any reconfigure.
+
+The full list:
 
 The installer downloads release artifacts through HTTPS-only curl/wget options
 and only when it can also download `SHA256SUMS` and verify the selected binary
