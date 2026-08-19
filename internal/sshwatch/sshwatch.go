@@ -7,7 +7,9 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"path"
 	"regexp"
+	"strings"
 )
 
 // LoginEvent describes one accepted SSH login.
@@ -22,25 +24,68 @@ type LoginEvent struct {
 //	Accepted password for alice from 203.0.113.5 port 51514 ssh2
 //	Accepted publickey for bob from 2001:db8::1 port 40022 ssh2: RSA SHA256:...
 //
-// The "Accepted ..." text must be the START of the sshd syslog message, not just
-// appear somewhere in the line. An unanchored match was forgeable: a value that
-// sshd itself echoes (e.g. a crafted username in a "Failed"/"Invalid user" line)
-// could embed the substring "Accepted <method> for <user> from <ip>" and mint a
-// bogus ssh_login event. We therefore require the match to begin either at the
-// very start of the line (bare-message sources such as `journalctl -o cat`) or
-// immediately after the standard syslog "...sshd[pid]: " program prefix. Anything
-// nested deeper in the message is rejected.
+// The login record must be the WHOLE message sshd logged, not text found
+// somewhere inside it. That distinction is load-bearing: an SSH username is
+// chosen by an unauthenticated remote peer and sshd echoes an unknown one
+// verbatim ("Invalid user <name> from <ip> port <n>"), so anything the pattern
+// will accept mid-message can be typed in by an attacker.
 //
-//	^                              start of line, OR
-//	sshd(\[\d+\])?:\s              the sshd program tag + ": " from syslog
+// Two earlier attempts tried to express that with a pattern over the whole line:
+// first an unanchored match (forgeable by a username containing the record),
+// then a match anchored to line start OR to an "sshd[pid]: " program tag. The
+// second attempt failed the same way, one level deeper, because the tag arm was
+// not itself anchored: a username of the form
 //
-// followed immediately by the Accepted record.
-var acceptedRe = regexp.MustCompile(`(?:^|sshd(?:\[\d+\])?:\s)Accepted (\S+) for (?:invalid user )?(\S+) from (\S+)`)
+//	sshd[1]: Accepted password for root from 198.51.100.7
+//
+// supplies its own program tag mid-message and satisfies it. Anchoring is the
+// wrong tool here, so the framing is now split off structurally instead:
+// splitSyslogMessage removes the syslog header exactly once, from the front, and
+// the record is matched against the message field alone. A crafted username
+// lands inside the message and can never become the message.
+var acceptedRe = regexp.MustCompile(`^Accepted (\S+) for (?:invalid user )?(\S+) from (\S+)`)
+
+// syslogHeaderRe matches the BSD (RFC 3164) or ISO-8601 framing that a file
+// source such as /var/log/auth.log carries in front of the sshd message:
+//
+//	Jun 11 04:00:01 host sshd[123]: <message>
+//	2026-08-19T03:14:07.123456+08:00 host sshd[123]: <message>
+//
+// It is anchored at line start and consumes timestamp, hostname and program tag
+// in one pass, so it always splits at the FIRST tag on the line: the one syslog
+// itself wrote. A second tag inside the message is part of the message.
+// journald's `-o cat` output carries no header at all and is handled by leaving
+// the line untouched.
+var syslogHeaderRe = regexp.MustCompile(`^(?:[A-Z][a-z]{2} {1,2}\d{1,2} \d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*)\s+\S+\s+(\S+?)(?:\[\d+\])?:[ \t]`)
+
+// splitSyslogMessage separates the syslog framing from the message the program
+// logged. program is empty when the line carries no header (a bare message), in
+// which case the whole line is the message.
+func splitSyslogMessage(line string) (program, message string) {
+	m := syslogHeaderRe.FindStringSubmatchIndex(line)
+	if m == nil {
+		return "", line
+	}
+	return line[m[2]:m[3]], line[m[1]:]
+}
+
+// isSSHDProgram reports whether a syslog program tag is sshd. OpenSSH 9.8 split
+// the per-connection work into helper binaries that log under their own tags
+// ("sshd-session", "sshd-auth"), so the sshd- prefix is accepted too; without it
+// accepted logins go unreported on current OpenSSH.
+func isSSHDProgram(program string) bool {
+	base := path.Base(strings.TrimSpace(program))
+	return base == "sshd" || strings.HasPrefix(base, "sshd-")
+}
 
 // Parse extracts a LoginEvent from a single log line, returning false when the
 // line is not an accepted-login record.
 func Parse(line string) (LoginEvent, bool) {
-	m := acceptedRe.FindStringSubmatch(line)
+	program, message := splitSyslogMessage(line)
+	if program != "" && !isSSHDProgram(program) {
+		return LoginEvent{}, false
+	}
+	m := acceptedRe.FindStringSubmatch(message)
 	if m == nil {
 		return LoginEvent{}, false
 	}
