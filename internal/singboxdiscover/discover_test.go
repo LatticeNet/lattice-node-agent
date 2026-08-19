@@ -61,7 +61,10 @@ func TestResolveRuntimeLayoutUsesLocalProcessAuthority(t *testing.T) {
 	if config != dir || sidecar != meta {
 		t.Fatalf("layout = %q %q", config, sidecar)
 	}
-	if _, _, err := resolveRuntimeLayout([][]string{{"sing-box", "run", "-C", dir}, {"sing-box", "run", "-C", t.TempDir()}}, meta); err == nil {
+	// Ambiguity must still be refused. Both vectors carry a trusted executable
+	// path so this asserts the ambiguity rule itself rather than being satisfied
+	// by the executable-identity check added for the decoy-process finding.
+	if _, _, err := resolveRuntimeLayout([][]string{{"/usr/bin/sing-box", "run", "-C", dir}, {"/usr/local/bin/sing-box", "run", "-C", t.TempDir()}}, meta); err == nil {
 		t.Fatal("ambiguous config directories accepted")
 	}
 }

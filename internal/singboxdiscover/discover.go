@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -38,6 +40,15 @@ const (
 	maxInspectCalls            = 64
 	maxInspectWorkers          = 4
 	defaultInspectTotalTimeout = 2 * time.Second
+	// singBoxExecutableName is the exact binary name accepted as sing-box when
+	// deciding whether a running process may name host paths for this agent. A
+	// substring match ("contains sing-box") let any binary claim the identity.
+	singBoxExecutableName = "sing-box"
+	// maxRuntimeConfigBytes bounds one sing-box config file read. These paths
+	// come from the running process, so they are root-controlled after the
+	// selector fix, but an unbounded read of a file the agent does not own is
+	// still a way to take the agent down with the disk.
+	maxRuntimeConfigBytes = 8 << 20 // 8 MiB
 )
 
 // Source configures on-box sing-box discovery.
@@ -196,7 +207,7 @@ func loadSingBoxRuntimeConfigFiles(source Source) []singBoxRuntimeConfigFile {
 	}
 	readFn := source.readFile
 	if readFn == nil {
-		readFn = os.ReadFile
+		readFn = readBoundedConfigFile
 	}
 	configs := []singBoxRuntimeConfigFile{}
 	for _, path := range filesFn() {
@@ -211,6 +222,24 @@ func loadSingBoxRuntimeConfigFiles(source Source) []singBoxRuntimeConfigFile {
 		configs = append(configs, singBoxRuntimeConfigFile{path: path, cfg: cfg})
 	}
 	return configs
+}
+
+// readBoundedConfigFile reads one sing-box config file with a size ceiling, so a
+// single oversized file cannot exhaust agent memory on every discovery cycle.
+func readBoundedConfigFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxRuntimeConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRuntimeConfigBytes {
+		return nil, fmt.Errorf("sing-box config %s exceeds %d bytes", path, maxRuntimeConfigBytes)
+	}
+	return data, nil
 }
 
 type singBoxLatticeIdentity struct {
@@ -644,6 +673,9 @@ func singBoxRuntimeConfigFiles() []string {
 		}
 	}
 	for _, args := range singBoxProcessArgs() {
+		if len(args) == 0 || !trustedSingBoxExecutable(args[0]) {
+			continue
+		}
 		for i := 0; i < len(args); i++ {
 			arg := args[i]
 			switch arg {
@@ -678,11 +710,43 @@ func singBoxRuntimeConfigFiles() []string {
 	return out
 }
 
+// singBoxProcessArgs returns the argument vectors of the running sing-box
+// processes the agent is willing to treat as local authority.
+//
+// This selector is a trust boundary, not a convenience filter: whatever it
+// admits gets to name the directory the root agent uses as the linechain layout
+// authority (ResolveRuntimeLayout) and as an inventory source
+// (singBoxRuntimeConfigFiles). It previously admitted any process whose argv[0]
+// basename merely contained "sing-box" and whose argv contained "run", so an
+// unprivileged local user only had to run `cp /bin/sleep /tmp/sing-box &&
+// /tmp/sing-box run -C /tmp/mine` to steer a root process.
+//
+// Three things are checked now, in order of how hard they are to forge:
+//
+//  1. The process runs as uid 0, read from the kernel's ownership of
+//     /proc/<pid>. An unprivileged attacker cannot produce a root process, so
+//     this is the check that actually excludes them.
+//  2. Its executable is identified from /proc/<pid>/exe, which the kernel
+//     maintains, rather than from the self-reported argv[0]. A process can set
+//     argv[0] to anything; it cannot relabel its own exe link. When the link
+//     cannot be read (a non-root agent lacks ptrace permission over a root
+//     process) the self-reported path is used instead, which is sound only
+//     because step 1 already established the process is root.
+//  3. The resolved executable must be a sing-box binary living in a system
+//     executable directory, owned by root and not group/world writable, so a
+//     root-run script from a writable path is not authority either.
+//
+// The validated path replaces argv[0] in the returned vector, so every consumer
+// downstream reasons about the kernel's answer rather than the process's claim.
 func singBoxProcessArgs() [][]string {
 	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
 	var out [][]string
-	for _, path := range matches {
-		raw, err := os.ReadFile(path)
+	for _, cmdlinePath := range matches {
+		procDir := filepath.Dir(cmdlinePath)
+		if !processRunsAsRoot(procDir) {
+			continue
+		}
+		raw, err := os.ReadFile(cmdlinePath)
 		if err != nil || len(raw) == 0 {
 			continue
 		}
@@ -693,15 +757,79 @@ func singBoxProcessArgs() [][]string {
 				args = append(args, string(part))
 			}
 		}
-		if len(args) == 0 {
+		if len(args) == 0 || !containsArg(args, "run") {
 			continue
 		}
-		base := filepath.Base(args[0])
-		if strings.Contains(base, "sing-box") && containsArg(args, "run") {
-			out = append(out, args)
+		exe, err := os.Readlink(filepath.Join(procDir, "exe"))
+		if err != nil {
+			exe = args[0]
 		}
+		if !trustedSingBoxExecutable(exe) {
+			continue
+		}
+		args[0] = filepath.Clean(exe)
+		out = append(out, args)
 	}
 	return out
+}
+
+// processRunsAsRoot reports whether /proc/<pid> is owned by uid 0. The kernel
+// owns that directory to the process credentials, so it is not forgeable from
+// inside the process.
+func processRunsAsRoot(procDir string) bool {
+	info, err := os.Stat(procDir)
+	if err != nil {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == 0
+}
+
+// trustedSingBoxExecutableDirs are the system executable directories a sing-box
+// binary may live in to be accepted as local authority. Anything outside them
+// (/tmp, a home directory, a world-writable app directory) is refused. A node
+// whose sing-box lives elsewhere loses process-derived discovery and falls back
+// to the conventional /etc/sing-box paths rather than trusting the process.
+var trustedSingBoxExecutableDirs = []string{
+	"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin",
+}
+
+// trustedSingBoxExecutable reports whether an executable path may be treated as
+// sing-box. The path rules are pure so both the /proc collector and the layout
+// resolver apply the same identity; the ownership and permission rules are
+// applied only when the file can be stat'd, and refuse anything that is not a
+// root-owned, non-group/world-writable regular file.
+func trustedSingBoxExecutable(exe string) bool {
+	exe = strings.TrimSpace(exe)
+	if !filepath.IsAbs(exe) {
+		return false
+	}
+	clean := filepath.Clean(exe)
+	if filepath.Base(clean) != singBoxExecutableName {
+		return false
+	}
+	trustedDir := false
+	for _, dir := range trustedSingBoxExecutableDirs {
+		if filepath.Dir(clean) == dir {
+			trustedDir = true
+			break
+		}
+	}
+	if !trustedDir {
+		return false
+	}
+	info, err := os.Lstat(clean)
+	if err != nil {
+		// The binary is not visible from here (a test vector, or a chroot). The
+		// path rules above still applied, and in the /proc collector the process
+		// was already proven to be root.
+		return true
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == 0
 }
 
 // ResolveRuntimeLayout returns the one locally observed sing-box -C directory
@@ -714,6 +842,12 @@ func ResolveRuntimeLayout(metaPath string) (string, string, error) {
 func resolveRuntimeLayout(processes [][]string, metaPath string) (string, string, error) {
 	dirs := map[string]struct{}{}
 	for _, args := range processes {
+		// Second layer behind the /proc checks in singBoxProcessArgs: only a
+		// process running a sing-box binary from a system executable directory
+		// may name the config directory this agent treats as authority.
+		if len(args) == 0 || !trustedSingBoxExecutable(args[0]) {
+			continue
+		}
 		for i := 0; i < len(args); i++ {
 			arg := args[i]
 			var value string
