@@ -739,7 +739,7 @@ func singBoxRuntimeConfigFiles() []string {
 // The validated path replaces argv[0] in the returned vector, so every consumer
 // downstream reasons about the kernel's answer rather than the process's claim.
 func singBoxProcessArgs() [][]string {
-	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	matches, _ := filepath.Glob(filepath.Join(procRoot, "[0-9]*", "cmdline"))
 	var out [][]string
 	for _, cmdlinePath := range matches {
 		procDir := filepath.Dir(cmdlinePath)
@@ -773,16 +773,44 @@ func singBoxProcessArgs() [][]string {
 	return out
 }
 
+// procRoot is the process table the selector reads. It is a variable so a test
+// can point the privileged half of this trust boundary at a fabricated tree;
+// production always reads /proc.
+var procRoot = "/proc"
+
+// fileIdentity is the subset of file metadata the trust checks need: the mode
+// decides regular-file and writability questions, the uid decides ownership.
+type fileIdentity struct {
+	mode os.FileMode
+	uid  uint32
+}
+
+// statIdentity resolves a path's mode and owning uid. It is a package variable
+// for one reason: ownership is the load-bearing half of this selector, and a
+// test process that is not root cannot create a root-owned file to exercise it.
+// Tests substitute the uid and keep the real mode, so only the fact under test
+// is fabricated.
+var statIdentity = func(path string) (fileIdentity, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileIdentity{}, fmt.Errorf("no ownership metadata for %s", path)
+	}
+	return fileIdentity{mode: info.Mode(), uid: stat.Uid}, nil
+}
+
 // processRunsAsRoot reports whether /proc/<pid> is owned by uid 0. The kernel
 // owns that directory to the process credentials, so it is not forgeable from
 // inside the process.
 func processRunsAsRoot(procDir string) bool {
-	info, err := os.Stat(procDir)
+	id, err := statIdentity(procDir)
 	if err != nil {
 		return false
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && stat.Uid == 0
+	return id.uid == 0
 }
 
 // trustedSingBoxExecutableDirs are the system executable directories a sing-box
@@ -818,18 +846,17 @@ func trustedSingBoxExecutable(exe string) bool {
 	if !trustedDir {
 		return false
 	}
-	info, err := os.Lstat(clean)
+	id, err := statIdentity(clean)
 	if err != nil {
 		// The binary is not visible from here (a test vector, or a chroot). The
 		// path rules above still applied, and in the /proc collector the process
 		// was already proven to be root.
 		return true
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+	if !id.mode.IsRegular() || id.mode.Perm()&0o022 != 0 {
 		return false
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && stat.Uid == 0
+	return id.uid == 0
 }
 
 // ResolveRuntimeLayout returns the one locally observed sing-box -C directory
