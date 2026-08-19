@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -25,17 +29,19 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
+	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
+	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.3-alpha.2"
-var compatServerMin = "v0.2.2-alpha.2"
+var version = "0.3.4-alpha.1"
+var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
 
@@ -59,11 +65,25 @@ func compatibilityPayload() agentCompatibility {
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 const (
-	defaultDebugMaxLineBytes  = 4096
-	defaultDebugMaxBatchLines = 100
-	debugSinkMaxLines         = 1000
-	guardRealityReportTimeout = 10 * time.Second
+	defaultDebugMaxLineBytes    = 4096
+	defaultDebugMaxBatchLines   = 100
+	debugSinkMaxLines           = 1000
+	guardRealityReportTimeout   = 10 * time.Second
+	guardManagedSHACapability   = "netguard-managed-sha-v1"
+	durableTaskResultCapability = "durable-task-result-v1"
+	agentCapabilitiesHeader     = "X-Lattice-Agent-Capabilities"
 )
+
+func reportedCapabilities() []string {
+	return []string{durableTaskResultCapability, guardManagedSHACapability}
+}
+
+func capabilitiesFor(linechainReady bool) []string {
+	if linechainReady {
+		return reportedCapabilities()
+	}
+	return []string{guardManagedSHACapability}
+}
 
 type agentConfig struct {
 	Server              string
@@ -144,6 +164,9 @@ type agentConfig struct {
 	SingBoxBin            string
 	SingBoxMeta           string
 	LogStateDir           string
+	TaskOutboxDir         string
+	LinechainTxnDir       string
+	LinechainReady        bool
 }
 
 type agentRuntimePayload struct {
@@ -178,6 +201,8 @@ func main() {
 	var cfg agentConfig
 	var printVersion bool
 	var printCompat bool
+	var printGuardManagedSHA bool
+	var applyLinechain bool
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
@@ -235,8 +260,12 @@ func main() {
 	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
 	flag.StringVar(&cfg.SingBoxMeta, "singbox-meta", env("LATTICE_SINGBOX_META", ""), "design-15 sing-box sidecar metadata path for -singbox-discover (default /etc/sing-box/lattice-metadata.json)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
+	flag.StringVar(&cfg.TaskOutboxDir, "task-outbox-dir", os.Getenv("LATTICE_TASK_OUTBOX_DIR"), "base directory for durable task-result journals (default: log state dir, or the user cache directory for manual runs)")
+	flag.StringVar(&cfg.LinechainTxnDir, "linechain-txn-dir", os.Getenv("LATTICE_LINECHAIN_TXN_DIR"), "private directory for crash-recoverable linechain transactions")
+	flag.BoolVar(&applyLinechain, "linechain-apply", false, "apply one bounded linechain document from stdin and exit")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.BoolVar(&printCompat, "compat-json", false, "print embedded server/dashboard compatibility metadata and exit")
+	flag.BoolVar(&printGuardManagedSHA, "guard-managed-sha", false, "print the canonical SHA-256 of the managed lattice_guard nft table and exit")
 	flag.Parse()
 	if printVersion {
 		fmt.Println(version)
@@ -245,6 +274,30 @@ func main() {
 	if printCompat {
 		if err := json.NewEncoder(os.Stdout).Encode(compatibilityPayload()); err != nil {
 			log.Fatalf("compatibility encode failed: %v", err)
+		}
+		return
+	}
+	if printGuardManagedSHA {
+		if err := writeGuardManagedSHA(context.Background(), os.Stdout, guardreality.CollectManagedTableSHA); err != nil {
+			log.Fatalf("guard managed SHA collection failed: %v", err)
+		}
+		return
+	}
+	if applyLinechain {
+		dir, err := linechainTransactionDir(cfg)
+		if err != nil {
+			log.Fatalf("linechain transaction path failed: %v", err)
+		}
+		manager, err := linechain.OpenHelper(dir)
+		if err != nil {
+			log.Fatalf("linechain transaction manager failed: %v", err)
+		}
+		defer manager.Close()
+		if err := manager.ConfigureLayout(os.Getenv("LATTICE_LINECHAIN_CONFIG_DIR"), os.Getenv("LATTICE_LINECHAIN_SIDECAR_PATH")); err != nil {
+			log.Fatalf("linechain local layout failed: %v", err)
+		}
+		if err := manager.Apply(context.Background(), os.Stdin, os.Getenv("LATTICE_TASK_ID"), os.Getenv("LATTICE_TASK_LEASE_ID"), os.Getenv("LATTICE_LINECHAIN_TASK_SCRIPT_SHA256")); err != nil {
+			log.Fatalf("linechain apply failed: %v", err)
 		}
 		return
 	}
@@ -303,6 +356,47 @@ func main() {
 	if cfg.NodeID == "" || cfg.Token == "" {
 		log.Fatal("node-id and token are required")
 	}
+	outboxDir, err := taskResultOutboxDir(cfg)
+	if err != nil {
+		log.Fatalf("task result outbox path failed: %v", err)
+	}
+	taskResults, err := taskoutbox.Open(outboxDir)
+	if err != nil {
+		log.Fatalf("task result outbox initialization failed: %v", err)
+	}
+	defer taskResults.Close()
+	linechainDir, err := linechainTransactionDir(cfg)
+	if err != nil {
+		log.Fatalf("linechain transaction path failed: %v", err)
+	}
+	linechainManager, err := linechain.Open(linechainDir)
+	if err != nil {
+		log.Fatalf("linechain transaction manager initialization failed: %v", err)
+	}
+	defer linechainManager.Close()
+	linechainConfigDir, linechainSidecarPath, layoutErr := singboxdiscover.ResolveRuntimeLayout(cfg.SingBoxMeta)
+	if layoutErr != nil {
+		log.Printf("warning: durable linechain tasks disabled: %v", layoutErr)
+	} else if err := linechainManager.ConfigureLayout(linechainConfigDir, linechainSidecarPath); err != nil {
+		log.Printf("warning: durable linechain tasks disabled: %v", err)
+	} else {
+		cfg.LinechainReady = true
+	}
+	for {
+		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err == nil {
+			break
+		} else {
+			log.Printf("linechain recovery blocked readiness: %v", err)
+			time.Sleep(cfg.Interval)
+		}
+	}
+	agentBinary, err := os.Executable()
+	if err != nil {
+		log.Fatalf("resolve lattice-agent executable failed: %v", err)
+	}
+	if !filepath.IsAbs(agentBinary) {
+		log.Fatalf("resolved lattice-agent executable is not absolute: %q", agentBinary)
+	}
 	if cfg.AllowTerminal && os.Geteuid() == 0 && !cfg.AllowRoot {
 		log.Printf("warning: terminal sessions disabled because agent is running as root without -allow-root-exec")
 		cfg.AllowTerminal = false
@@ -318,6 +412,7 @@ func main() {
 	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 		"version":              version,
 		"compatibility":        compatibilityPayload(),
+		"capabilities":         capabilitiesFor(cfg.LinechainReady),
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
 		"internal_ip":          cfg.InternalIP,
@@ -343,12 +438,20 @@ func main() {
 		go runTerminalLoop(context.Background(), cfg)
 	}
 
-	runner := taskexec.Runner{AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(), WorkdirRoot: cfg.TaskWorkRoot}
+	runner := taskexec.Runner{
+		AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(),
+		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary, LinechainTxnDir: linechainDir, LinechainConfigDir: linechainConfigDir, LinechainSidecarPath: linechainSidecarPath,
+	}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
+		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
+			log.Printf("linechain recovery blocked cycle: %v", err)
+			<-ticker.C
+			continue
+		}
 		if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 			debugf(cfg, "agent config fetch failed: %v", err)
 		} else {
@@ -366,7 +469,7 @@ func main() {
 		if err := reportSingBoxInventory(cfg); err != nil {
 			log.Printf("singbox discover error: %v", err)
 		}
-		if err := runTasks(cfg, runner); err != nil {
+		if err := runTasks(cfg, runner, taskResults, linechainManager); err != nil {
 			log.Printf("task poll error: %v", err)
 		}
 		if assigned, err := fetchMonitors(cfg); err != nil {
@@ -390,6 +493,20 @@ func main() {
 		cancelReport()
 		<-ticker.C
 	}
+}
+
+var guardManagedSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func writeGuardManagedSHA(ctx context.Context, out io.Writer, collect func(context.Context, guardreality.Source) (string, error)) error {
+	sha, err := collect(ctx, guardreality.Source{})
+	if err != nil {
+		return err
+	}
+	if !guardManagedSHARe.MatchString(sha) {
+		return fmt.Errorf("collector returned invalid managed table SHA")
+	}
+	_, err = fmt.Fprintln(out, sha)
+	return err
 }
 
 // monitorManager keeps one goroutine per assigned monitor, each probing on its
@@ -624,6 +741,7 @@ func reportMetrics(cfg agentConfig) error {
 	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
 		"version":       version,
 		"compatibility": compatibilityPayload(),
+		"capabilities":  capabilitiesFor(cfg.LinechainReady),
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,
@@ -1046,12 +1164,51 @@ func resolveProxyUsageSecret(cfg *agentConfig) error {
 	return nil
 }
 
-func runTasks(cfg agentConfig, runner taskexec.Runner) error {
+type taskRunner interface {
+	Run(model.Task) model.TaskResult
+}
+
+type taskResultOutbox interface {
+	Begin(model.Task) (bool, error)
+	Complete(model.TaskResult) (bool, error)
+	ConfirmDurability() error
+	RecoverInterrupted(string) error
+	Pending() ([]taskoutbox.Entry, error)
+	Remove(taskoutbox.Entry) error
+}
+
+type taskResultOutboxSnapshot interface {
+	Snapshot() ([]taskoutbox.Entry, error)
+}
+
+type leasedAgentTask struct {
+	model.Task
+	DurableResult   bool   `json:"durable_result"`
+	DurableProtocol string `json:"durable_protocol,omitempty"`
+}
+
+func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, managers ...*linechain.Manager) error {
+	var manager *linechain.Manager
+	if len(managers) > 0 {
+		manager = managers[0]
+	}
+	if manager != nil {
+		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
+			return err
+		}
+	}
+	if err := outbox.RecoverInterrupted(cfg.NodeID); err != nil {
+		return fmt.Errorf("recover interrupted task results: %w", err)
+	}
+	if err := flushTaskResults(cfg, outbox); err != nil {
+		return err
+	}
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/tasks?node_id=%s", cfg.Server, cfg.NodeID), nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set(agentCapabilitiesHeader, strings.Join(capabilitiesFor(cfg.LinechainReady), ","))
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -1060,23 +1217,382 @@ func runTasks(cfg agentConfig, runner taskexec.Runner) error {
 	if resp.StatusCode != http.StatusOK {
 		return agentHTTPError(resp, "fetch tasks")
 	}
-	var tasks []model.Task
+	var tasks []leasedAgentTask
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
 		return err
 	}
 	debugf(cfg, "tasks fetched: count=%d", len(tasks))
-	for _, task := range tasks {
+	for _, leased := range tasks {
+		task := leased.Task
+		if err := validateDurablePair(leased, manager, cfg.LinechainReady); err != nil {
+			return err
+		}
+		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v2" && leased.DurableProtocol != "netguard-v1" {
+			return fmt.Errorf("unsupported durable protocol %q", leased.DurableProtocol)
+		}
+		if !leased.DurableResult {
+			debugf(cfg, "task start without durable-result protocol: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
+			result := runner.Run(task)
+			result.NodeID = cfg.NodeID
+			if result.FinishedAt.IsZero() {
+				result.FinishedAt = time.Now().UTC()
+			}
+			if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": result}, nil); err != nil {
+				return fmt.Errorf("post task result %s: %w", task.ID, err)
+			}
+			continue
+		}
+		var committed bool
+		var err error
+		if typed, ok := outbox.(interface {
+			BeginWithProtocol(model.Task, string) (bool, error)
+		}); ok {
+			committed, err = typed.BeginWithProtocol(task, leased.DurableProtocol)
+		} else {
+			committed, err = outbox.Begin(task)
+		}
+		if err != nil {
+			journalErr := fmt.Errorf("journal task lease %s before execution: %w", task.ID, err)
+			if committed {
+				// The lease journal is visible but its directory durability is
+				// uncertain. Do not post a different direct result: the next poll
+				// will recover this exact journal as an unknown outcome.
+				return journalErr
+			}
+			// No host code ran, so it is safe to make one best-effort terminal
+			// report even though durable retry storage is unavailable. This avoids
+			// silently stranding the server lease while preserving the fail-closed
+			// rule that an unjournaled task is never executed.
+			failure := model.TaskResult{
+				TaskID: task.ID, LeaseID: task.LeaseID, NodeID: cfg.NodeID, ExitCode: -1,
+				Error:      "task was not executed because its durable lease journal could not be written",
+				FinishedAt: time.Now().UTC(),
+			}
+			if postErr := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": failure}, nil); postErr != nil {
+				return fmt.Errorf("%v; report unexecuted task: %w", journalErr, postErr)
+			}
+			return journalErr
+		}
+		if !committed {
+			// The server intentionally redelivers an unacknowledged lease when a
+			// prior task-poll response may have been lost. An exact existing journal
+			// is the execution authority, so the duplicate response is a no-op.
+			debugf(cfg, "task lease already journaled: id=%s", task.ID)
+			continue
+		}
 		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
-		result := runner.Run(task)
+		var result model.TaskResult
+		if isLinechainTask(leased) {
+			typed, ok := runner.(interface {
+				RunLinechain(model.Task) model.TaskResult
+			})
+			if !ok {
+				return fmt.Errorf("linechain task runner does not expose trusted E3 execution")
+			}
+			result = typed.RunLinechain(task)
+		} else {
+			result = runner.Run(task)
+		}
 		result.NodeID = cfg.NodeID
+		if manager != nil && isLinechainTask(leased) {
+			result, err = manager.ResolveAfterRun(context.Background(), task, result)
+			if err != nil {
+				return fmt.Errorf("resolve linechain task %s: %w", task.ID, err)
+			}
+		}
 		debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
-		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{
-			"result": result,
-		}, nil); err != nil {
+		completed, completeErr := outbox.Complete(result)
+		if completeErr != nil {
+			journalErr := fmt.Errorf("journal task result %s before upload: %w", task.ID, completeErr)
+			if completed {
+				// Rename published the exact result even though directory durability
+				// was uncertain. Confirm the local transition before allowing the
+				// server to commit the result; otherwise a crash could expose the old
+				// leased journal and synthesize a conflicting unknown-outcome result.
+				if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
+					return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
+				}
+				if manager != nil && isLinechainTask(leased) {
+					if cleanupErr := manager.Cleanup(task.ID, task.LeaseID); cleanupErr != nil {
+						if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
+							return fmt.Errorf("%v; cleanup confirmed linechain task: %v; upload stable result: %w", journalErr, cleanupErr, uploadErr)
+						}
+						return fmt.Errorf("%v; cleanup confirmed linechain task: %w; result remains replayable", journalErr, cleanupErr)
+					}
+				}
+				if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
+					return fmt.Errorf("%v; upload confirmed task result: %w", journalErr, flushErr)
+				}
+			}
+			return journalErr
+		}
+		if manager != nil && isLinechainTask(leased) {
+			if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
+				if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
+					return fmt.Errorf("cleanup linechain task %s: %v; upload stable result: %w", task.ID, err, uploadErr)
+				}
+				return fmt.Errorf("cleanup linechain task %s after durable outbox completion; result remains replayable: %w", task.ID, err)
+			}
+		}
+		if err := flushTaskResults(cfg, outbox); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func crossCheckLinechainAuthority(manager *linechain.Manager, outbox taskResultOutbox) error {
+	_, err := captureLinechainAuthority(manager, outbox)
+	return err
+}
+
+func captureLinechainAuthority(manager *linechain.Manager, outbox taskResultOutbox) (map[string]linechain.RecoveryAuthority, error) {
+	typed, ok := outbox.(taskResultOutboxSnapshot)
+	if !ok {
+		return nil, nil
+	}
+	entries, err := typed.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	refs, err := manager.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	journals := map[string]linechain.JournalRef{}
+	for _, ref := range refs {
+		journals[ref.TaskID+"\x00"+ref.LeaseID] = ref
+	}
+	matchedE3 := map[string]struct{}{}
+	for _, entry := range entries {
+		key := entry.Task.ID + "\x00" + entry.Task.LeaseID
+		ref, hasJournal := journals[key]
+		if hasJournal && entry.DurableProtocol != "linechain-e3-v2" {
+			return nil, fmt.Errorf("linechain journal %s has mismatched outbox protocol", entry.Task.ID)
+		}
+		if hasJournal && entry.DurableProtocol == "linechain-e3-v2" {
+			if ref.TaskScriptSHA != linechainTaskScriptSHA(entry.Task.Script) {
+				return nil, fmt.Errorf("linechain journal %s does not match the exact outbox task script", entry.Task.ID)
+			}
+			artifactSHA, err := linechainArtifactSHAFromTaskScript(entry.Task.Script)
+			if err != nil || artifactSHA != ref.ArtifactSHA256 {
+				return nil, fmt.Errorf("linechain journal %s does not match the issued artifact in the exact outbox script", entry.Task.ID)
+			}
+			matchedE3[key] = struct{}{}
+		}
+		if entry.State == "leased" && entry.DurableProtocol == "linechain-e3-v2" {
+			if !hasJournal {
+				return nil, fmt.Errorf("leased E3 outbox %s lacks exact linechain journal", entry.Task.ID)
+			}
+		}
+		if entry.State == "completed" && entry.DurableProtocol == "linechain-e3-v2" && hasJournal {
+			if !ref.Terminal || entry.Result == nil || ref.Result == nil || !sameTaskResult(*entry.Result, *ref.Result) {
+				return nil, fmt.Errorf("completed E3 outbox %s conflicts with linechain terminal result", entry.Task.ID)
+			}
+		}
+	}
+	for key := range journals {
+		if _, ok := matchedE3[key]; !ok {
+			return nil, fmt.Errorf("linechain journal lacks exact leased E3 outbox: %q", key)
+		}
+	}
+	authority := make(map[string]linechain.RecoveryAuthority, len(journals))
+	for key, ref := range journals {
+		authority[key] = linechain.RecoveryAuthority{TaskScriptSHA: ref.TaskScriptSHA, ArtifactSHA256: ref.ArtifactSHA256, Phase: ref.Phase, ResultSHA256: taskResultPointerSHA(ref.Result), JournalSHA256: ref.JournalSHA256}
+	}
+	return authority, nil
+}
+
+func sameTaskResult(a, b model.TaskResult) bool {
+	aBytes, aErr := json.Marshal(a)
+	bBytes, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aBytes, bBytes)
+}
+
+func linechainTaskScriptSHA(script string) string {
+	sum := sha256.Sum256([]byte(script))
+	return hex.EncodeToString(sum[:])
+}
+
+func linechainArtifactSHAFromTaskScript(script string) (string, error) {
+	const prefix = "# lattice-linechain-e3-v2\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '"
+	const suffix = "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n"
+	if !strings.HasPrefix(script, prefix) || !strings.HasSuffix(script, suffix) {
+		return "", fmt.Errorf("linechain task script is not the canonical v2 wrapper")
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(script, prefix), suffix)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode linechain task document: %w", err)
+	}
+	fields, err := decodeUniqueTopLevelFields(raw)
+	if err != nil {
+		return "", fmt.Errorf("decode linechain task document: %w", err)
+	}
+	var version int
+	var protocol, artifact string
+	if err := json.Unmarshal(fields["version"], &version); err != nil || version != 2 {
+		return "", fmt.Errorf("linechain task document version is invalid")
+	}
+	if err := json.Unmarshal(fields["durable_protocol"], &protocol); err != nil || protocol != "linechain-e3-v2" {
+		return "", fmt.Errorf("linechain task document protocol is invalid")
+	}
+	if err := json.Unmarshal(fields["artifact_sha256"], &artifact); err != nil || !guardManagedSHARe.MatchString(artifact) {
+		return "", fmt.Errorf("linechain task document artifact is invalid")
+	}
+	return artifact, nil
+}
+
+func decodeUniqueTopLevelFields(raw []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("document must be an object")
+	}
+	fields := make(map[string]json.RawMessage)
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("document field name is invalid")
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate document field %s", name)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[name] = value
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected trailing data")
+	}
+	return fields, nil
+}
+
+func taskResultPointerSHA(result *model.TaskResult) string {
+	if result == nil {
+		return ""
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func validateDurablePair(task leasedAgentTask, manager *linechain.Manager, ready bool) error {
+	if !task.DurableResult {
+		if task.DurableProtocol != "" {
+			return fmt.Errorf("non-durable task has protocol %q", task.DurableProtocol)
+		}
+		return nil
+	}
+	if task.DurableProtocol != "linechain-e3-v2" && task.DurableProtocol != "netguard-v1" {
+		return fmt.Errorf("durable task has unsupported protocol %q", task.DurableProtocol)
+	}
+	if task.DurableProtocol == "linechain-e3-v2" && (manager == nil || !ready) {
+		return fmt.Errorf("linechain task received while durable linechain is unavailable")
+	}
+	return nil
+}
+
+func isLinechainTask(task leasedAgentTask) bool {
+	return task.DurableResult && task.DurableProtocol == "linechain-e3-v2"
+}
+
+func requireLinechainRecovered(ctx context.Context, manager *linechain.Manager, outbox taskResultOutbox, nodeID string) error {
+	authority, err := captureLinechainAuthority(manager, outbox)
+	if err != nil {
+		return err
+	}
+	return manager.RequireRecoveredAuthorized(ctx, func(result model.TaskResult) error {
+		committed, err := outbox.Complete(result)
+		if err == nil {
+			return nil
+		}
+		if committed {
+			return outbox.ConfirmDurability()
+		}
+		// An exact completed outbox may remain after a crash before transaction
+		// cleanup. Complete implementations treat that replay idempotently.
+		return err
+	}, nodeID, authority)
+}
+
+func flushTaskResults(cfg agentConfig, outbox taskResultOutbox) error {
+	return flushTaskResultsRetain(cfg, outbox, false)
+}
+
+func flushTaskResultsRetain(cfg agentConfig, outbox taskResultOutbox, retain bool) error {
+	pending, err := outbox.Pending()
+	if err != nil {
+		return fmt.Errorf("read pending task results: %w", err)
+	}
+	for _, entry := range pending {
+		if entry.Result == nil {
+			return fmt.Errorf("pending task result %s is empty", entry.Task.ID)
+		}
+		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{
+			"result": *entry.Result,
+		}, nil); err != nil {
+			return fmt.Errorf("flush durable task result %s: %w", entry.Task.ID, err)
+		}
+		// Pending entries predate typed lease metadata; retain only the exact
+		// helper namespace marker during cleanup recovery. Live classification is
+		// always driven by durable_protocol on the leased response.
+		if retain && entry.DurableProtocol == "linechain-e3-v2" {
+			continue
+		}
+		if err := outbox.Remove(entry); err != nil {
+			return fmt.Errorf("remove acknowledged task result %s: %w", entry.Task.ID, err)
+		}
+	}
+	return nil
+}
+
+func taskResultOutboxDir(cfg agentConfig) (string, error) {
+	base := strings.TrimSpace(cfg.TaskOutboxDir)
+	if base == "" {
+		base = strings.TrimSpace(cfg.LogStateDir)
+	}
+	if base == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(cacheDir, "lattice-agent")
+	}
+	nodeHash := sha256.Sum256([]byte(cfg.Server + "\x00" + cfg.NodeID))
+	return filepath.Join(base, "task-outbox", fmt.Sprintf("%x", nodeHash[:])), nil
+}
+
+func linechainTransactionDir(cfg agentConfig) (string, error) {
+	dir := strings.TrimSpace(cfg.LinechainTxnDir)
+	if dir == "" {
+		base := strings.TrimSpace(cfg.LogStateDir)
+		if base == "" {
+			cacheDir, err := os.UserCacheDir()
+			if err != nil {
+				return "", err
+			}
+			base = filepath.Join(cacheDir, "lattice-agent")
+		}
+		dir = filepath.Join(base, "linechain-txn")
+	}
+	dir = filepath.Clean(dir)
+	if !filepath.IsAbs(dir) || dir == string(filepath.Separator) {
+		return "", fmt.Errorf("linechain transaction directory must be absolute and non-root")
+	}
+	return dir, nil
 }
 
 func postAgentJSON(cfg agentConfig, path string, payload map[string]any, out any) error {

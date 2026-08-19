@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,21 @@ func TestDiscoverParsesListAndVersion(t *testing.T) {
 	}
 	if len(inv.Nodes) != 2 || inv.Nodes[0].Network != "reality" || inv.Nodes[1].Protocol != "hysteria2" {
 		t.Fatalf("nodes parse wrong: %+v", inv.Nodes)
+	}
+}
+
+func TestResolveRuntimeLayoutUsesLocalProcessAuthority(t *testing.T) {
+	dir := t.TempDir()
+	meta := filepath.Join(t.TempDir(), "lattice-metadata.json")
+	config, sidecar, err := resolveRuntimeLayout([][]string{{"/usr/bin/sing-box", "run", "-C", dir}}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config != dir || sidecar != meta {
+		t.Fatalf("layout = %q %q", config, sidecar)
+	}
+	if _, _, err := resolveRuntimeLayout([][]string{{"sing-box", "run", "-C", dir}, {"sing-box", "run", "-C", t.TempDir()}}, meta); err == nil {
+		t.Fatal("ambiguous config directories accepted")
 	}
 }
 

@@ -1,17 +1,74 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"reflect"
+	"regexp"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
+
+func TestWriteGuardManagedSHAOnlyOutputsCanonicalHashOnSuccess(t *testing.T) {
+	valid := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	tests := []struct {
+		name    string
+		collect func(context.Context, guardreality.Source) (string, error)
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "success",
+			collect: func(context.Context, guardreality.Source) (string, error) {
+				return valid, nil
+			},
+			want: valid + "\n",
+		},
+		{
+			name: "collection failure",
+			collect: func(context.Context, guardreality.Source) (string, error) {
+				return "", errors.New("nft unavailable")
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid collector value",
+			collect: func(context.Context, guardreality.Source) (string, error) {
+				return "NOT-A-SHA", nil
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := writeGuardManagedSHA(context.Background(), &out, tc.collect)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%v", err, tc.wantErr)
+			}
+			if out.String() != tc.want {
+				t.Fatalf("stdout = %q, want %q", out.String(), tc.want)
+			}
+			if out.Len() > 0 && !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(out.Bytes()) {
+				t.Fatalf("successful stdout is not one lowercase SHA-256: %q", out.String())
+			}
+		})
+	}
+}
+
+func TestReportedCapabilitiesAdvertiseGuardManagedSHA(t *testing.T) {
+	got := reportedCapabilities()
+	if !reflect.DeepEqual(got, []string{durableTaskResultCapability, guardManagedSHACapability}) {
+		t.Fatalf("reported capabilities = %#v", got)
+	}
+}
 
 func TestReportGuardReality(t *testing.T) {
 	originalClient := httpClient

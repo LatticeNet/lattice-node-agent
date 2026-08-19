@@ -43,6 +43,65 @@ type Source struct {
 	Runner    Runner
 }
 
+// CollectManagedTableSHA reads the current nftables ruleset and returns the
+// canonical hash of the managed inet lattice_guard table. It fails closed when
+// the command, JSON parsing, or managed-table lookup fails.
+func CollectManagedTableSHA(ctx context.Context, source Source) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := source.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	run := source.Runner
+	if run == nil {
+		run = runBoundedCommand
+	}
+	nftBinary := firstNonEmpty(source.NFTBinary, "nft")
+
+	rulesetOut, err := runStep(ctx, timeout, run, nftBinary, "-j", "list", "ruleset")
+	if err != nil {
+		return "", err
+	}
+	managedSHA, _, err := ParseNFTRuleset(rulesetOut)
+	if err != nil {
+		return "", fmt.Errorf("parse nft ruleset: %w", err)
+	}
+	if managedSHA == "" {
+		return "", fmt.Errorf("managed nft table %s %s not found", managedFamily, managedTable)
+	}
+	hasContent, err := managedTableHasContent(rulesetOut)
+	if err != nil {
+		return "", fmt.Errorf("inspect managed nft table: %w", err)
+	}
+	if !hasContent {
+		return "", fmt.Errorf("managed nft table %s %s is empty", managedFamily, managedTable)
+	}
+	return managedSHA, nil
+}
+
+func managedTableHasContent(raw []byte) (bool, error) {
+	var payload struct {
+		NFTables []map[string]any `json:"nftables"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &payload); err != nil {
+		return false, err
+	}
+	for _, entry := range payload.NFTables {
+		for kind, rawBody := range entry {
+			if kind == "table" {
+				continue
+			}
+			body, ok := rawBody.(map[string]any)
+			if ok && nftObjectBelongsToManaged(kind, body) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // Collect runs the read-only guard reality commands and normalizes their output
 // into the shared SDK model. The caller-supplied node id wins over anything a
 // command could report.

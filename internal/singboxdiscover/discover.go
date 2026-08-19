@@ -175,6 +175,14 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 	return inv, nil
 }
 
+// DiscoverRuntimeFiles parses an explicit locally resolved runtime config set.
+// It is used by recovery/E2E verification after the same bounded layout resolver
+// has established file authority.
+func DiscoverRuntimeFiles(nodeID string, files []string, metaPath string) (model.SingBoxInventory, error) {
+	copyFiles := append([]string(nil), files...)
+	return discoverRuntimeConfig(Source{MetaPath: metaPath, runtimeFiles: func() []string { return copyFiles }}, nodeID, time.Now().UTC())
+}
+
 // loadSingBoxRuntimeConfigFiles locates and reads the on-box sing-box config
 // files (the running process's -c/-C paths plus the /etc/sing-box defaults) and
 // returns each one that parsed successfully. Returns an empty slice when none
@@ -694,6 +702,63 @@ func singBoxProcessArgs() [][]string {
 		}
 	}
 	return out
+}
+
+// ResolveRuntimeLayout returns the one locally observed sing-box -C directory
+// and the design-17 sidecar path. It never trusts a server task document to
+// choose writable host paths.
+func ResolveRuntimeLayout(metaPath string) (string, string, error) {
+	return resolveRuntimeLayout(singBoxProcessArgs(), metaPath)
+}
+
+func resolveRuntimeLayout(processes [][]string, metaPath string) (string, string, error) {
+	dirs := map[string]struct{}{}
+	for _, args := range processes {
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			var value string
+			switch arg {
+			case "-C", "--config-directory":
+				if i+1 < len(args) {
+					i++
+					value = args[i]
+				}
+			default:
+				for _, prefix := range []string{"-C=", "--config-directory="} {
+					if v, ok := strings.CutPrefix(arg, prefix); ok {
+						value = v
+					}
+				}
+			}
+			if value != "" && filepath.IsAbs(value) {
+				dirs[filepath.Clean(value)] = struct{}{}
+			}
+		}
+	}
+	if len(dirs) == 0 {
+		if info, err := os.Lstat("/etc/sing-box/conf"); err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			dirs["/etc/sing-box/conf"] = struct{}{}
+		}
+	}
+	if len(dirs) != 1 {
+		return "", "", fmt.Errorf("resolve sing-box config directory: found %d active -C directories", len(dirs))
+	}
+	var configDir string
+	for dir := range dirs {
+		configDir = dir
+	}
+	info, err := os.Lstat(configDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", "", fmt.Errorf("resolve sing-box config directory: path is not a real directory")
+	}
+	metaPath = strings.TrimSpace(metaPath)
+	if metaPath == "" {
+		metaPath = defaultMetaPath
+	}
+	if !filepath.IsAbs(metaPath) {
+		return "", "", fmt.Errorf("resolve sing-box sidecar: path must be absolute")
+	}
+	return configDir, filepath.Clean(metaPath), nil
 }
 
 func containsArg(args []string, want string) bool {

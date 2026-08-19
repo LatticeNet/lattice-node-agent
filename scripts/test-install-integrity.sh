@@ -118,7 +118,15 @@ for expected in \
   'User=$run_user' \
   'Group=$run_group' \
   'Delegate=yes' \
-  'chown "$run_user:$run_group" "$state_dir"'
+  'chown "$run_user:$run_group" "$state_dir"' \
+  'LATTICE_TASK_OUTBOX_DIR="${LATTICE_TASK_OUTBOX_DIR:-}"' \
+  'LATTICE_TASK_OUTBOX_DIR=$(quote_env "${LATTICE_TASK_OUTBOX_DIR:-}")' \
+  'chown "$run_user:$run_group" "$task_outbox_leaf"' \
+  'LATTICE_LINECHAIN_TXN_DIR="$linechain_txn_dir"' \
+  'LATTICE_LINECHAIN_TXN_DIR=$(quote_env "$linechain_txn_dir")' \
+  'prepare_linechain_txn_dir' \
+  'chmod 0700 "$linechain_txn_dir"' \
+  'chown "$run_user:$run_group" "$linechain_txn_dir"'
 do
   if ! grep -Fq "$expected" "$ROOT/scripts/install.sh"; then
     echo "installer non-root systemd contract missing: $expected" >&2
@@ -126,6 +134,67 @@ do
   fi
 done
 
+UNSAFE_LOG="$TMP/unsafe-outbox.log"
+if PATH="$FAKEBIN:/usr/bin:/bin" \
+  LATTICE_HOME="$HOME_DIR" \
+  LATTICE_AGENT_BIN="$HOME_DIR/lattice-agent" \
+  LATTICE_AGENT_ENV="$HOME_DIR/lattice-agent.env" \
+  LATTICE_AGENT_STATE="$HOME_DIR/state" \
+  LATTICE_TASK_OUTBOX_DIR="/" \
+  LATTICE_SERVER="https://lattice.example.com" \
+  LATTICE_NODE_ID="node-test" \
+  LATTICE_NODE_TOKEN="node-token-test" \
+  sh "$ROOT/scripts/install.sh" >"$UNSAFE_LOG" 2>&1; then
+  echo "installer accepted filesystem root as task outbox" >&2
+  exit 1
+fi
+if ! grep -Fq "must not be a filesystem or system root" "$UNSAFE_LOG"; then
+  echo "unsafe outbox rejection was not explicit" >&2
+  cat "$UNSAFE_LOG" >&2
+  exit 1
+fi
+
+SYMLINK_BASE="$TMP/outbox-link"
+ln -s "$HOME_DIR" "$SYMLINK_BASE"
+if PATH="$FAKEBIN:/usr/bin:/bin" \
+  LATTICE_HOME="$HOME_DIR" \
+  LATTICE_AGENT_BIN="$HOME_DIR/lattice-agent" \
+  LATTICE_AGENT_ENV="$HOME_DIR/lattice-agent.env" \
+  LATTICE_AGENT_STATE="$HOME_DIR/state" \
+  LATTICE_TASK_OUTBOX_DIR="$SYMLINK_BASE" \
+  LATTICE_SERVER="https://lattice.example.com" \
+  LATTICE_NODE_ID="node-test" \
+  LATTICE_NODE_TOKEN="node-token-test" \
+  sh "$ROOT/scripts/install.sh" >"$UNSAFE_LOG" 2>&1; then
+  echo "installer accepted symlinked task outbox" >&2
+  exit 1
+fi
+if ! grep -Fq "must not traverse symlinks" "$UNSAFE_LOG"; then
+  echo "symlinked outbox rejection was not explicit" >&2
+  cat "$UNSAFE_LOG" >&2
+  exit 1
+fi
+
+NESTED_SYMLINK_PARENT="$TMP/outbox-parent-link"
+ln -s "$HOME_DIR" "$NESTED_SYMLINK_PARENT"
+if PATH="$FAKEBIN:/usr/bin:/bin" \
+  LATTICE_HOME="$HOME_DIR" \
+  LATTICE_AGENT_BIN="$HOME_DIR/lattice-agent" \
+  LATTICE_AGENT_ENV="$HOME_DIR/lattice-agent.env" \
+  LATTICE_AGENT_STATE="$HOME_DIR/state" \
+  LATTICE_TASK_OUTBOX_DIR="$NESTED_SYMLINK_PARENT/nested" \
+  LATTICE_SERVER="https://lattice.example.com" \
+  LATTICE_NODE_ID="node-test" \
+  LATTICE_NODE_TOKEN="node-token-test" \
+  sh "$ROOT/scripts/install.sh" >"$UNSAFE_LOG" 2>&1; then
+  echo "installer accepted non-root-owned parent symlink for task outbox" >&2
+  exit 1
+fi
+if ! grep -Fq "must not traverse a non-root-owned symlink" "$UNSAFE_LOG"; then
+  echo "nested symlinked outbox rejection was not explicit" >&2
+  cat "$UNSAFE_LOG" >&2
+  exit 1
+fi
 DARWIN_TMP="$TMP/darwin"
 DARWIN_BIN="$DARWIN_TMP/bin"
 DARWIN_HOME="$DARWIN_TMP/home"
@@ -207,6 +276,7 @@ if ! PATH="$DARWIN_BIN:/usr/bin:/bin" \
   LATTICE_AGENT_BIN="$DARWIN_HOME/lattice-agent" \
   LATTICE_AGENT_ENV="$DARWIN_HOME/lattice-agent.env" \
   LATTICE_AGENT_STATE="$DARWIN_HOME/state&logs" \
+  LATTICE_TASK_OUTBOX_DIR="$DARWIN_HOME/outbox&state" \
   LATTICE_AGENT_PLIST="$DARWIN_PLIST" \
   LATTICE_SERVER="$special_server" \
   LATTICE_NODE_ID="node&mac" \
@@ -239,7 +309,8 @@ for expected in \
   '<key>LATTICE_IP_RESOLVERS</key><string>https://api.example.com/ip?format=json&amp;node=&lt;self&gt;</string>' \
   '<key>LATTICE_IP_SCRIPT</key><string>/usr/local/bin/ip&amp;probe</string>' \
   '<key>LATTICE_PUBLIC_IP</key><string>203.0.113.7</string>' \
-  '<key>LATTICE_PUBLIC_IP6</key><string>2001:db8::7</string>'
+  '<key>LATTICE_PUBLIC_IP6</key><string>2001:db8::7</string>' \
+  '<key>LATTICE_TASK_OUTBOX_DIR</key><string>'"$DARWIN_HOME"'/outbox&amp;state</string>'
 do
   if ! grep -Fq "$expected" "$DARWIN_PLIST"; then
     echo "launchd plist missing persisted IP config: $expected" >&2

@@ -1,0 +1,266 @@
+package linechain
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+const (
+	semanticSidecarMetadataSchema = "lattice.singbox-metadata.v2"
+	semanticSidecarPatchSchema    = "lattice.singbox-linechain-sidecar-patch.v1"
+	semanticArtifactSchema        = "lattice.singbox-linechain-artifact.v2"
+)
+
+var lowercaseUUIDv4RE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+type SidecarPatchV2 struct {
+	Schema                     string  `json:"schema"`
+	SourceLineUUID             string  `json:"source_line_uuid"`
+	SourceInboundTag           string  `json:"source_inbound_tag"`
+	ExpectedDownstreamLineUUID *string `json:"expected_downstream_line_uuid"`
+	DesiredDownstreamLineUUID  *string `json:"desired_downstream_line_uuid"`
+}
+
+type semanticArtifactBindingV2 struct {
+	Schema                 string  `json:"schema"`
+	Operation              string  `json:"operation"`
+	FragmentBasename       string  `json:"fragment_basename"`
+	PreviousFragmentSHA256 *string `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string `json:"fragment_sha256"`
+	SidecarPatchSHA256     string  `json:"sidecar_patch_sha256"`
+}
+
+func canonicalSemanticSidecarPatch(raw []byte) (SidecarPatchV2, []byte, error) {
+	var fields map[string]json.RawMessage
+	if err := decodeJSONObject(raw, &fields); err != nil {
+		return SidecarPatchV2{}, nil, fmt.Errorf("decode semantic sidecar patch: %w", err)
+	}
+	for _, name := range []string{"schema", "source_line_uuid", "source_inbound_tag", "expected_downstream_line_uuid", "desired_downstream_line_uuid"} {
+		if _, ok := fields[name]; !ok {
+			return SidecarPatchV2{}, nil, fmt.Errorf("semantic sidecar patch field %s must be present", name)
+		}
+	}
+	if len(fields) != 5 {
+		return SidecarPatchV2{}, nil, fmt.Errorf("semantic sidecar patch has unknown fields")
+	}
+	var patch SidecarPatchV2
+	if err := json.Unmarshal(raw, &patch); err != nil {
+		return SidecarPatchV2{}, nil, fmt.Errorf("decode semantic sidecar patch: %w", err)
+	}
+	if patch.Schema != semanticSidecarPatchSchema || !lowercaseUUIDv4RE.MatchString(patch.SourceLineUUID) || strings.TrimSpace(patch.SourceInboundTag) == "" || patch.SourceInboundTag != strings.TrimSpace(patch.SourceInboundTag) {
+		return SidecarPatchV2{}, nil, fmt.Errorf("semantic sidecar patch identity is invalid")
+	}
+	for _, value := range []*string{patch.ExpectedDownstreamLineUUID, patch.DesiredDownstreamLineUUID} {
+		if value != nil && !lowercaseUUIDv4RE.MatchString(*value) {
+			return SidecarPatchV2{}, nil, fmt.Errorf("semantic sidecar downstream identity is invalid")
+		}
+	}
+	canonical, err := json.Marshal(patch)
+	if err != nil {
+		return SidecarPatchV2{}, nil, fmt.Errorf("encode semantic sidecar patch: %w", err)
+	}
+	if !bytes.Equal(raw, canonical) {
+		return SidecarPatchV2{}, nil, fmt.Errorf("semantic sidecar patch is not canonical")
+	}
+	return patch, canonical, nil
+}
+
+func canonicalSemanticArtifactBinding(binding semanticArtifactBindingV2) ([]byte, error) {
+	if binding.Schema != semanticArtifactSchema || !linechainBasenameRE.MatchString(binding.FragmentBasename) || !validSHA(binding.SidecarPatchSHA256) {
+		return nil, fmt.Errorf("semantic artifact binding identity is invalid")
+	}
+	switch binding.Operation {
+	case "create":
+		if binding.PreviousFragmentSHA256 != nil || binding.FragmentSHA256 == nil {
+			return nil, fmt.Errorf("create semantic artifact binding has invalid fragment shape")
+		}
+	case "replace":
+		if binding.PreviousFragmentSHA256 == nil || binding.FragmentSHA256 == nil {
+			return nil, fmt.Errorf("replace semantic artifact binding has invalid fragment shape")
+		}
+	case "remove":
+		if binding.PreviousFragmentSHA256 == nil || binding.FragmentSHA256 != nil {
+			return nil, fmt.Errorf("remove semantic artifact binding has invalid fragment shape")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported semantic artifact operation %q", binding.Operation)
+	}
+	for _, value := range []*string{binding.PreviousFragmentSHA256, binding.FragmentSHA256} {
+		if value != nil && !validSHA(*value) {
+			return nil, fmt.Errorf("semantic artifact fragment digest is invalid")
+		}
+	}
+	return json.Marshal(binding)
+}
+
+func verifySemanticArtifactBinding(fragment *string, patch []byte, binding semanticArtifactBindingV2, issuedArtifactSHA256 string) error {
+	if binding.FragmentSHA256 == nil {
+		if fragment != nil {
+			return fmt.Errorf("semantic artifact fragment output must be absent")
+		}
+	} else if fragment == nil || digest([]byte(*fragment)) != *binding.FragmentSHA256 {
+		return fmt.Errorf("semantic artifact fragment digest binding mismatch")
+	}
+	if digest(patch) != binding.SidecarPatchSHA256 {
+		return fmt.Errorf("semantic artifact sidecar patch digest binding mismatch")
+	}
+	canonical, err := canonicalSemanticArtifactBinding(binding)
+	if err != nil {
+		return err
+	}
+	if !validSHA(issuedArtifactSHA256) || digest(canonical) != issuedArtifactSHA256 {
+		return fmt.Errorf("semantic artifact digest binding mismatch")
+	}
+	return nil
+}
+
+// mergeManagedSidecar applies one authenticated source patch to an existing
+// metadata v2 sidecar. It changes only the matched inbound's chain object.
+func mergeManagedSidecar(current []byte, patch SidecarPatchV2) ([]byte, error) {
+	var top map[string]json.RawMessage
+	if err := decodeJSONObject(current, &top); err != nil {
+		return nil, fmt.Errorf("decode current semantic sidecar: %w", err)
+	}
+	if err := validateSemanticSidecarTop(top); err != nil {
+		return nil, fmt.Errorf("current semantic sidecar: %w", err)
+	}
+	var inbounds []json.RawMessage
+	if err := json.Unmarshal(top["inbounds"], &inbounds); err != nil {
+		return nil, fmt.Errorf("decode current semantic sidecar inbounds: %w", err)
+	}
+	match := -1
+	seenUUID := make(map[string]struct{}, len(inbounds))
+	seenTag := make(map[string]struct{}, len(inbounds))
+	for i, raw := range inbounds {
+		uuid, tag, err := semanticInboundIdentity(raw)
+		if err != nil {
+			return nil, fmt.Errorf("current semantic sidecar inbound %d: %w", i, err)
+		}
+		if _, ok := seenUUID[uuid]; ok {
+			return nil, fmt.Errorf("current semantic sidecar has duplicate line_uuid %q", uuid)
+		}
+		if _, ok := seenTag[tag]; ok {
+			return nil, fmt.Errorf("current semantic sidecar has duplicate tag %q", tag)
+		}
+		seenUUID[uuid], seenTag[tag] = struct{}{}, struct{}{}
+		if uuid == patch.SourceLineUUID || tag == patch.SourceInboundTag {
+			if uuid != patch.SourceLineUUID || tag != patch.SourceInboundTag || match >= 0 {
+				return nil, fmt.Errorf("current semantic sidecar source identity is ambiguous")
+			}
+			match = i
+		}
+	}
+	if match < 0 {
+		return nil, fmt.Errorf("current semantic sidecar source identity is missing")
+	}
+	var inbound map[string]json.RawMessage
+	if err := decodeJSONObject(inbounds[match], &inbound); err != nil {
+		return nil, err
+	}
+	currentDownstream, err := currentDownstreamIdentity(inbound)
+	if err != nil {
+		return nil, err
+	}
+	if !nullableStringEqual(currentDownstream, patch.ExpectedDownstreamLineUUID) {
+		return nil, fmt.Errorf("current semantic sidecar downstream identity changed")
+	}
+	if patch.DesiredDownstreamLineUUID == nil {
+		delete(inbound, "chain")
+	} else {
+		chain := struct {
+			DownstreamLineUUID string `json:"downstream_line_uuid"`
+		}{DownstreamLineUUID: *patch.DesiredDownstreamLineUUID}
+		encoded, err := json.Marshal(chain)
+		if err != nil {
+			return nil, err
+		}
+		inbound["chain"] = encoded
+	}
+	encodedInbound, err := json.Marshal(inbound)
+	if err != nil {
+		return nil, err
+	}
+	inbounds[match] = encodedInbound
+	encodedInbounds, err := json.Marshal(inbounds)
+	if err != nil {
+		return nil, err
+	}
+	top["inbounds"] = encodedInbounds
+	out, err := json.Marshal(top)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
+}
+
+func currentDownstreamIdentity(inbound map[string]json.RawMessage) (*string, error) {
+	raw, ok := inbound["chain"]
+	if !ok {
+		return nil, nil
+	}
+	var chain map[string]json.RawMessage
+	if err := decodeJSONObject(raw, &chain); err != nil {
+		return nil, fmt.Errorf("current semantic sidecar chain: %w", err)
+	}
+	rawDownstream, ok := chain["downstream_line_uuid"]
+	if !ok {
+		return nil, fmt.Errorf("current semantic sidecar chain downstream_line_uuid must be present")
+	}
+	if bytes.Equal(bytes.TrimSpace(rawDownstream), []byte("null")) {
+		return nil, nil
+	}
+	var value string
+	if err := json.Unmarshal(rawDownstream, &value); err != nil || !lowercaseUUIDv4RE.MatchString(value) {
+		return nil, fmt.Errorf("current semantic sidecar downstream_line_uuid is invalid")
+	}
+	return &value, nil
+}
+
+func nullableStringEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func validateSemanticSidecarTop(top map[string]json.RawMessage) error {
+	var schema string
+	if err := json.Unmarshal(top["schema"], &schema); err != nil || schema != semanticSidecarMetadataSchema {
+		return fmt.Errorf("unsupported schema")
+	}
+	var inbounds []json.RawMessage
+	if err := json.Unmarshal(top["inbounds"], &inbounds); err != nil || inbounds == nil {
+		return fmt.Errorf("inbounds must be an array")
+	}
+	return nil
+}
+
+func semanticInboundIdentity(raw json.RawMessage) (string, string, error) {
+	var value map[string]json.RawMessage
+	if err := decodeJSONObject(raw, &value); err != nil {
+		return "", "", err
+	}
+	var uuid, tag string
+	if err := json.Unmarshal(value["line_uuid"], &uuid); err != nil || !lowercaseUUIDv4RE.MatchString(uuid) {
+		return "", "", fmt.Errorf("line_uuid must be a lowercase UUIDv4 string")
+	}
+	if err := json.Unmarshal(value["tag"], &tag); err != nil || strings.TrimSpace(tag) == "" || tag != strings.TrimSpace(tag) {
+		return "", "", fmt.Errorf("tag must be a non-empty canonical string")
+	}
+	return uuid, tag, nil
+}
+
+func decodeJSONObject(raw []byte, dst *map[string]json.RawMessage) error {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("must be a non-null object")
+	}
+	fields, err := decodeUniqueJSONObject(raw)
+	if err != nil {
+		return err
+	}
+	*dst = fields
+	return nil
+}
