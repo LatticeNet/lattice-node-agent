@@ -281,6 +281,33 @@ func cgroupFeatureNames(c CgroupConfig) []string {
 	return features
 }
 
+const (
+	maxTaskTimeout     = 10 * time.Minute
+	defaultTaskTimeout = 30 * time.Second
+)
+
+// resolveTaskTimeout turns a requested timeout into the one this runner will
+// enforce.
+//
+// An out-of-range value clamps to the bound it exceeded, never to the default.
+// Falling back to the default for a value that was too LARGE inverts the
+// caller's intent: the control plane asked for more time and received the least
+// it could have. That is exactly what happened to agent updates, which the
+// server deliberately gave 900s and which therefore ran with a 30 second
+// deadline, so no node too slow to fetch the binary in 30 seconds could ever
+// update itself. Only an absent or nonsensical value gets the default.
+func resolveTaskTimeout(sec int) time.Duration {
+	timeout := time.Duration(sec) * time.Second
+	switch {
+	case timeout <= 0:
+		return defaultTaskTimeout
+	case timeout > maxTaskTimeout:
+		return maxTaskTimeout
+	default:
+		return timeout
+	}
+}
+
 func (r Runner) effectiveUID() int {
 	if r.getUID != nil {
 		return r.getUID()
@@ -329,10 +356,7 @@ func (r Runner) Run(task model.Task) model.TaskResult {
 		return result
 	}
 	interp = interpPath
-	timeout := time.Duration(task.TimeoutSec) * time.Second
-	if timeout <= 0 || timeout > 10*time.Minute {
-		timeout = 30 * time.Second
-	}
+	timeout := resolveTaskTimeout(task.TimeoutSec)
 	limit := task.OutputLimit
 	if limit <= 0 || limit > 256*1024 {
 		limit = 64 * 1024

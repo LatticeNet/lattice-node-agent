@@ -503,3 +503,34 @@ func normalizePathForTest(path string) string {
 	}
 	return path
 }
+
+// A timeout that is too large clamps to the maximum, not to the default.
+//
+// The old guard sent any value above ten minutes to the 30 second default,
+// which inverts the caller's intent: the control plane asks for more time and
+// receives the least it could have. Agent updates are given 900s by the server
+// precisely because a slow uplink needs minutes to fetch the binary, so they
+// ran with a 30 second deadline and no slow node could ever update itself.
+func TestOverlargeTimeoutClampsToMaxNotDefault(t *testing.T) {
+	// A script that outlives the 30s default but finishes well inside the
+	// ten minute maximum would be killed by the old guard and survives now.
+	// Kept short so the test does not take 30 seconds to prove it: the
+	// assertion is on the computed deadline, not on wall clock.
+	for _, tc := range []struct {
+		name string
+		secs int
+		want time.Duration
+	}{
+		{"over the maximum clamps down to it", 900, 10 * time.Minute},
+		{"far over the maximum still clamps to it", 86400, 10 * time.Minute},
+		{"within range is honoured", 600, 600 * time.Second},
+		{"zero falls back to the default", 0, 30 * time.Second},
+		{"negative falls back to the default", -5, 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveTaskTimeout(tc.secs); got != tc.want {
+				t.Fatalf("timeout for %ds: got %v want %v", tc.secs, got, tc.want)
+			}
+		})
+	}
+}
