@@ -1,6 +1,10 @@
-// Package sshwatch detects successful SSH logins from sshd log lines so the
-// agent can report them as security events. The parser is the testable core;
-// the line source (journald or auth.log) is wired by the agent.
+// Package sshwatch reads sshd log lines and turns them into security events the
+// agent can report: accepted logins one at a time (Parse), and rejected
+// authentication attempts folded into a per-window summary (ParseFailure,
+// Aggregator), because a single public node logs thousands of the latter a day
+// and shipping them line by line would cost real money to produce something
+// nobody reads. The parsers and the aggregator are the testable core; the line
+// source (journald or auth.log) is wired by the agent.
 package sshwatch
 
 import (
@@ -92,9 +96,10 @@ func Parse(line string) (LoginEvent, bool) {
 	return LoginEvent{Method: m[1], User: m[2], Address: m[3]}, true
 }
 
-// Stream reads lines from r and invokes emit for each accepted login until r is
-// exhausted or ctx is cancelled.
-func Stream(ctx context.Context, r io.Reader, emit func(LoginEvent)) error {
+// StreamLines reads lines from r and hands each one to fn until r is exhausted
+// or ctx is cancelled. An Aggregator needs the whole line, not only the logins
+// Stream reports, so the scan loop is shared instead of written twice.
+func StreamLines(ctx context.Context, r io.Reader, fn func(string)) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -103,9 +108,17 @@ func Stream(ctx context.Context, r io.Reader, emit func(LoginEvent)) error {
 			return ctx.Err()
 		default:
 		}
-		if ev, ok := Parse(scanner.Text()); ok {
-			emit(ev)
-		}
+		fn(scanner.Text())
 	}
 	return scanner.Err()
+}
+
+// Stream reads lines from r and invokes emit for each accepted login until r is
+// exhausted or ctx is cancelled.
+func Stream(ctx context.Context, r io.Reader, emit func(LoginEvent)) error {
+	return StreamLines(ctx, r, func(line string) {
+		if ev, ok := Parse(line); ok {
+			emit(ev)
+		}
+	})
 }
