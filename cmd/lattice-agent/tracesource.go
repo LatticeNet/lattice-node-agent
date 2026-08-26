@@ -39,6 +39,16 @@ const (
 )
 
 type traceCollector struct {
+	// applyMu serialises applyConfig end to end. mu alone is not enough:
+	// applyConfig reads whether a subscription is running, releases the lock,
+	// and only then stops and starts one. Two callers racing through that
+	// window would both see nothing running, both start, and the second would
+	// overwrite the first's cancel func, leaking its four goroutines for the
+	// life of the process. There is one caller today, but the whole point of
+	// splitting applyConfig out of reconcile is that a control-stream push can
+	// call it too.
+	applyMu sync.Mutex
+
 	mu     sync.Mutex
 	cfg    agentConfig
 	policy tracepolicy.Set
@@ -88,6 +98,9 @@ func (c *traceCollector) reconcile(ctx context.Context, cfg agentConfig) {
 // applyConfig is separated from reconcile so a pushed trace.config message on
 // the control stream can drive the same path without a poll.
 func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAgentConfig) {
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+
 	now := time.Now().UTC()
 	set := tracepolicy.Build(agentCfg, now)
 
