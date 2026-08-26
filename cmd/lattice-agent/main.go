@@ -434,8 +434,16 @@ func main() {
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
 	}
+	// Created before the terminal loop because that loop owns the shared
+	// control socket, which is how a pushed trace policy reaches the collector.
+	traceCollector := newTraceCollector(cfg)
+	defer traceCollector.stop()
 	if cfg.AllowTerminal {
-		go runTerminalLoop(context.Background(), cfg)
+		// The control socket is shared, so a pushed trace policy arrives here.
+		// It is the same path the poll takes, just without the wait.
+		go runTerminalLoop(context.Background(), cfg, func(ctx context.Context, tc model.TraceAgentConfig) {
+			traceCollector.applyConfig(ctx, tc)
+		})
 	}
 
 	runner := taskexec.Runner{
@@ -482,6 +490,7 @@ func main() {
 		} else {
 			logTailers.reconcile(sources)
 		}
+		traceCollector.reconcile(context.Background(), cfg)
 		debugf(cfg, "poll cycle complete")
 		if err := flushDebugEvents(cfg); err != nil {
 			log.Printf("debug event report error: %v", err)

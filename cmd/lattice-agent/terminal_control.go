@@ -24,6 +24,11 @@ const (
 type terminalControlMessage struct {
 	Type    string                `json:"type"`
 	Session model.TerminalSession `json:"session,omitempty"`
+	// Trace carries a pushed trace policy change. The server has been sending
+	// these; without a field to decode into, every push was silently dropped
+	// and the control was only ever as fast as the poll it was meant to
+	// short-circuit.
+	Trace *model.TraceAgentConfig `json:"trace,omitempty"`
 }
 
 func (m *terminalManager) runControlLoop(ctx context.Context) {
@@ -77,6 +82,15 @@ func (m *terminalManager) runControlOnce(ctx context.Context) error {
 			continue
 		}
 		switch msg.Type {
+		case "trace.config":
+			if msg.Trace == nil {
+				debugf(m.cfg, "trace control message carried no config")
+				continue
+			}
+			if m.onTraceConfig != nil {
+				m.onTraceConfig(ctx, *msg.Trace)
+			}
+
 		case "terminal.open":
 			if msg.Session.ID == "" || msg.Session.NodeID != m.cfg.NodeID {
 				debugf(m.cfg, "terminal control ignored invalid session: type=%s session=%s node=%s", msg.Type, msg.Session.ID, msg.Session.NodeID)

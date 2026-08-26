@@ -35,10 +35,14 @@ type terminalManager struct {
 	mu               sync.Mutex
 	active           map[string]struct{}
 	controlConnected atomic.Bool
+	// onTraceConfig receives pushed trace policy changes. The control socket is
+	// shared, so this is where a trace push lands; it is optional so the
+	// terminal loop still works on its own.
+	onTraceConfig func(context.Context, model.TraceAgentConfig)
 }
 
-func runTerminalLoop(ctx context.Context, cfg agentConfig) {
-	manager := &terminalManager{cfg: cfg, active: map[string]struct{}{}}
+func runTerminalLoop(ctx context.Context, cfg agentConfig, onTraceConfig func(context.Context, model.TraceAgentConfig)) {
+	manager := &terminalManager{cfg: cfg, active: map[string]struct{}{}, onTraceConfig: onTraceConfig}
 	go manager.runControlLoop(ctx)
 	ticker := time.NewTicker(terminalPollInterval)
 	defer ticker.Stop()
