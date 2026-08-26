@@ -1019,3 +1019,79 @@ func TestConnectionWithASourceIsStillEmitted(t *testing.T) {
 		t.Fatalf("Partial = %d, want 0", a.Stats().Partial)
 	}
 }
+
+// A connection the connection table still lists is not finished, whatever one
+// half close says.
+//
+// An HTTP client finishes its upload and sing-box logs "connection upload
+// finished" while the response is still streaming. Applying the half close
+// grace there stamps a clean eof at the moment the request body ended, freezes
+// duration and bytes, and makes a later reset unreportable because the id is
+// already done. That is the close-reason invariant broken by the very fix that
+// rescues short connections.
+func TestHalfCloseDoesNotFinaliseAConnectionStillInTheTable(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	clock := now
+	a := New(Options{NodeID: "n1", Now: func() time.Time { return clock }})
+
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 900,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.7", SrcPort: 4444,
+	})
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 900,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundTo, User: "u_1111222233334444",
+		DstHost: "big.example", DstPort: 443,
+	})
+	// The poll sees it live.
+	a.Snapshot(Snapshot{At: clock, Items: []SnapshotItem{{
+		SrcIP: "10.0.0.7", SrcPort: "4444", DstHost: "big.example", DstPort: "443",
+		InboundType: "vless", InboundTag: "in", Network: "tcp", Upload: 500, Download: 1000,
+	}}})
+
+	// Upload finishes; the download is still streaming.
+	a.Line(singboxlog.Line{
+		At: clock, Level: "debug", HasLogID: true, LogID: 900,
+		TagKind: singboxlog.TagConnection, Event: singboxlog.EventFinished,
+		Direction: singboxlog.DirectionUpload, ElapsedMS: 100,
+	})
+
+	// Well past the grace, with the poll still listing it.
+	clock = clock.Add(30 * time.Second)
+	a.Snapshot(Snapshot{At: clock, Items: []SnapshotItem{{
+		SrcIP: "10.0.0.7", SrcPort: "4444", DstHost: "big.example", DstPort: "443",
+		InboundType: "vless", InboundTag: "in", Network: "tcp", Upload: 500, Download: 900000,
+	}}})
+	a.Tick(clock)
+
+	if got := a.Drain(); len(got) != 0 {
+		for _, r := range got {
+			if !r.Open {
+				t.Fatalf("a live connection was finalised as %q after one half close", r.CloseReason)
+			}
+		}
+	}
+
+	// Once it really leaves the table, it settles on the evidence seen.
+	clock = clock.Add(6 * time.Second)
+	a.Snapshot(Snapshot{At: clock, Items: nil})
+	a.Tick(clock)
+
+	var final []model.ConnRecord
+	for _, r := range a.Drain() {
+		if !r.Open {
+			final = append(final, r)
+		}
+	}
+	if len(final) != 1 {
+		t.Fatalf("expected exactly one final record after it left the table, got %d", len(final))
+	}
+	if final[0].CloseReason == "" {
+		t.Fatal("final record has no close reason")
+	}
+	if !final[0].BytesKnown || final[0].Download != 900000 {
+		t.Fatalf("the final record lost the sampled bytes: known=%v down=%d", final[0].BytesKnown, final[0].Download)
+	}
+}

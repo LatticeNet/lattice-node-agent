@@ -539,6 +539,26 @@ func (a *Assembler) Snapshot(s Snapshot) {
 // never in proves nothing, and absence only counts when observed in a poll
 // strictly newer than the one that last showed the connection, so a poll that
 // never happened cannot close anything.
+// stillListed reports whether the connection was in the most recent
+// /connections poll.
+//
+// It gates the half close grace, because one half close is not proof the
+// connection ended. An HTTP client that finishes its upload gets
+// "connection upload finished" while the response is still streaming, and on a
+// long download the second half is minutes away. Settling on the first half
+// there would stamp a clean eof at the moment the request body ended, freeze
+// the duration and bytes, and then ignore a reset that arrived later because
+// the id is already done. The connection table is authoritative about liveness,
+// so while it still lists the connection the grace does not apply and the
+// disappearance rule finalises it instead.
+//
+// A connection that was never sampled is not listed and is unaffected: the
+// grace is what rescues short connections from the orphan TTL, and those are
+// exactly the ones no poll ever sees.
+func (a *Assembler) stillListed(c *conn) bool {
+	return c.sampled && c.lastSnapSeq >= a.snapSeq
+}
+
 func (a *Assembler) sweepVanished(at time.Time) {
 	for e := a.order.Front(); e != nil; {
 		next := e.Next()
@@ -644,7 +664,7 @@ func (a *Assembler) Tick(now time.Time) {
 		next := e.Next() // captured before a finish removes e
 		c := e.Value.(*conn)
 		switch {
-		case !c.firstHalfAt.IsZero() && now.Sub(c.firstHalfAt) >= a.opts.HalfCloseGrace:
+		case !c.firstHalfAt.IsZero() && now.Sub(c.firstHalfAt) >= a.opts.HalfCloseGrace && !a.stillListed(c):
 			// One direction reported and the other one is not coming. The two
 			// half closes are logged at different levels, so at anything below
 			// a trace subscription exactly one of them is ever delivered.
