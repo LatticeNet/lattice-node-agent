@@ -408,7 +408,16 @@ func (s *Shipper) recordFailure(status int, retryAfter time.Duration, err error)
 // post sends one batch and returns the status so the caller can tell a 429
 // apart from every other refusal.
 func (s *Shipper) post(ctx context.Context, batch model.TraceBatch) (int, time.Duration, error) {
-	body, err := json.Marshal(batch)
+	// The wire shape is {node_id, batch}, matching every other agent endpoint
+	// (see the server's handleAgentLogs). Sending a bare batch would still
+	// authenticate, because TraceBatch carries its own node_id, and the server
+	// would then accept an empty batch with 200 OK. That silent success is
+	// exactly the failure this subsystem exists to remove, so the envelope is
+	// explicit here rather than implied.
+	body, err := json.Marshal(struct {
+		NodeID string           `json:"node_id"`
+		Batch  model.TraceBatch `json:"batch"`
+	}{NodeID: s.nodeID, Batch: batch})
 	if err != nil {
 		return 0, 0, fmt.Errorf("encode trace batch: %w", err)
 	}

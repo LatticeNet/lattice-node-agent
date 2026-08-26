@@ -103,54 +103,125 @@ func TestDuplicateOutboundLineIsIdempotent(t *testing.T) {
 	}
 }
 
-// One direction reported and the other never did. The honest answer is
-// unknown, and the partial evidence stays in CloseError.
-func TestHalfCloseThenOrphanTTLYieldsUnknown(t *testing.T) {
+// sing-box logs the two half closes at different levels, so below a trace
+// subscription only one of them ever arrives. The connection settles on the
+// half it saw once the grace expires, instead of waiting out the orphan TTL
+// and then calling a clean close unknown.
+func TestHalfCloseGraceSettlesOnTheHalfWeSaw(t *testing.T) {
 	cases := []struct {
-		name     string
-		errText  string
-		wantErr  string
-		wantKind string
+		name       string
+		feed       func(a *Assembler)
+		wantReason string
+		wantErr    string
 	}{
-		{name: "clean half", errText: "", wantErr: "no further log lines for this connection"},
-		{name: "error half", errText: "read: connection reset by peer", wantErr: "read: connection reset by peer"},
+		{
+			name: "download finished at debug, upload closed never delivered",
+			feed: func(a *Assembler) {
+				a.Line(half(7, t0.Add(20*time.Millisecond), 20, singboxlog.EventFinished, singboxlog.DirectionDownload, ""))
+			},
+			wantReason: model.CloseEOF,
+		},
+		{
+			name: "only the cancel path half arrived",
+			feed: func(a *Assembler) {
+				a.Line(half(7, t0.Add(20*time.Millisecond), 20, singboxlog.EventClosed, singboxlog.DirectionUpload, ""))
+			},
+			wantReason: model.CloseCanceled,
+		},
+		{
+			name: "the half that arrived carried an error",
+			feed: func(a *Assembler) {
+				a.Line(half(7, t0.Add(20*time.Millisecond), 20, singboxlog.EventClosed, singboxlog.DirectionUpload, "read: connection reset by peer"))
+			},
+			wantReason: model.CloseReset,
+			wantErr:    "read: connection reset by peer",
+		},
+		{
+			name: "a cancelled packet half is a udp idle timeout",
+			feed: func(a *Assembler) {
+				l := half(7, t0.Add(20*time.Millisecond), 20, singboxlog.EventClosed, singboxlog.DirectionUpload, "")
+				l.Packet = true
+				a.Line(l)
+			},
+			wantReason: model.CloseUDPIdle,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Open snapshots have their own test; turn them off here so what
-			// comes out of Drain can only be the orphan sweep.
+			// Open snapshots have their own test; turn them off so what comes
+			// out of Drain can only be the grace.
 			a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
 			openConn(a, 7, t0, 5001, "example.com")
-			a.Line(half(7, t0.Add(20*time.Millisecond), 20, singboxlog.EventClosed, singboxlog.DirectionUpload, tc.errText))
+			tc.feed(a)
 			if recs := a.Drain(); len(recs) != 0 {
-				t.Fatalf("one half close must not finish a connection, got %+v", recs)
+				t.Fatalf("one half close must not finish a connection immediately: %+v", recs)
 			}
-			a.Tick(t0.Add(9 * time.Minute))
+			a.Tick(t0.Add(time.Second))
 			if recs := a.Drain(); len(recs) != 0 {
-				t.Fatalf("orphan swept before the TTL: %+v", recs)
+				t.Fatalf("finished inside the grace: %+v", recs)
 			}
-			// The TTL runs from the last evidence of life, which is the half
-			// close at 20ms, not from the connection's start.
-			a.Tick(t0.Add(10*time.Minute + time.Second))
+
+			a.Tick(t0.Add(2*time.Second + 20*time.Millisecond))
 			rec := drainOne(t, a)
-			if rec.CloseReason != model.CloseUnknown {
-				t.Errorf("close reason = %q, want %q", rec.CloseReason, model.CloseUnknown)
+			if rec.CloseReason != tc.wantReason || rec.CloseError != tc.wantErr {
+				t.Errorf("close = %q/%q, want %q/%q", rec.CloseReason, rec.CloseError, tc.wantReason, tc.wantErr)
 			}
-			if rec.CloseError != tc.wantErr {
-				t.Errorf("close error = %q, want %q", rec.CloseError, tc.wantErr)
+			// The connection ended when sing-box logged the half close, not
+			// when the grace expired two seconds later.
+			if !rec.EndedAt.Equal(t0.Add(20 * time.Millisecond)) {
+				t.Errorf("ended at = %s, want the half close instant", rec.EndedAt)
 			}
-			if rec.EndedAt != t0.Add(10*time.Minute+time.Second) {
-				t.Errorf("ended at = %s", rec.EndedAt)
-			}
-			// The duration is sing-box's own last elapsed, a measured lower
-			// bound, not the ten silent minutes the agent waited.
 			if rec.DurationMS != 20 {
-				t.Errorf("duration = %dms, want 20ms", rec.DurationMS)
+				t.Errorf("duration = %dms, want sing-box's own 20ms", rec.DurationMS)
 			}
-			if s := a.Stats(); s.Orphaned != 1 || s.Open != 0 {
-				t.Errorf("stats = %+v, want one orphan and nothing open", s)
+			if s := a.Stats(); s.Open != 0 || s.Orphaned != 0 || s.Emitted != 1 {
+				t.Errorf("stats = %+v, want one emitted and no orphan", s)
 			}
 		})
+	}
+}
+
+// Both halves at trace level land in the same millisecond, well inside the
+// grace. The grace must not change that path, and must not emit twice.
+func TestBothHalvesStillFinishImmediatelyAndOnce(t *testing.T) {
+	a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+	openConn(a, 8, t0, 5001, "example.com")
+	a.Line(half(8, t0.Add(20*time.Millisecond), 20, singboxlog.EventFinished, singboxlog.DirectionDownload, ""))
+	a.Line(half(8, t0.Add(20*time.Millisecond), 20, singboxlog.EventClosed, singboxlog.DirectionUpload, ""))
+
+	rec := drainOne(t, a)
+	if rec.CloseReason != model.CloseEOF || rec.DurationMS != 20 {
+		t.Fatalf("record = %q %dms", rec.CloseReason, rec.DurationMS)
+	}
+	// Ticking past the grace must not produce a second record for it.
+	a.Tick(t0.Add(time.Hour))
+	if recs := a.Drain(); len(recs) != 0 {
+		t.Fatalf("the grace emitted a duplicate: %+v", recs)
+	}
+	if s := a.Stats(); s.Emitted != 1 || s.Open != 0 {
+		t.Fatalf("stats = %+v, want exactly one record", s)
+	}
+}
+
+// A connection with no terminal line at all still has to reach the honest
+// answer, just by the slower route.
+func TestNoTerminalLineAtAllOrphansToUnknown(t *testing.T) {
+	a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+	openConn(a, 9, t0, 5001, "example.com")
+	a.Tick(t0.Add(5 * time.Minute))
+	if recs := a.Drain(); len(recs) != 0 {
+		t.Fatalf("swept before the TTL: %+v", recs)
+	}
+	a.Tick(t0.Add(10*time.Minute + time.Second))
+	rec := drainOne(t, a)
+	if rec.CloseReason != model.CloseUnknown {
+		t.Errorf("close reason = %q, want %q", rec.CloseReason, model.CloseUnknown)
+	}
+	if rec.CloseError != "no further log lines for this connection" {
+		t.Errorf("close error = %q", rec.CloseError)
+	}
+	if s := a.Stats(); s.Orphaned != 1 || s.Open != 0 {
+		t.Errorf("stats = %+v, want one orphan and nothing open", s)
 	}
 }
 
@@ -695,11 +766,11 @@ func TestNewFillsDocumentedDefaults(t *testing.T) {
 	a := New(Options{})
 	if a.opts.MaxOpen != defaultMaxOpen || a.opts.OrphanTTL != defaultOrphanTTL ||
 		a.opts.SnapshotEvery != defaultSnapshotEvery || a.opts.StallFloor != defaultStallFloor ||
-		a.opts.StallQuiet != defaultStallQuiet || a.opts.Now == nil {
+		a.opts.StallQuiet != defaultStallQuiet || a.opts.HalfCloseGrace != defaultHalfCloseGrace || a.opts.Now == nil {
 		t.Fatalf("defaults not applied: %+v", a.opts)
 	}
 	if a.opts.MaxOpen != 4096 || a.opts.OrphanTTL != 10*time.Minute || a.opts.SnapshotEvery != time.Minute ||
-		a.opts.StallFloor != time.Minute || a.opts.StallQuiet != 30*time.Second {
+		a.opts.StallFloor != time.Minute || a.opts.StallQuiet != 30*time.Second || a.opts.HalfCloseGrace != 2*time.Second {
 		t.Fatalf("defaults drifted from the documented values: %+v", a.opts)
 	}
 }
@@ -779,5 +850,172 @@ func TestPacketConnectionIsUDP(t *testing.T) {
 	rec := drainOne(t, a)
 	if rec.Network != "udp" || rec.CloseReason != model.CloseUDPIdle {
 		t.Fatalf("record = network %q reason %q", rec.Network, rec.CloseReason)
+	}
+}
+
+// A connection sing-box listed before and does not list now has ended. That is
+// authoritative and independent of the subscription level, so it does not wait
+// on any timer.
+func TestVanishingFromASnapshotFinalises(t *testing.T) {
+	poll := func(a *Assembler, at time.Time, present bool) {
+		s := Snapshot{At: at}
+		if present {
+			s.Items = []SnapshotItem{{SrcIP: "10.0.0.9", SrcPort: "5001", Upload: 100, Download: 200}}
+		}
+		a.Snapshot(s)
+	}
+
+	t.Run("with a half close, sing-box's own reason and duration win", func(t *testing.T) {
+		a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+		openConn(a, 161, t0, 5001, "example.com")
+		poll(a, t0.Add(5*time.Second), true)
+		a.Line(half(161, t0.Add(6*time.Second), 6000, singboxlog.EventFinished, singboxlog.DirectionDownload, ""))
+		poll(a, t0.Add(10*time.Second), false)
+
+		rec := drainOne(t, a)
+		if rec.CloseReason != model.CloseEOF || rec.CloseError != "" {
+			t.Errorf("close = %q/%q, want the half we saw", rec.CloseReason, rec.CloseError)
+		}
+		if rec.DurationMS != 6000 {
+			t.Errorf("duration = %dms, want sing-box's 6000ms", rec.DurationMS)
+		}
+		if !rec.BytesKnown || rec.Upload != 100 || rec.Download != 200 {
+			t.Errorf("bytes = %d/%d known %v", rec.Upload, rec.Download, rec.BytesKnown)
+		}
+		if s := a.Stats(); s.Open != 0 || s.Orphaned != 0 {
+			t.Errorf("stats = %+v", s)
+		}
+	})
+
+	t.Run("with no close line at all, unknown and the poll instant", func(t *testing.T) {
+		a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+		openConn(a, 162, t0, 5001, "example.com")
+		poll(a, t0.Add(5*time.Second), true)
+		poll(a, t0.Add(10*time.Second), false)
+
+		rec := drainOne(t, a)
+		if rec.CloseReason != model.CloseUnknown {
+			t.Errorf("close reason = %q, want unknown: nothing said how it ended", rec.CloseReason)
+		}
+		if rec.CloseError != "connection left the sing-box connection table without a close line" {
+			t.Errorf("close error = %q", rec.CloseError)
+		}
+		if !rec.EndedAt.Equal(t0.Add(10 * time.Second)) {
+			t.Errorf("ended at = %s, want the poll that proved it gone", rec.EndedAt)
+		}
+		// The last elapsed we saw was the outbound line at 2ms, which predates
+		// the whole silent stretch, so the poll instant is the better bound.
+		if rec.DurationMS != 10_000 {
+			t.Errorf("duration = %dms, want the 10s bound", rec.DurationMS)
+		}
+	})
+}
+
+// Absence from a table a connection was never in proves nothing.
+func TestNeverSampledIsUnaffectedByTheSnapshotRule(t *testing.T) {
+	a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+	openConn(a, 171, t0, 5001, "sampled.example")
+	openConn(a, 172, t0, 5002, "never.example")
+
+	a.Snapshot(Snapshot{At: t0.Add(5 * time.Second), Items: []SnapshotItem{
+		{SrcIP: "10.0.0.9", SrcPort: "5001", Upload: 1, Download: 1},
+	}})
+	a.Snapshot(Snapshot{At: t0.Add(10 * time.Second)})
+
+	rec := drainOne(t, a)
+	if rec.LogID != 171 {
+		t.Fatalf("finalised %d, want only the connection that was actually sampled", rec.LogID)
+	}
+	if s := a.Stats(); s.Open != 1 {
+		t.Fatalf("open = %d, want the never sampled connection still tracked", s.Open)
+	}
+}
+
+// Still in the newest poll means still running, and a poll that never happened
+// cannot close anything.
+func TestPresentInNewestSnapshotIsNotFinalised(t *testing.T) {
+	a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+	openConn(a, 181, t0, 5001, "live.example")
+	for i := 1; i <= 3; i++ {
+		at := t0.Add(time.Duration(i) * 5 * time.Second)
+		a.Snapshot(Snapshot{At: at, Items: []SnapshotItem{
+			{SrcIP: "10.0.0.9", SrcPort: "5001", Upload: int64(i) * 100, Download: int64(i) * 100},
+		}})
+	}
+	if recs := a.Drain(); len(recs) != 0 {
+		t.Fatalf("a connection present in every poll was finalised: %+v", recs)
+	}
+
+	// The poller stops. Without a newer poll there is no evidence of absence,
+	// so nothing may be closed on that basis.
+	for i := 1; i <= 5; i++ {
+		a.Tick(t0.Add(time.Duration(i) * 30 * time.Second))
+	}
+	if recs := a.Drain(); len(recs) != 0 {
+		t.Fatalf("missing polls closed a live connection: %+v", recs)
+	}
+	if s := a.Stats(); s.Open != 1 || s.Emitted != 0 {
+		t.Fatalf("stats = %+v, want it still open", s)
+	}
+}
+
+// A connection seen only at its close is counted, not emitted.
+//
+// This happens whenever the collector subscribes while traffic is already
+// flowing: the opening lines were emitted before anyone was listening, so all
+// that arrives is the tail. A record with no source, no destination and no user
+// cannot be filtered, joined, or acted on, and its empty user renders as
+// "unnamed" when the truth is "unobserved".
+func TestCloseOnlyConnectionIsCountedNotEmitted(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	clock := now
+	a := New(Options{NodeID: "n1", Now: func() time.Time { return clock }})
+
+	// Only the terminal lines, as if the collector arrived mid connection.
+	a.Line(singboxlog.Line{
+		At: clock, Level: "debug", HasLogID: true, LogID: 4242,
+		TagKind: singboxlog.TagConnection, Event: singboxlog.EventFinished,
+		Direction: singboxlog.DirectionDownload, ElapsedMS: 305,
+	})
+	clock = clock.Add(5 * time.Second)
+	a.Tick(clock)
+
+	if got := a.Drain(); len(got) != 0 {
+		t.Fatalf("emitted %d records for a close-only connection: %+v", len(got), got)
+	}
+	if a.Stats().Partial != 1 {
+		t.Fatalf("Partial = %d, want 1", a.Stats().Partial)
+	}
+}
+
+// The suppression must not swallow a real connection that merely lacks a
+// destination hostname, so a source alone is enough to keep it.
+func TestConnectionWithASourceIsStillEmitted(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	clock := now
+	a := New(Options{NodeID: "n1", Now: func() time.Time { return clock }})
+
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 77,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.9", SrcPort: 5555,
+	})
+	a.Line(singboxlog.Line{
+		At: clock, Level: "debug", HasLogID: true, LogID: 77,
+		TagKind: singboxlog.TagConnection, Event: singboxlog.EventFinished,
+		Direction: singboxlog.DirectionDownload, ElapsedMS: 12,
+	})
+	clock = clock.Add(5 * time.Second)
+	a.Tick(clock)
+
+	got := a.Drain()
+	if len(got) != 1 {
+		t.Fatalf("emitted %d records, want 1", len(got))
+	}
+	if got[0].SrcIP != "10.0.0.9" {
+		t.Fatalf("src = %q", got[0].SrcIP)
+	}
+	if a.Stats().Partial != 0 {
+		t.Fatalf("Partial = %d, want 0", a.Stats().Partial)
 	}
 }

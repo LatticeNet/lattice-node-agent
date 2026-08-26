@@ -31,12 +31,23 @@ type recorder struct {
 func (r *recorder) handler(t *testing.T) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, req *http.Request) {
-		var batch model.TraceBatch
-		if err := json.NewDecoder(req.Body).Decode(&batch); err != nil {
+		// Decode the same envelope the server does. Decoding a bare TraceBatch
+		// here would still "work" and would hide a shape mismatch, which is how
+		// this went unnoticed the first time: the server accepted the wrong
+		// shape with 200 OK and zero records.
+		var envelope struct {
+			NodeID string           `json:"node_id"`
+			Batch  model.TraceBatch `json:"batch"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&envelope); err != nil {
 			t.Errorf("decode batch: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		if envelope.NodeID == "" {
+			t.Error("envelope node_id is empty; the server authenticates on it")
+		}
+		batch := envelope.Batch
 		r.mu.Lock()
 		r.requests = append(r.requests, recordedRequest{
 			path:        req.URL.Path,

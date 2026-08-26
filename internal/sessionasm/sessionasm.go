@@ -22,6 +22,10 @@
 //   - The "outbound connection to" line is emitted twice, identically, so
 //     every write has to be idempotent.
 //   - A dial failure has no close line at all; the error line is terminal.
+//   - The two half closes of one connection are logged at DIFFERENT levels:
+//     "connection download finished" at debug, "connection upload closed" at
+//     trace. Below a trace subscription only one of them is ever delivered, so
+//     a connection must never be made to wait for both.
 //
 // The assembler is fed by the collector goroutine (Line, Snapshot, Tick,
 // CoreRestart) and emptied by the shipper goroutine (Drain, Stats). One mutex
@@ -47,6 +51,12 @@ const (
 	defaultSnapshotEvery = 60 * time.Second
 	defaultStallFloor    = 60 * time.Second
 	defaultStallQuiet    = 30 * time.Second
+	// defaultHalfCloseGrace is how long a connection waits for its second half
+	// close before settling for the one it has. The two halves land in the
+	// same millisecond in every capture, so this is three orders of magnitude
+	// of headroom, and it is still well inside the /connections poll interval
+	// so the grace resolves a connection before the snapshot rule has to.
+	defaultHalfCloseGrace = 2 * time.Second
 
 	// snapshotStartSkew bounds how far before a tracked connection a
 	// /connections item may have started and still be joined to it. The join
@@ -82,6 +92,12 @@ type Options struct {
 	SnapshotEvery time.Duration // emit an Open snapshot for long lived connections; default 60s
 	StallFloor    time.Duration // a connection must be older than this before it can be called stalled; default 60s
 	StallQuiet    time.Duration // zero bytes both ways for this long marks stalled; default 30s
+	// HalfCloseGrace is how long to wait for the second half close before
+	// finalising on the first. It exists because the two halves are logged at
+	// different levels, so below trace only one of them arrives and waiting
+	// for the other parks a cleanly closed connection until the orphan TTL.
+	// Default 2s.
+	HalfCloseGrace time.Duration
 
 	// Now is the clock of record for inputs that carry no usable timestamp.
 	// Injectable so tests never sleep. Defaults to time.Now.
@@ -103,6 +119,11 @@ type Stats struct {
 	// Orphaned counts connections emitted with CloseUnknown after OrphanTTL.
 	// A rising number means the parser or the stream is losing terminal lines.
 	Orphaned uint64
+	// Partial counts connections seen only at their close, with no source and
+	// no destination, and therefore not emitted. It is normally a small
+	// startup artifact; a persistently rising number means the log stream is
+	// losing the opening lines of connections.
+	Partial uint64
 	// Dropped counts connections discarded under MaxOpen pressure, without a
 	// record. They are discarded rather than emitted because the moment the
 	// node is over the cap is the worst moment to multiply the record flood,
@@ -173,10 +194,19 @@ type conn struct {
 	closedUp     bool
 	closedDown   bool
 	close        closeCandidate
+	// firstHalfAt is when the first half close was logged. sing-box logs the
+	// two halves at different levels, so the second one may never be
+	// delivered; this starts the grace after which the connection settles for
+	// the evidence it has.
+	firstHalfAt time.Time
 
 	sampled          bool
 	lastSnapAt       time.Time
 	lastByteChangeAt time.Time
+	// lastSnapSeq is the poll that last listed this connection. A connection
+	// missing from a strictly newer poll has left sing-box's connection table,
+	// which is an authoritative and level independent statement that it ended.
+	lastSnapSeq uint64
 
 	lastEmitAt time.Time // last open snapshot, initialised to StartedAt
 	srcKey     string
@@ -195,6 +225,9 @@ type Assembler struct {
 	done  *doneSet         // log ids already emitted, so trailing lines cannot resurrect them
 	out   []model.ConnRecord
 	stats Stats
+	// snapSeq counts /connections polls. Comparing it with a connection's own
+	// last poll is what makes disappearance detectable without a timer.
+	snapSeq uint64
 }
 
 // New builds an Assembler, filling in the defaults for anything unset.
@@ -213,6 +246,9 @@ func New(opts Options) *Assembler {
 	}
 	if opts.StallQuiet <= 0 {
 		opts.StallQuiet = defaultStallQuiet
+	}
+	if opts.HalfCloseGrace <= 0 {
+		opts.HalfCloseGrace = defaultHalfCloseGrace
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -435,6 +471,9 @@ func (a *Assembler) apply(c *conn, l singboxlog.Line, at time.Time) {
 // halfClosed records that one direction reported and finishes the connection
 // once both have.
 func (a *Assembler) halfClosed(c *conn, l singboxlog.Line, at time.Time) {
+	if c.firstHalfAt.IsZero() {
+		c.firstHalfAt = at
+	}
 	switch l.Direction {
 	case singboxlog.DirectionUpload:
 		c.closedUp = true
@@ -473,6 +512,7 @@ func (a *Assembler) Snapshot(s Snapshot) {
 	if at.IsZero() {
 		at = a.opts.Now()
 	}
+	a.snapSeq++
 	for _, item := range s.Items {
 		c := a.bySrc[srcKey(item.SrcIP, item.SrcPort)]
 		if c == nil {
@@ -487,6 +527,40 @@ func (a *Assembler) Snapshot(s Snapshot) {
 			continue
 		}
 		a.join(c, item, at)
+	}
+	a.sweepVanished(at)
+}
+
+// sweepVanished finalises the connections this poll proves have ended. A
+// connection that sing-box listed before and does not list now is closed, and
+// that statement is authoritative and independent of the subscription level,
+// unlike anything the log stream can say. Two guards keep it honest: a
+// connection never sampled is untouched, because absence from a table it was
+// never in proves nothing, and absence only counts when observed in a poll
+// strictly newer than the one that last showed the connection, so a poll that
+// never happened cannot close anything.
+func (a *Assembler) sweepVanished(at time.Time) {
+	for e := a.order.Front(); e != nil; {
+		next := e.Next()
+		c := e.Value.(*conn)
+		if c.sampled && c.lastSnapSeq < a.snapSeq {
+			cand := c.close
+			src := durFromCore
+			if cand.rank == rankNone {
+				// It left the table without ever saying how it ended. The last
+				// elapsed counter we have predates the whole silent stretch,
+				// so the poll instant is the better bound: it is accurate to
+				// one poll interval instead of understating by minutes.
+				cand = closeCandidate{
+					reason: model.CloseUnknown,
+					err:    "connection left the sing-box connection table without a close line",
+					rank:   rankTerminal,
+				}
+				src = durFromClock
+			}
+			a.finish(c, cand, at, src)
+		}
+		e = next
 	}
 }
 
@@ -507,6 +581,7 @@ func (a *Assembler) join(c *conn, item SnapshotItem, at time.Time) {
 	c.rec.BytesKnown = true
 	c.sampled = true
 	c.lastSnapAt = at
+	c.lastSnapSeq = a.snapSeq
 	c.lastSeenAt = at
 
 	if c.rec.InboundType == "" {
@@ -569,6 +644,16 @@ func (a *Assembler) Tick(now time.Time) {
 		next := e.Next() // captured before a finish removes e
 		c := e.Value.(*conn)
 		switch {
+		case !c.firstHalfAt.IsZero() && now.Sub(c.firstHalfAt) >= a.opts.HalfCloseGrace:
+			// One direction reported and the other one is not coming. The two
+			// half closes are logged at different levels, so at anything below
+			// a trace subscription exactly one of them is ever delivered.
+			// Waiting for the second would park a cleanly closed connection
+			// until the orphan TTL and then publish it as unknown, which is
+			// the specific dishonesty this package exists to prevent. Settle
+			// on the half we actually saw, and end the record when sing-box
+			// logged it rather than when the grace expired.
+			a.finish(c, c.close, c.firstHalfAt, durFromCore)
 		case now.Sub(c.lastSeenAt) >= a.opts.OrphanTTL:
 			// Neither a line nor a snapshot for the whole TTL. We do not know
 			// how it ended, and saying so is the point of CloseUnknown.
@@ -648,6 +733,21 @@ func (a *Assembler) finish(c *conn, cand closeCandidate, endedAt time.Time, src 
 	}
 	a.forget(c)
 	a.done.add(rec.LogID)
+
+	// A connection observed only at its close carries nothing: no source, no
+	// destination, no user. It happens when the collector subscribes while a
+	// connection is already in flight, so only the tail is seen. Emitting it
+	// would put a row in the table that cannot be filtered, joined, or acted
+	// on, and whose empty user reads as "unnamed" when the truth is
+	// "unobserved". Count it instead, so the gap stays visible without
+	// pretending to be a connection record.
+	//
+	// A long lived pre-existing connection is unaffected: the /connections poll
+	// supplies its source, destination and inbound tag well before it closes.
+	if rec.SrcIP == "" && rec.DstHost == "" {
+		a.stats.Partial++
+		return
+	}
 	a.push(rec)
 }
 

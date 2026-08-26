@@ -468,6 +468,16 @@ func TestFixturesNeverEmitAnEmptyCloseReason(t *testing.T) {
 	a.Line(singboxlog.Line{At: fixtureBase, HasLogID: true, LogID: 43, Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.2", SrcPort: 1235})
 	a.Tick(fixtureBase.Add(2 * time.Hour)) // orphan sweep
 	a.Line(singboxlog.Line{At: fixtureBase, HasLogID: true, LogID: 44, Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.3", SrcPort: 1236})
+	// A connection that only ever got one of its two half closes, settled by
+	// the grace.
+	a.Line(singboxlog.Line{At: fixtureBase, HasLogID: true, LogID: 45, Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.4", SrcPort: 1237})
+	a.Line(singboxlog.Line{At: fixtureBase, HasLogID: true, LogID: 45, ElapsedMS: 30, Tag: "connection", TagKind: singboxlog.TagConnection,
+		Event: singboxlog.EventFinished, Direction: singboxlog.DirectionDownload})
+	a.Tick(fixtureBase.Add(3 * time.Second))
+	// A connection that left the connection table without saying anything.
+	a.Line(singboxlog.Line{At: fixtureBase, HasLogID: true, LogID: 46, Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.5", SrcPort: 1238})
+	a.Snapshot(Snapshot{At: fixtureBase.Add(4 * time.Second), Items: []SnapshotItem{{SrcIP: "10.0.0.5", SrcPort: "1238"}}})
+	a.Snapshot(Snapshot{At: fixtureBase.Add(9 * time.Second)})
 	a.CoreRestart(2, fixtureBase.Add(3*time.Hour))
 
 	records := a.Drain()
@@ -479,4 +489,89 @@ func TestFixturesNeverEmitAnEmptyCloseReason(t *testing.T) {
 			t.Errorf("record %d (open=%v) has an empty close reason", r.LogID, r.Open)
 		}
 	}
+}
+
+// atDebug drops the lines a debug subscription never receives. sing-box logs
+// "connection upload closed" at trace and "connection download finished" at
+// debug, so at the level the node policy actually runs at, a normally closing
+// connection delivers exactly one of its two half closes.
+func atDebug(lines []singboxlog.Line) []singboxlog.Line {
+	out := make([]singboxlog.Line, 0, len(lines))
+	for _, l := range lines {
+		if l.Level == "trace" {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+// The regression test for the level split: the same captures, subscribed at
+// debug instead of trace, must still produce the same connections with the
+// same close reasons. Nothing here may wait for the orphan TTL, and nothing
+// may be reported as unknown.
+func TestFixturesAtDebugSubscriptionProduceTheSameRecords(t *testing.T) {
+	t.Run("exit_nosniff", func(t *testing.T) {
+		lines := atDebug(exitNosniffLines())
+		if len(lines) != 28 {
+			t.Fatalf("debug view has %d lines, want the 31 captured minus the 3 trace half closes", len(lines))
+		}
+		offsets := map[uint32]time.Duration{
+			291839386: 0, 228733835: time.Second, 2099970926: 2 * time.Second, 3281277749: 3 * time.Second,
+		}
+		a := New(Options{NodeID: "node-exit", CoreGeneration: 7, Now: func() time.Time { return fixtureBase }})
+		for _, l := range stamp(lines, offsets) {
+			a.Line(l)
+		}
+		// One tick past the grace, far short of the ten minute orphan TTL.
+		a.Tick(fixtureBase.Add(10 * time.Second))
+
+		// The dial failure lands during the feed; the other three settle on the
+		// half close that a debug subscription does deliver, with sing-box's
+		// own durations, identical to what the trace subscription produced.
+		checkRecords(t, a.Drain(), []wantRecord{
+			{logID: 2099970926, user: userExit, userKind: model.UserKindManaged, dstHost: "127.0.0.1", dstPort: 19999,
+				outbound: "direct-out", reason: model.CloseDialFailed,
+				closeErr:  "dial tcp 127.0.0.1:19999: connect: connection refused",
+				startedAt: fixtureBase.Add(2 * time.Second)},
+			{logID: 291839386, user: userExit, userKind: model.UserKindManaged, dstHost: "127.0.0.1", dstPort: 18081,
+				outbound: "direct-out", reason: model.CloseEOF, durationMS: 5, startedAt: fixtureBase},
+			{logID: 228733835, user: userExit, userKind: model.UserKindManaged, dstHost: "localhost", dstPort: 18081, dstIP: "127.0.0.1",
+				outbound: "direct-out", reason: model.CloseEOF, durationMS: 2, startedAt: fixtureBase.Add(time.Second)},
+			{logID: 3281277749, user: userExit, userKind: model.UserKindManaged, dstHost: "example.com", dstPort: 443, dstIP: "172.66.147.243",
+				outbound: "direct-out", reason: model.CloseEOF, durationMS: 1400, startedAt: fixtureBase.Add(3 * time.Second)},
+		})
+		if s := a.Stats(); s.Open != 0 || s.Emitted != 4 || s.Orphaned != 0 {
+			t.Fatalf("stats = %+v, want 4 emitted and no orphan", s)
+		}
+	})
+
+	t.Run("entry_sniff", func(t *testing.T) {
+		lines := atDebug(entrySniffLines())
+		if len(lines) != 17 {
+			t.Fatalf("debug view has %d lines, want the 19 captured minus the 2 trace half closes", len(lines))
+		}
+		offsets := map[uint32]time.Duration{411327584: 0, 3872684616: time.Second}
+		a := New(Options{NodeID: "node-entry", CoreGeneration: 3, Now: func() time.Time { return fixtureBase }})
+		for _, l := range stamp(lines, offsets) {
+			a.Line(l)
+		}
+		a.Tick(fixtureBase.Add(10 * time.Second))
+
+		// 3872684616 still ends on the inbound's own close line, which is at
+		// debug, so it needs no grace at all and reports 18ms rather than the
+		// 16ms of the half close. The reason is the same either way, which is
+		// the property that matters: raising or lowering the subscription
+		// changes the precision, never the verdict.
+		checkRecords(t, a.Drain(), []wantRecord{
+			{logID: 3872684616, userKind: model.UserKindUnnamed, dstHost: "127.0.0.1", dstPort: 18081,
+				outbound: "chain-to-exit", reason: model.CloseEOF, closeErr: "read http request: EOF",
+				durationMS: 18, startedAt: fixtureBase.Add(time.Second)},
+			{logID: 411327584, userKind: model.UserKindUnnamed, dstHost: "example.com", dstPort: 443,
+				outbound: "chain-to-exit", reason: model.CloseEOF, durationMS: 1260, startedAt: fixtureBase},
+		})
+		if s := a.Stats(); s.Open != 0 || s.Emitted != 2 || s.Orphaned != 0 {
+			t.Fatalf("stats = %+v, want 2 emitted and no orphan", s)
+		}
+	})
 }
