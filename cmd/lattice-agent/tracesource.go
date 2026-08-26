@@ -36,6 +36,10 @@ const (
 	// traceCoreProbeTimeout bounds the liveness probe used to tell a sing-box
 	// restart apart from a transport blip.
 	traceCoreProbeTimeout = 2 * time.Second
+	// traceFinalFlushTimeout bounds the last delivery attempt on shutdown.
+	traceFinalFlushTimeout = 5 * time.Second
+	// defaultTraceBudgetLines is the per-second ceiling when a policy sets none.
+	defaultTraceBudgetLines = 500
 )
 
 type traceCollector struct {
@@ -65,11 +69,33 @@ type traceCollector struct {
 	// haveLevel is what the open stream is actually delivering. A difference
 	// from the merged policy is what triggers a resubscribe.
 	haveLevel model.TraceLevel
-	cancel    context.CancelFunc
+
+	// The pipeline and the subscription have different lifetimes on purpose.
+	//
+	// runCancel stops the assembler, the shipper and the connection poll. Those
+	// hold the open connections and everything queued for delivery, so they
+	// must survive a verbosity change: tearing them down mid-flight loses
+	// pending records with no Dropped count and strands open connections, whose
+	// later close lines then arrive without an opening identity and are dropped
+	// as partial. Starting a capture would erase the connection being
+	// investigated.
+	//
+	// streamCancel stops only the /logs subscription, which is the one thing
+	// that genuinely has to be reopened, because a Clash API log stream fixes
+	// its level when it opens.
+	runCancel    context.CancelFunc
+	streamCancel context.CancelFunc
+	// addr is the endpoint the live pipeline was built against. A change means
+	// a different core, so the pipeline is rebuilt rather than re-pointed.
+	addr string
 
 	// coreDown latches while sing-box is unreachable so a flapping stream
 	// cannot bump the generation more than once per real restart.
 	coreDown bool
+
+	// budget is live, so a policy that changes only the budget takes effect
+	// without waiting for a level change to rebuild the stream.
+	budget int
 
 	unparsed uint64
 	dropped  uint64
@@ -110,7 +136,8 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 	addr := strings.TrimSpace(agentCfg.Policy.ClashAPIAddr)
 	secretPath := strings.TrimSpace(agentCfg.Policy.SecretPath)
 	cfg := c.cfg
-	running := c.cancel != nil
+	pipelineUp := c.runCancel != nil
+	sameEndpoint := c.addr == addr
 	have := c.haveLevel
 	c.mu.Unlock()
 
@@ -118,84 +145,145 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 		c.stop()
 		return
 	}
-	if running && have == set.SubscribeLevel() {
+	if pipelineUp && !sameEndpoint {
+		// A different Clash API means a different core. Nothing in flight
+		// belongs to it, so take the whole pipeline down, flushing what is
+		// already assembled rather than dropping it.
+		c.stop()
+		pipelineUp = false
+	}
+	if !pipelineUp {
+		if !c.startPipeline(ctx, cfg, addr, secretPath, agentCfg.Policy) {
+			return
+		}
+		have = ""
+	}
+	c.setBudget(agentCfg.Policy.BudgetLinesPerSec)
+	if have == set.SubscribeLevel() {
 		return
 	}
-	// Either nothing is running, or the level moved. Both mean a fresh stream,
-	// because a Clash API log subscription fixes its level at open time.
-	c.stop()
-	c.start(ctx, cfg, addr, secretPath, set.SubscribeLevel(), agentCfg.Policy, len(set.ActiveSessions()))
+	c.restartStream(cfg, set.SubscribeLevel(), len(set.ActiveSessions()))
 }
 
-func (c *traceCollector) start(ctx context.Context, cfg agentConfig, addr, secretPath string, level model.TraceLevel, pol model.TracePolicy, sessionCount int) {
+// setBudget makes the per-second line budget live, so a policy that changes
+// only the budget takes effect without waiting for a level change to rebuild
+// the stream.
+func (c *traceCollector) setBudget(budget int) {
+	if budget <= 0 {
+		budget = defaultTraceBudgetLines
+	}
+	c.mu.Lock()
+	c.budget = budget
+	c.mu.Unlock()
+}
+
+// startPipeline brings up the parts that must outlive any one subscription:
+// the assembler holding open connections, the shipper holding queued delivery,
+// and the connection poll. Returns false if the endpoint cannot be reached at
+// all, in which case nothing is left half-built.
+func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, addr, secretPath string, pol model.TracePolicy) bool {
 	secret, err := resolveClashSecret(secretPath, cfg)
 	if err != nil {
 		log.Printf("trace: cannot read the Clash API secret: %v", err)
-		return
+		return false
 	}
 	client, err := singboxapi.New(singboxapi.Config{Addr: addr, Secret: secret})
 	if err != nil {
 		log.Printf("trace: Clash API client: %v", err)
-		return
+		return false
 	}
 
-	budget := pol.BudgetLinesPerSec
-	if budget <= 0 {
-		budget = 500
-	}
-	// The assembler must start on the SAME generation the collector is counting
-	// from, or the records swept by the first restart carry a generation the
-	// server never sees again, and the restart marker reports generation zero.
 	c.mu.Lock()
-	startGeneration := c.generation
-	c.mu.Unlock()
-	asm := sessionasm.New(sessionasm.Options{NodeID: cfg.NodeID, CoreGeneration: startGeneration})
+	// The assembler starts on the generation the collector is counting from, or
+	// the connections swept by the first restart carry a generation the server
+	// never sees again and the marker reports generation zero.
+	asm := sessionasm.New(sessionasm.Options{NodeID: cfg.NodeID, CoreGeneration: c.generation})
 	shipper := traceship.New(traceship.Config{
 		Server: cfg.Server,
 		NodeID: cfg.NodeID,
 		Token:  cfg.Token,
 	})
-
-	streamCtx, cancel := context.WithCancel(ctx)
-
-	c.mu.Lock()
+	runCtx, runCancel := context.WithCancel(ctx)
 	c.client = client
 	c.asm = asm
 	c.shipper = shipper
-	c.haveLevel = level
-	c.cancel = cancel
-	generation := c.generation
-	coreStart := c.coreStart
+	c.runCancel = runCancel
+	c.addr = addr
+	generation, coreStart := c.generation, c.coreStart
 	c.mu.Unlock()
 
 	shipper.SetCore(generation, coreStart)
 
-	// Say what changed. An operator raising a node to trace needs to see that
-	// the subscription actually moved, and this is the only place that knows
-	// the level, the budget and how many sessions are riding on it.
-	debugf(cfg, "trace: subscribed to %s at level=%s budget=%d lines/s sessions=%d generation=%d",
-		addr, level, budget, sessionCount, generation)
-
-	go shipper.Run(streamCtx)
-	go c.pollConnections(streamCtx, client, asm)
-	go c.driveAssembler(streamCtx, asm, shipper)
-	go c.streamLogs(streamCtx, client, asm, string(level), budget)
+	go shipper.Run(runCtx)
+	go c.pollConnections(runCtx, client, asm)
+	go c.driveAssembler(runCtx, asm, shipper)
+	debugf(cfg, "trace: pipeline up for %s generation=%d", addr, generation)
+	return true
 }
 
+// restartStream reopens the /logs subscription at a new level, leaving the
+// assembler, the shipper and everything they hold untouched.
+func (c *traceCollector) restartStream(cfg agentConfig, level model.TraceLevel, sessionCount int) {
+	c.mu.Lock()
+	if c.streamCancel != nil {
+		c.streamCancel()
+	}
+	client, asm := c.client, c.asm
+	budget := c.budget
+	runCancelSet := c.runCancel != nil
+	c.mu.Unlock()
+	if client == nil || asm == nil || !runCancelSet {
+		return
+	}
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	c.mu.Lock()
+	c.streamCancel = streamCancel
+	c.haveLevel = level
+	c.mu.Unlock()
+
+	debugf(cfg, "trace: subscribed to %s at level=%s budget=%d lines/s sessions=%d",
+		c.addr, level, budget, sessionCount)
+	go c.streamLogs(streamCtx, client, asm, string(level))
+}
+
+// stop takes the whole collector down and does NOT discard what is in flight:
+// the assembler is drained one last time and the shipper is given a bounded,
+// independent context to deliver it. Cancelling and walking away is how pending
+// evidence disappears without ever being counted as dropped.
 func (c *traceCollector) stop() {
 	c.mu.Lock()
-	cancel := c.cancel
-	c.cancel = nil
+	streamCancel, runCancel := c.streamCancel, c.runCancel
+	asm, shipper := c.asm, c.shipper
+	c.streamCancel, c.runCancel = nil, nil
+	c.asm, c.shipper, c.client = nil, nil, nil
 	c.haveLevel = ""
+	c.addr = ""
 	c.mu.Unlock()
-	if cancel != nil {
+
+	if streamCancel != nil {
+		streamCancel()
+	}
+	if runCancel != nil {
+		runCancel()
+	}
+	if asm != nil && shipper != nil {
+		if records := asm.Drain(); len(records) > 0 {
+			shipper.AddRecords(records)
+		}
+		// An independent context: the one that just got cancelled cannot carry
+		// a final delivery.
+		flushCtx, cancel := context.WithTimeout(context.Background(), traceFinalFlushTimeout)
+		if err := shipper.Flush(flushCtx); err != nil {
+			log.Printf("trace: final flush left data undelivered: %v", err)
+		}
 		cancel()
 	}
 }
 
 // streamLogs is the hot path. Every kept line is parsed, offered to the
 // assembler, and (when a session asked for it) shipped verbatim.
-func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Client, asm *sessionasm.Assembler, level string, budgetPerSec int) {
+func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Client, asm *sessionasm.Assembler, level string) {
 	// nodeID is captured once: reading c.cfg from inside the hot path would race
 	// with the poll loop that reassigns it every cycle.
 	c.mu.Lock()
@@ -227,6 +315,15 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 			inWindow = 0
 		}
 		inWindow++
+		// The budget is read live rather than captured, so a policy that
+		// changes only the budget takes effect on the running stream instead
+		// of waiting for a level change to rebuild it.
+		c.mu.Lock()
+		budgetPerSec := c.budget
+		c.mu.Unlock()
+		if budgetPerSec <= 0 {
+			budgetPerSec = defaultTraceBudgetLines
+		}
 		if inWindow > budgetPerSec {
 			// Over budget: drop and count. A silently discarded line reads later
 			// as a quiet network, so the count rides along in the next batch.

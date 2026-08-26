@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/singboxlog"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -141,7 +142,7 @@ func TestConcurrentApplyConfigStartsOneSubscription(t *testing.T) {
 	}
 
 	c.mu.Lock()
-	haveCancel := c.cancel != nil
+	haveCancel := c.runCancel != nil
 	c.mu.Unlock()
 	if !haveCancel {
 		t.Fatal("no subscription is recorded after applyConfig")
@@ -164,7 +165,7 @@ func TestApplyConfigDisabledPolicyStopsEverything(t *testing.T) {
 	c.applyConfig(ctx, cfg)
 	time.Sleep(100 * time.Millisecond)
 	c.mu.Lock()
-	running := c.cancel != nil
+	running := c.runCancel != nil
 	c.mu.Unlock()
 	if !running {
 		t.Fatal("expected a running subscription")
@@ -174,10 +175,98 @@ func TestApplyConfigDisabledPolicyStopsEverything(t *testing.T) {
 	c.applyConfig(ctx, cfg)
 
 	c.mu.Lock()
-	stillRunning := c.cancel != nil
+	stillRunning := c.runCancel != nil
 	c.mu.Unlock()
 	if stillRunning {
 		t.Fatal("a disabled policy must stop collection, not leave it running")
 	}
 	_ = fmt.Sprint()
+}
+
+// A verbosity change must not destroy the pipeline's state.
+//
+// The assembler holds open connections and the shipper holds queued delivery.
+// Rebuilding them on every level change loses pending records with no Dropped
+// count and strands open connections, whose later close lines then arrive
+// without an opening identity and are suppressed as partial. Starting a capture
+// would erase the connection being investigated, which is the opposite of the
+// point.
+func TestLevelChangeKeepsThePipelineAndItsOpenConnections(t *testing.T) {
+	api := fakeClashAPI(t)
+	c, cfg := traceTestCollector(t, api)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	cfg.Policy.Level = model.TraceLevelInfo
+	c.applyConfig(ctx, cfg)
+	time.Sleep(120 * time.Millisecond)
+
+	c.mu.Lock()
+	asmBefore := c.asm
+	shipperBefore := c.shipper
+	c.mu.Unlock()
+	if asmBefore == nil || shipperBefore == nil {
+		t.Fatal("pipeline did not come up")
+	}
+
+	// An open connection lives in the assembler.
+	asmBefore.Line(singboxlog.Line{
+		At: time.Now().UTC(), Level: "info", HasLogID: true, LogID: 4242,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.5", SrcPort: 1234,
+	})
+	if got := asmBefore.Stats().Open; got != 1 {
+		t.Fatalf("expected 1 open connection before the level change, got %d", got)
+	}
+
+	// Raise the level, which reopens the subscription.
+	cfg.Policy.Level = model.TraceLevelTrace
+	c.applyConfig(ctx, cfg)
+	time.Sleep(120 * time.Millisecond)
+
+	c.mu.Lock()
+	asmAfter := c.asm
+	shipperAfter := c.shipper
+	level := c.haveLevel
+	c.mu.Unlock()
+
+	if level != model.TraceLevelTrace {
+		t.Fatalf("subscription level = %q, want trace", level)
+	}
+	if asmAfter != asmBefore {
+		t.Fatal("the assembler was replaced by a level change; every open connection went with it")
+	}
+	if shipperAfter != shipperBefore {
+		t.Fatal("the shipper was replaced by a level change; everything queued for delivery went with it")
+	}
+	if got := asmAfter.Stats().Open; got != 1 {
+		t.Fatalf("the open connection did not survive the level change: %d open", got)
+	}
+}
+
+// A budget-only policy change must reach the running stream.
+func TestBudgetChangeTakesEffectWithoutRebuildingTheStream(t *testing.T) {
+	api := fakeClashAPI(t)
+	c, cfg := traceTestCollector(t, api)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	cfg.Policy.BudgetLinesPerSec = 100
+	c.applyConfig(ctx, cfg)
+	time.Sleep(100 * time.Millisecond)
+	c.mu.Lock()
+	first := c.budget
+	c.mu.Unlock()
+	if first != 100 {
+		t.Fatalf("budget = %d, want 100", first)
+	}
+
+	cfg.Policy.BudgetLinesPerSec = 7
+	c.applyConfig(ctx, cfg)
+	c.mu.Lock()
+	second := c.budget
+	c.mu.Unlock()
+	if second != 7 {
+		t.Fatalf("budget stayed %d after a budget-only policy change; the control is inert", second)
+	}
 }
