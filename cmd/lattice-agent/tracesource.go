@@ -130,7 +130,13 @@ func (c *traceCollector) start(ctx context.Context, cfg agentConfig, addr, secre
 	if budget <= 0 {
 		budget = 500
 	}
-	asm := sessionasm.New(sessionasm.Options{NodeID: cfg.NodeID})
+	// The assembler must start on the SAME generation the collector is counting
+	// from, or the records swept by the first restart carry a generation the
+	// server never sees again, and the restart marker reports generation zero.
+	c.mu.Lock()
+	startGeneration := c.generation
+	c.mu.Unlock()
+	asm := sessionasm.New(sessionasm.Options{NodeID: cfg.NodeID, CoreGeneration: startGeneration})
 	shipper := traceship.New(traceship.Config{
 		Server: cfg.Server,
 		NodeID: cfg.NodeID,
@@ -189,6 +195,20 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 	)
 	onEntry := func(entry []byte) {
 		now := time.Now().UTC()
+
+		// The first line after an outage is the proof that sing-box came back.
+		// Recovery cannot be detected in onError, which only runs when a stream
+		// ENDS: the down to up transition happens on a successful reconnect,
+		// where nothing else would notice it. Sweeping here is what turns a
+		// restart into a marker carrying the number of connections it killed.
+		c.mu.Lock()
+		recovered := c.coreDown
+		c.coreDown = false
+		c.mu.Unlock()
+		if recovered {
+			c.noteCoreRestart(asm)
+		}
+
 		if now.Sub(windowStart) >= time.Second {
 			windowStart = now
 			inWindow = 0
@@ -303,6 +323,19 @@ func (c *traceCollector) pollConnections(ctx context.Context, client *singboxapi
 		snap, err := client.Connections(ctx)
 		if err != nil {
 			continue
+		}
+		// Recovery must not depend on traffic. A restart on a quiet node ends
+		// the log stream and then nothing else happens, so waiting for the next
+		// log line would leave the swept connections and the restart marker
+		// pending indefinitely. This poll runs either way, so whichever of the
+		// two observes the core answering again wins; the check and clear is
+		// under the lock, so only one of them sweeps.
+		c.mu.Lock()
+		recovered := c.coreDown
+		c.coreDown = false
+		c.mu.Unlock()
+		if recovered {
+			c.noteCoreRestart(asm)
 		}
 		items := make([]sessionasm.SnapshotItem, 0, len(snap.Connections))
 		for _, conn := range snap.Connections {
