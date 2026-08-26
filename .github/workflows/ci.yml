@@ -3,6 +3,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release line is integration, and CI does not run on pushes to it. That
+  # left the branch that actually ships with no way to be verified in CI at all,
+  # so a release could only ever rest on someone's local run.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
