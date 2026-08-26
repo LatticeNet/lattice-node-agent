@@ -53,7 +53,9 @@ type Config struct {
 	MaxBatchRecords int
 	MaxBatchLines   int
 	// MaxPending bounds records plus lines together. Over it, the oldest are
-	// dropped and counted.
+	// dropped and counted. The batch currently on the wire sits outside this
+	// bound, so the real ceiling is MaxPending plus one batch: an item being
+	// delivered must not be discardable, or it would be counted twice.
 	MaxPending    int
 	FlushInterval time.Duration
 	// Now is the clock, injectable so backoff can be tested without sleeping.
@@ -101,12 +103,17 @@ type Shipper struct {
 	mu      sync.Mutex
 	records []model.ConnRecord
 	lines   []model.TraceLine
-	// recordsBase and linesBase are the absolute index of the queue head. A
-	// request runs without the lock held, so items can be dropped from the
-	// front while it is in flight; the absolute positions are what let the
-	// commit remove exactly the shipped items and nothing else.
-	recordsBase uint64
-	linesBase   uint64
+	// inflightRecords and inflightLines hold the items of the batch currently
+	// on the wire. They leave the queues for the duration of the request, so
+	// neither an Add nor the capacity trim can reach them. That is what keeps
+	// every item counted exactly once: an item discarded under pressure while
+	// it was also being delivered would land in both the dropped and the
+	// shipped counter, and the operator's total would then correspond to
+	// nothing. On failure they go back on the front of the queues. Only a
+	// flush cycle touches them, and shipMu allows one cycle at a time, so at
+	// most one batch is ever in flight.
+	inflightRecords []model.ConnRecord
+	inflightLines   []model.TraceLine
 
 	coreGeneration uint64
 	coreStartedAt  time.Time
@@ -128,13 +135,6 @@ type Shipper struct {
 	loggedShipErr   bool
 	retryUntil      time.Time
 	backoffFailures int
-}
-
-// pendingBatch is one request together with where its items sat in the queue.
-type pendingBatch struct {
-	batch     model.TraceBatch
-	recordEnd uint64
-	lineEnd   uint64
 }
 
 // New builds a shipper. It does not start anything; call Run for the flush
@@ -239,16 +239,17 @@ func (s *Shipper) Flush(ctx context.Context) error {
 	s.shipMu.Lock()
 	defer s.shipMu.Unlock()
 	for {
-		pb, ok := s.nextBatch()
+		batch, ok := s.takeBatch()
 		if !ok {
 			return nil
 		}
-		status, retryAfter, err := s.post(ctx, pb.batch)
+		status, retryAfter, err := s.post(ctx, batch)
 		if err != nil {
+			s.restore()
 			s.recordFailure(status, retryAfter, err)
 			return err
 		}
-		s.commit(pb)
+		s.commit(batch)
 	}
 }
 
@@ -271,10 +272,12 @@ func (s *Shipper) Run(ctx context.Context) {
 func (s *Shipper) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	pendingRecords := len(s.records) + len(s.inflightRecords)
+	pendingLines := len(s.lines) + len(s.inflightLines)
 	return Stats{
-		Pending:        len(s.records) + len(s.lines),
-		PendingRecords: len(s.records),
-		PendingLines:   len(s.lines),
+		Pending:        pendingRecords + pendingLines,
+		PendingRecords: pendingRecords,
+		PendingLines:   pendingLines,
 		ShippedRecords: s.shippedRecords,
 		ShippedLines:   s.shippedLines,
 		ShippedBatches: s.shippedBatches,
@@ -311,74 +314,85 @@ func (s *Shipper) trimLocked() {
 	}
 	if dropRecords > 0 {
 		s.records = s.records[dropRecords:]
-		s.recordsBase += uint64(dropRecords)
 	}
 	if dropLines > 0 {
 		s.lines = s.lines[dropLines:]
-		s.linesBase += uint64(dropLines)
 	}
 	n := uint64(dropRecords + dropLines)
 	s.dropped += n
 	s.droppedTotal += n
 }
 
-// nextBatch takes the head of each queue without removing it, so a failed ship
-// holds position. It reports false when there is nothing to say.
-func (s *Shipper) nextBatch() (pendingBatch, bool) {
+// takeBatch moves the head of each queue into the in-flight slices and builds
+// the request from them. Taking the items out of the queue, rather than
+// peeking at them, is what makes the delivery window immune to the capacity
+// trim that may run while the request is on the wire. It reports false when
+// there is nothing to say.
+func (s *Shipper) takeBatch() (model.TraceBatch, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	if !s.retryUntil.IsZero() && now.Before(s.retryUntil) {
-		return pendingBatch{}, false
+		return model.TraceBatch{}, false
 	}
 	recordN := min(len(s.records), s.maxBatchRecords)
 	lineN := min(len(s.lines), s.maxBatchLines)
 	// An empty batch is still worth sending when counters are owed: drops that
 	// stopped the flow entirely would otherwise never be reported.
 	if recordN == 0 && lineN == 0 && s.dropped == 0 && s.unparsed == 0 {
-		return pendingBatch{}, false
+		return model.TraceBatch{}, false
 	}
-	pb := pendingBatch{
-		batch: model.TraceBatch{
-			NodeID:         s.nodeID,
-			CoreGeneration: s.coreGeneration,
-			CoreStartedAt:  s.coreStartedAt,
-			Dropped:        s.dropped,
-			Unparsed:       s.unparsed,
-			CapturedAt:     now.UTC(),
-		},
-		recordEnd: s.recordsBase + uint64(recordN),
-		lineEnd:   s.linesBase + uint64(lineN),
+	batch := model.TraceBatch{
+		NodeID:         s.nodeID,
+		CoreGeneration: s.coreGeneration,
+		CoreStartedAt:  s.coreStartedAt,
+		Dropped:        s.dropped,
+		Unparsed:       s.unparsed,
+		CapturedAt:     now.UTC(),
 	}
 	if recordN > 0 {
-		pb.batch.Records = append([]model.ConnRecord(nil), s.records[:recordN]...)
+		s.inflightRecords = append([]model.ConnRecord(nil), s.records[:recordN]...)
+		s.records = s.records[recordN:]
+		batch.Records = s.inflightRecords
 	}
 	if lineN > 0 {
-		pb.batch.Lines = append([]model.TraceLine(nil), s.lines[:lineN]...)
+		s.inflightLines = append([]model.TraceLine(nil), s.lines[:lineN]...)
+		s.lines = s.lines[lineN:]
+		batch.Lines = s.inflightLines
 	}
-	return pb, true
+	return batch, true
 }
 
-// commit removes what the server accepted. It subtracts the counters the batch
-// carried rather than zeroing them, because a drop that happened while the
-// request was in flight is still owed to the next batch.
-func (s *Shipper) commit(pb pendingBatch) {
+// restore puts an unacknowledged batch back on the front of the queues, in the
+// order it was taken. Holding position is the point: the next tick resends
+// exactly these items. Whatever the restore pushes past MaxPending is dropped
+// here and counted once, as a drop and only as a drop.
+func (s *Shipper) restore() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if pb.recordEnd > s.recordsBase {
-		n := min(int(pb.recordEnd-s.recordsBase), len(s.records))
-		s.records = s.records[n:]
-		s.recordsBase += uint64(n)
+	if len(s.inflightRecords) > 0 {
+		s.records = prepend(s.inflightRecords, s.records)
+		s.inflightRecords = nil
 	}
-	if pb.lineEnd > s.linesBase {
-		n := min(int(pb.lineEnd-s.linesBase), len(s.lines))
-		s.lines = s.lines[n:]
-		s.linesBase += uint64(n)
+	if len(s.inflightLines) > 0 {
+		s.lines = prepend(s.inflightLines, s.lines)
+		s.inflightLines = nil
 	}
-	s.dropped = saturatingSub(s.dropped, pb.batch.Dropped)
-	s.unparsed = saturatingSub(s.unparsed, pb.batch.Unparsed)
-	s.shippedRecords += uint64(len(pb.batch.Records))
-	s.shippedLines += uint64(len(pb.batch.Lines))
+	s.trimLocked()
+}
+
+// commit releases what the server accepted. It subtracts the counters the
+// batch carried rather than zeroing them, because a drop that happened while
+// the request was in flight is still owed to the next batch.
+func (s *Shipper) commit(batch model.TraceBatch) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shippedRecords += uint64(len(s.inflightRecords))
+	s.shippedLines += uint64(len(s.inflightLines))
+	s.inflightRecords = nil
+	s.inflightLines = nil
+	s.dropped = saturatingSub(s.dropped, batch.Dropped)
+	s.unparsed = saturatingSub(s.unparsed, batch.Unparsed)
 	s.shippedBatches++
 	s.lastSuccess = s.now().UTC()
 	s.lastError = ""
@@ -486,6 +500,14 @@ func errorSnippet(r io.Reader) string {
 		return ""
 	}
 	return ": " + text
+}
+
+// prepend returns head followed by tail in a slice of its own, so that putting
+// a batch back cannot write into the array the request read from.
+func prepend[T any](head, tail []T) []T {
+	out := make([]T, 0, len(head)+len(tail))
+	out = append(out, head...)
+	return append(out, tail...)
 }
 
 func saturatingSub(a, b uint64) uint64 {

@@ -577,3 +577,118 @@ func TestBackoffForDoublesAndCaps(t *testing.T) {
 		}
 	}
 }
+
+func TestDropPressureDuringInFlightShipCountsEachItemOnce(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rec := &recorder{respond: func(n int, w http.ResponseWriter) bool {
+		if n == 1 {
+			close(started)
+			<-release
+		}
+		return false
+	}}
+	s := newShipper(t, rec, func(cfg *Config) {
+		cfg.MaxPending = 4
+		cfg.MaxBatchRecords = 4
+	})
+	s.AddRecords(records(1, 2, 3, 4))
+
+	errc := make(chan error, 1)
+	go func() { errc <- s.Flush(context.Background()) }()
+	<-started
+	// Eight more arrive while the first four are on the wire. Four of them do
+	// not fit and are dropped; the four being delivered must not be touched,
+	// because an item counted as dropped while it is also being shipped lands
+	// in both counters and the operator's total then means nothing.
+	s.AddRecords(records(5, 6, 7, 8, 9, 10, 11, 12))
+	close(release)
+	if err := <-errc; err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if rec.count() != 2 {
+		t.Fatalf("requests = %d, want 2", rec.count())
+	}
+	first, second := rec.at(t, 0).batch, rec.at(t, 1).batch
+	if got := recordIDs(first.Records); !equalUint32(got, []uint32{1, 2, 3, 4}) {
+		t.Fatalf("first batch = %v, want the four that were in flight", got)
+	}
+	if first.Dropped != 0 {
+		t.Fatalf("first batch dropped = %d, want 0: the drop happened after it was built", first.Dropped)
+	}
+	if got := recordIDs(second.Records); !equalUint32(got, []uint32{9, 10, 11, 12}) {
+		t.Fatalf("second batch = %v, want the newest four", got)
+	}
+	if second.Dropped != 4 {
+		t.Fatalf("second batch dropped = %d, want 4", second.Dropped)
+	}
+
+	st := s.Stats()
+	if st.ShippedRecords != 8 || st.DroppedTotal != 4 {
+		t.Fatalf("shipped %d, dropped %d; want 8 and 4", st.ShippedRecords, st.DroppedTotal)
+	}
+	if total := st.ShippedRecords + st.DroppedTotal + uint64(st.Pending); total != 12 {
+		t.Fatalf("accounted for %d of the 12 items added", total)
+	}
+	if st.Pending != 0 || st.Dropped != 0 {
+		t.Fatalf("final stats: %+v", st)
+	}
+}
+
+func TestDropPressureDuringFailedShipRestoresAndCountsOnce(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rec := &recorder{respond: func(n int, w http.ResponseWriter) bool {
+		if n == 1 {
+			close(started)
+			<-release
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}}
+	s := newShipper(t, rec, func(cfg *Config) {
+		cfg.MaxPending = 4
+		cfg.MaxBatchRecords = 4
+	})
+	s.AddRecords(records(1, 2, 3, 4))
+
+	errc := make(chan error, 1)
+	go func() { errc <- s.Flush(context.Background()) }()
+	<-started
+	s.AddRecords(records(5, 6, 7, 8, 9, 10, 11, 12))
+	close(release)
+	if err := <-errc; err == nil {
+		t.Fatal("expected an error from the 500")
+	}
+
+	// The failed batch went back on the front of the queue, which put the
+	// queue over capacity, so the oldest four went as a drop and only as a
+	// drop. Nothing shipped, nothing is owed twice.
+	st := s.Stats()
+	if st.ShippedRecords != 0 || st.ShippedBatches != 0 {
+		t.Fatalf("failed ship advanced a shipped counter: %+v", st)
+	}
+	if st.DroppedTotal != 8 || st.PendingRecords != 4 {
+		t.Fatalf("dropped %d, pending %d; want 8 and 4", st.DroppedTotal, st.PendingRecords)
+	}
+	if total := st.ShippedRecords + st.DroppedTotal + uint64(st.Pending); total != 12 {
+		t.Fatalf("accounted for %d of the 12 items added", total)
+	}
+
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	batch := rec.at(t, 1).batch
+	if got := recordIDs(batch.Records); !equalUint32(got, []uint32{9, 10, 11, 12}) {
+		t.Fatalf("retry batch = %v, want the survivors", got)
+	}
+	if batch.Dropped != 8 {
+		t.Fatalf("retry batch dropped = %d, want 8", batch.Dropped)
+	}
+	st = s.Stats()
+	if st.ShippedRecords != 4 || st.DroppedTotal != 8 || st.Pending != 0 || st.Dropped != 0 {
+		t.Fatalf("final stats: %+v", st)
+	}
+}
