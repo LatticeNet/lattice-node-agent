@@ -109,6 +109,15 @@ type traceCollector struct {
 	// lines go straight out instead of buffering again.
 	tagged map[uint32][]string
 
+	// rawSourceID is the virtual log source that takes the node's ordinary
+	// lines, and rawQueue is what is waiting to go there. These are the lines
+	// no capture session asked for: they belong in the existing bounded log
+	// store, so the Logs view keeps working on a traced node and there is
+	// parser evidence to look at after the fact rather than only records.
+	rawSourceID string
+	rawQueue    []string
+	rawDropped  uint64
+
 	unparsed uint64
 	dropped  uint64
 }
@@ -217,6 +226,7 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 
 	c.mu.Lock()
 	c.policy = set
+	c.rawSourceID = strings.TrimSpace(agentCfg.RawSourceID)
 	enabled := set.Enabled()
 	addr := strings.TrimSpace(agentCfg.Policy.ClashAPIAddr)
 	secretPath := strings.TrimSpace(agentCfg.Policy.SecretPath)
@@ -474,6 +484,16 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 		}
 
 		c.mu.Lock()
+		// Every line the node floor keeps goes to the raw log source, whether
+		// or not a session wanted it. That is the always-on path: records are
+		// a summary, and a summary is not evidence.
+		if decision.Keep && c.rawSourceID != "" {
+			if len(c.rawQueue) < traceRawQueueMax {
+				c.rawQueue = append(c.rawQueue, line.Raw)
+			} else {
+				c.rawDropped++
+			}
+		}
 		claimed, alreadyTagged := c.tagged[line.LogID]
 		if line.HasLogID && !alreadyTagged && len(decision.SessionIDs) == 0 {
 			// Identity is not resolved yet. Hold the line so the chain can
@@ -638,6 +658,7 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 				c.mu.Unlock()
 				sh.AddRecords(records)
 			}
+			c.flushRaw()
 			c.mu.Lock()
 			unparsed, dropped := c.unparsed, c.dropped
 			c.unparsed, c.dropped = 0, 0
@@ -716,3 +737,43 @@ func fetchTraceConfig(cfg agentConfig) (model.TraceAgentConfig, error) {
 	}
 	return out, nil
 }
+
+// traceRawQueueMax bounds the raw line queue between flushes. Over it, lines
+// are dropped and counted rather than growing memory without limit.
+const traceRawQueueMax = 5000
+
+// flushRaw ships the ordinary lines to the virtual log source. A failure holds
+// position: the queue is only cleared once the server has taken it, so a
+// server outage delays raw lines rather than silently discarding them, up to
+// the queue bound.
+func (c *traceCollector) flushRaw() {
+	c.mu.Lock()
+	sourceID := c.rawSourceID
+	if sourceID == "" || len(c.rawQueue) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	lines := c.rawQueue
+	dropped := c.rawDropped
+	cfg := c.cfg
+	c.mu.Unlock()
+
+	status, err := shipLogBatch(cfg, model.LogBatch{
+		SourceID:   sourceID,
+		Path:       singBoxRawPathFor(cfg.NodeID),
+		Lines:      lines,
+		Dropped:    dropped,
+		CapturedAt: time.Now().UTC(),
+	})
+	if err != nil || status != http.StatusOK {
+		return
+	}
+	c.mu.Lock()
+	c.rawQueue = c.rawQueue[len(lines):]
+	c.rawDropped = 0
+	c.mu.Unlock()
+}
+
+// singBoxRawPathFor mirrors the server's virtual path so the cross-check on
+// ingest passes. It is not a file and nothing ever opens it.
+func singBoxRawPathFor(nodeID string) string { return "singbox://" + nodeID }
