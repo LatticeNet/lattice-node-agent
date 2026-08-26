@@ -468,15 +468,30 @@ func classifyDialFailure(l *Line, body string) bool {
 }
 
 func classifyAuthFailure(l *Line, rest string) {
-	l.Event = EventAuthFailed
 	src, errText, _ := strings.Cut(rest, ": ")
 	l.SrcIP, l.SrcPort = splitHostPort(src)
 	l.Error = errText
+	// "process connection from <src>" covers both a rejected credential and a
+	// transport that never came up. The error text is what separates them, and
+	// reporting a TLS handshake failure as an authentication failure sends an
+	// operator to debug a credential that was never presented, let alone
+	// rejected. No user is known either way, so attribution stays by source.
+	if isHandshakeError(errText) {
+		l.Event = EventHandshakeFailed
+		return
+	}
+	l.Event = EventAuthFailed
 }
 
-// classifyConnection reads the half-close and route-level close lines. The
-// handshake errors that share the "connection <direction> " prefix are left
-// unmodelled on purpose, so they surface as drift rather than as a wrong event.
+// isHandshakeError reports whether an error text describes the transport
+// failing to come up rather than anything about a credential.
+func isHandshakeError(errText string) bool {
+	lower := strings.ToLower(errText)
+	return strings.Contains(lower, "handshake")
+}
+
+// classifyConnection reads the half-close, handshake and route-level close
+// lines that share the "connection " tag.
 func classifyConnection(l *Line, rest string) bool {
 	direction := DirectionNone
 	switch {
@@ -497,6 +512,22 @@ func classifyConnection(l *Line, rest string) bool {
 			return true
 		}
 		return false
+	}
+
+	// "connection upload handshake: <err>" is terminal and real: the transport
+	// never came up, so no bytes ever moved. Leaving it unmodelled meant it
+	// fell through to EventOther and the connection was later published as
+	// unknown, which hides a failure that has a precise cause.
+	if errText, ok := strings.CutPrefix(rest, "handshake: "); ok {
+		l.Event = EventHandshakeFailed
+		l.Direction = direction
+		l.Error = errText
+		return true
+	}
+	if rest == "handshake" {
+		l.Event = EventHandshakeFailed
+		l.Direction = direction
+		return true
 	}
 
 	switch {

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/sessionasm"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxlog"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -268,5 +269,100 @@ func TestBudgetChangeTakesEffectWithoutRebuildingTheStream(t *testing.T) {
 	c.mu.Unlock()
 	if second != 7 {
 		t.Fatalf("budget stayed %d after a budget-only policy change; the control is inert", second)
+	}
+}
+
+// A transport gap is not a restart, and a restart is caught even if the stream
+// never noticed it.
+//
+// Reachability was the old signal: a two second API stall closed every healthy
+// connection as core_restart, and a restart that came back before the probe ran
+// was missed entirely. Cumulative totals are monotonic within one sing-box
+// process, so a decrease is a different process answering. That is the identity
+// evidence the close-reason contract needs.
+func TestRestartIsDetectedFromProcessIdentityNotReachability(t *testing.T) {
+	c := newTraceCollector(agentConfig{Server: "http://127.0.0.1:1", NodeID: "n1", Token: "t"})
+	asm := sessionasm.New(sessionasm.Options{NodeID: "n1", CoreGeneration: 1})
+
+	// Totals climbing: same process, no restart.
+	for _, tot := range []struct{ up, down int64 }{{10, 20}, {30, 60}, {31, 61}} {
+		c.mu.Lock()
+		regressed := c.sawTotals && (tot.up < c.lastUpload || tot.down < c.lastDownload)
+		c.lastUpload, c.lastDownload, c.sawTotals = tot.up, tot.down, true
+		c.mu.Unlock()
+		if regressed {
+			t.Fatalf("climbing totals reported a restart at %+v", tot)
+		}
+	}
+
+	// An observation gap alone must not sweep anything.
+	c.mu.Lock()
+	c.observationGaps++
+	gen := c.generation
+	c.mu.Unlock()
+	if gen != 1 {
+		t.Fatalf("an observation gap changed the generation to %d", gen)
+	}
+
+	// Totals reset: a new process is answering.
+	c.mu.Lock()
+	regressed := c.sawTotals && (int64(5) < c.lastUpload || int64(5) < c.lastDownload)
+	c.lastUpload, c.lastDownload = 5, 5
+	c.mu.Unlock()
+	if !regressed {
+		t.Fatal("a totals reset was not recognised as a new process")
+	}
+	c.noteCoreRestart(asm)
+	c.mu.Lock()
+	after := c.generation
+	c.mu.Unlock()
+	if after != 2 {
+		t.Fatalf("generation = %d after a real restart, want 2", after)
+	}
+}
+
+// A session expires on the agent even when the control plane is gone.
+//
+// The agent-side TTL is the whole point of the deadline: a capture must stop
+// even if the server disappears mid-capture, which is exactly when the privacy
+// boundary matters. Rebuilding the set only on a successful config fetch left
+// an expired session running and tagging indefinitely during an outage.
+func TestSessionExpiresLocallyWithoutTheServer(t *testing.T) {
+	api := fakeClashAPI(t)
+	c, cfg := traceTestCollector(t, api)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	now := time.Now().UTC()
+	cfg.Policy.Level = model.TraceLevelInfo
+	cfg.ServerTime = now
+	cfg.Sessions = []model.TraceAgentSession{{
+		ID:        "sess-expiring",
+		Level:     model.TraceLevelTrace,
+		ExpiresAt: now.Add(2 * time.Second),
+	}}
+	c.applyConfig(ctx, cfg)
+	time.Sleep(120 * time.Millisecond)
+
+	c.mu.Lock()
+	during := c.policy.SubscribeLevel()
+	c.mu.Unlock()
+	if during != model.TraceLevelTrace {
+		t.Fatalf("subscription level during the session = %q, want trace", during)
+	}
+
+	// No further config fetch will succeed: the server is gone. The agent must
+	// still let the session lapse.
+	c.expireSessionsLocally(now.Add(5 * time.Second))
+
+	c.mu.Lock()
+	after := c.policy.SubscribeLevel()
+	active := len(c.policy.ActiveSessions())
+	c.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("%d sessions still active past their deadline with the server unreachable", active)
+	}
+	if after != model.TraceLevelInfo {
+		t.Fatalf("subscription stayed at %q after expiry; it must fall back to the node floor", after)
 	}
 }

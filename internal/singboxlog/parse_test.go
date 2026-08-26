@@ -372,16 +372,20 @@ func TestParsePayload(t *testing.T) {
 			},
 		},
 		{
-			// The handshake errors share the prefix but are not a half-close,
-			// so they must not be classified as one.
-			name:    "upload handshake error is not a half-close",
+			// A handshake failure is terminal and real: the transport never came
+			// up, so no bytes ever moved. Leaving it unmodelled meant the
+			// connection was later published as unknown, hiding a failure that
+			// has a precise cause.
+			name:    "upload handshake error is its own terminal event",
 			level:   "error",
 			payload: `[1 0ms] connection: connection upload handshake: unexpected EOF`,
 			want: Line{
 				LogID: 1, HasLogID: true,
 				Tag: "connection", TagKind: TagConnection,
-				Event:   EventOther,
-				Message: "connection upload handshake: unexpected EOF",
+				Event:     EventHandshakeFailed,
+				Direction: DirectionUpload,
+				Message:   "connection upload handshake: unexpected EOF",
+				Error:     "unexpected EOF",
 			},
 		},
 		{
@@ -466,13 +470,17 @@ func TestParsePayload(t *testing.T) {
 			},
 		},
 		{
-			name:    "auth failed from an ipv6 source",
+			// A TLS handshake failure is not a rejected credential. Reporting it
+			// as one sends an operator to debug a user that never presented
+			// anything. No user is known either way, so attribution stays by
+			// source address.
+			name:    "tls handshake failure from an ipv6 source is not an auth failure",
 			level:   "error",
 			payload: `[1 0ms] inbound/vless[vless-exit]: process connection from [2001:db8::9]:5678: TLS handshake: EOF`,
 			want: Line{
 				LogID: 1, HasLogID: true,
 				Tag: "inbound/vless[vless-exit]", TagKind: TagInbound, TagType: "vless", TagName: "vless-exit",
-				Event:   EventAuthFailed,
+				Event:   EventHandshakeFailed,
 				Message: "process connection from [2001:db8::9]:5678: TLS handshake: EOF",
 				SrcIP:   "2001:db8::9", SrcPort: 5678,
 				Error: "TLS handshake: EOF",

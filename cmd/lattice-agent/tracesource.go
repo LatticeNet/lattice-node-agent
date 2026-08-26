@@ -89,9 +89,25 @@ type traceCollector struct {
 	// a different core, so the pipeline is rebuilt rather than re-pointed.
 	addr string
 
-	// coreDown latches while sing-box is unreachable so a flapping stream
-	// cannot bump the generation more than once per real restart.
-	coreDown bool
+	// lastUpload and lastDownload are the newest cumulative totals seen from
+	// /connections. They are monotonic within one sing-box process, so a drop
+	// is process identity changing, which is the only honest restart signal
+	// available through this API.
+	lastUpload   int64
+	lastDownload int64
+	sawTotals    bool
+	// observationGaps counts stream interruptions that were NOT shown to be
+	// restarts. They are reported so a flapping endpoint is visible without
+	// being mislabelled as connections being killed.
+	observationGaps uint64
+	// lastAsmDropped and lastAsmPartial are the assembler counters already
+	// forwarded, so only deltas travel.
+	lastAsmDropped uint64
+	lastAsmPartial uint64
+	// serverSkew is serverTime minus agent time at the last successful config
+	// fetch. The deadline is the server's, so its clock is what the agent
+	// compares against when enforcing expiry on its own.
+	serverSkew time.Duration
 
 	// budget is live, so a policy that changes only the budget takes effect
 	// without waiting for a level change to rebuild the stream.
@@ -225,6 +241,9 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 	set := tracepolicy.Build(agentCfg, now)
 
 	c.mu.Lock()
+	if !agentCfg.ServerTime.IsZero() {
+		c.serverSkew = agentCfg.ServerTime.Sub(now)
+	}
 	c.policy = set
 	c.rawSourceID = strings.TrimSpace(agentCfg.RawSourceID)
 	enabled := set.Enabled()
@@ -392,19 +411,6 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 	onEntry := func(entry []byte) {
 		now := time.Now().UTC()
 
-		// The first line after an outage is the proof that sing-box came back.
-		// Recovery cannot be detected in onError, which only runs when a stream
-		// ENDS: the down to up transition happens on a successful reconnect,
-		// where nothing else would notice it. Sweeping here is what turns a
-		// restart into a marker carrying the number of connections it killed.
-		c.mu.Lock()
-		recovered := c.coreDown
-		c.coreDown = false
-		c.mu.Unlock()
-		if recovered {
-			c.noteCoreRestart(asm)
-		}
-
 		if now.Sub(windowStart) >= time.Second {
 			windowStart = now
 			inWindow = 0
@@ -437,7 +443,11 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 			c.mu.Unlock()
 			return
 		}
-		if line.Event == singboxlog.EventOther && !line.HasLogID {
+		if !line.Parsed() {
+			// Every unrecognised line counts, with or without a connection id.
+			// A newer sing-box can reword a message while keeping the
+			// "[id elapsed] tag: message" shape, and only counting the
+			// id-less ones would let that drift read as quiet traffic.
 			c.mu.Lock()
 			c.unparsed++
 			c.mu.Unlock()
@@ -538,31 +548,19 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 	}
 
 	onError := func(err error) {
-		// A dropped stream MIGHT mean sing-box restarted, taking every live
-		// connection with it, or it might be a transport blip. Treating every
-		// disconnect as a restart would invent restart markers and mislabel
-		// healthy connections as core_restart, so probe before believing it:
-		// if the API still answers, the core is alive and only the stream fell
-		// over.
-		probeCtx, cancel := context.WithTimeout(ctx, traceCoreProbeTimeout)
-		_, probeErr := client.Version(probeCtx)
-		cancel()
-
+		// A dropped stream is an OBSERVATION GAP, not evidence that sing-box
+		// restarted. Asserting a restart from reachability closed healthy
+		// connections as core_restart whenever the API stalled for a couple of
+		// seconds, and missed a real restart that came back before the probe
+		// ran. Process identity is what settles it, and the connection totals
+		// carry it: they are cumulative within one process, so they only go
+		// backwards when a new process is answering. That check lives in the
+		// connection poll, which sees every reset whether or not the stream
+		// noticed a gap.
 		c.mu.Lock()
-		wasDown := c.coreDown
-		c.coreDown = probeErr != nil
+		c.observationGaps++
 		c.mu.Unlock()
-
-		if probeErr != nil {
-			debugf(c.cfg, "trace: sing-box unreachable after stream end: %v", probeErr)
-			return
-		}
-		if wasDown {
-			// It was unreachable and is now answering again: that is a restart,
-			// and the connections still open in the assembler did not survive it.
-			c.noteCoreRestart(asm)
-		}
-		debugf(c.cfg, "trace: log stream ended: %v", err)
+		debugf(c.cfg, "trace: log stream ended, treating as an observation gap: %v", err)
 	}
 
 	if err := client.StreamLogsWithRetry(ctx, level, onEntry, onError); err != nil && ctx.Err() == nil {
@@ -596,17 +594,15 @@ func (c *traceCollector) pollConnections(ctx context.Context, client *singboxapi
 		if err != nil {
 			continue
 		}
-		// Recovery must not depend on traffic. A restart on a quiet node ends
-		// the log stream and then nothing else happens, so waiting for the next
-		// log line would leave the swept connections and the restart marker
-		// pending indefinitely. This poll runs either way, so whichever of the
-		// two observes the core answering again wins; the check and clear is
-		// under the lock, so only one of them sweeps.
+		// Cumulative totals are monotonic within one sing-box process, so a
+		// decrease is a new process answering. This is the restart signal:
+		// it fires on a fast restart the stream never noticed, and does not
+		// fire on a stall that merely interrupted observation.
 		c.mu.Lock()
-		recovered := c.coreDown
-		c.coreDown = false
+		regressed := c.sawTotals && (snap.UploadTotal < c.lastUpload || snap.DownloadTotal < c.lastDownload)
+		c.lastUpload, c.lastDownload, c.sawTotals = snap.UploadTotal, snap.DownloadTotal, true
 		c.mu.Unlock()
-		if recovered {
+		if regressed {
 			c.noteCoreRestart(asm)
 		}
 		items := make([]sessionasm.SnapshotItem, 0, len(snap.Connections))
@@ -644,6 +640,7 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 			}
 			return
 		case now := <-ticker.C:
+			c.expireSessionsLocally(now.UTC())
 			asm.Tick(now.UTC())
 			if records := asm.Drain(); len(records) > 0 {
 				// A finished connection will send no more lines, so its
@@ -659,9 +656,25 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 				sh.AddRecords(records)
 			}
 			c.flushRaw()
+			// The assembler keeps its own loss counters and nothing was
+			// reading them, so bounded eviction and suppressed partial records
+			// were invisible: the server's gap audit could report zero loss
+			// while connections had been discarded. Forward the deltas.
+			asmStats := asm.Stats()
 			c.mu.Lock()
 			unparsed, dropped := c.unparsed, c.dropped
 			c.unparsed, c.dropped = 0, 0
+			if d := asmStats.Dropped - c.lastAsmDropped; d > 0 {
+				dropped += d
+				c.lastAsmDropped = asmStats.Dropped
+			}
+			if d := asmStats.Partial - c.lastAsmPartial; d > 0 {
+				// A partial observation is not a clean result. It is folded
+				// into the same counter an operator already watches rather
+				// than kept as a local statistic nobody sees.
+				dropped += d
+				c.lastAsmPartial = asmStats.Partial
+			}
 			c.mu.Unlock()
 			if unparsed > 0 {
 				sh.AddUnparsed(unparsed)
@@ -777,3 +790,45 @@ func (c *traceCollector) flushRaw() {
 // singBoxRawPathFor mirrors the server's virtual path so the cross-check on
 // ingest passes. It is not a file and nothing ever opens it.
 func singBoxRawPathFor(nodeID string) string { return "singbox://" + nodeID }
+
+// expireSessionsLocally drops sessions whose deadline has passed, without
+// waiting to hear it from the server.
+//
+// The agent-side TTL is the whole point of the deadline: a capture must stop
+// even if the control plane disappears mid-capture, which is exactly when the
+// privacy boundary matters most. Previously the set was only rebuilt when a
+// config fetch succeeded, so a server outage at 12:14 left a session that
+// expired at 12:15 running and tagging indefinitely.
+//
+// The server's clock governs the deadline, so its skew relative to this agent
+// is applied before comparing. A server ahead of the agent must not let a
+// session outlive its deadline, and a server behind must not cut one short.
+func (c *traceCollector) expireSessionsLocally(now time.Time) {
+	c.mu.Lock()
+	set := c.policy
+	skew := c.serverSkew
+	c.mu.Unlock()
+
+	next := set.ExpiresNext()
+	if next.IsZero() || now.Add(skew).Before(next) {
+		return
+	}
+	rebuilt := tracepolicy.Build(model.TraceAgentConfig{
+		Policy:   set.Policy(),
+		Sessions: set.ActiveSessions(),
+	}, now.Add(skew))
+
+	c.mu.Lock()
+	c.policy = rebuilt
+	want := rebuilt.SubscribeLevel()
+	have := c.haveLevel
+	cfg := c.cfg
+	c.mu.Unlock()
+
+	if want != have {
+		// Expiry can lower the subscription, and leaving it high would keep
+		// collecting at a verbosity nobody is authorised for any more.
+		debugf(cfg, "trace: a session expired locally; dropping the subscription from %s to %s", have, want)
+		c.restartStream(cfg, want, len(rebuilt.ActiveSessions()))
+	}
+}

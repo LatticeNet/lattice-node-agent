@@ -465,6 +465,13 @@ func (a *Assembler) apply(c *conn, l singboxlog.Line, at time.Time) {
 		// address and stays UserKindUnnamed rather than borrowing a name.
 		a.finish(c, closeCandidate{reason: model.CloseAuthFailed, err: l.Error, rank: rankTerminal}, at, durFromCore)
 
+	case singboxlog.EventHandshakeFailed:
+		// Terminal, and specifically NOT an authentication failure: the
+		// transport never came up, so no credential was ever judged. Saying
+		// auth_failed here sends an operator to debug a user that presented
+		// nothing.
+		a.finish(c, closeCandidate{reason: model.CloseHandshakeFailed, err: l.Error, rank: rankTerminal}, at, durFromCore)
+
 	case singboxlog.EventConnectionClosed:
 		a.finish(c, closeCandidate{reason: closeReasonFor(l.Error, model.CloseEOF), err: l.Error, rank: rankTerminal}, at, durFromCore)
 

@@ -60,6 +60,12 @@ const (
 	// EventAuthFailed is "process connection from src: err". No user is known at
 	// this point, by construction, so it can only ever be attributed to Src.
 	EventAuthFailed Event = "auth_failed"
+	// EventHandshakeFailed is terminal: the transport never came up. sing-box
+	// words it as "connection <direction> handshake: <err>" on the copy path,
+	// and as a TLS handshake error inside the inbound's own failure line.
+	// Modelling it separately matters because the alternative is sending an
+	// operator to debug a credential that was never rejected.
+	EventHandshakeFailed Event = "handshake_failed"
 	// EventOther parsed structurally but is not a modelled message.
 	EventOther Event = "other"
 )

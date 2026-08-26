@@ -154,6 +154,15 @@ func (s Set) Match(l singboxlog.Line, user, dstHost string) Decision {
 // ActiveSessions returns the sessions that survived the expiry cut, sorted by
 // id. The slice is a copy: a caller that reports session stats must not be
 // able to reach back into the policy it was handed.
+// Policy returns the node policy this set was built from, so a caller can
+// rebuild the set locally when a session expires without a fresh config fetch.
+func (s Set) Policy() model.TracePolicy {
+	return model.TracePolicy{
+		Enabled: s.nodeEnabled,
+		Level:   s.nodeLevel,
+	}
+}
+
 func (s Set) ActiveSessions() []model.TraceAgentSession {
 	if len(s.sessions) == 0 {
 		return nil
