@@ -97,12 +97,97 @@ type traceCollector struct {
 	// without waiting for a level change to rebuild the stream.
 	budget int
 
+	// pending holds the opening lines of connections whose identity is not
+	// known yet. A session filtered by user cannot match "inbound connection
+	// from" because the user only appears on the NEXT line, so without this the
+	// captured chain would always start one line late and lose the source
+	// address. Bounded on both axes: a few lines per connection, a few hundred
+	// connections, oldest evicted first.
+	pending      map[uint32][]model.TraceLine
+	pendingOrder []uint32
+	// tagged marks connections already claimed by a session, so their later
+	// lines go straight out instead of buffering again.
+	tagged map[uint32][]string
+
 	unparsed uint64
 	dropped  uint64
 }
 
+const (
+	// tracePendingPerConn and tracePendingConns bound the pre-identity buffer.
+	// Eight lines is more than a connection emits before its user is known;
+	// the connection cap is what stops a flood of half-open connections from
+	// growing it without limit.
+	tracePendingPerConn = 8
+	tracePendingConns   = 512
+)
+
 func newTraceCollector(cfg agentConfig) *traceCollector {
-	return &traceCollector{cfg: cfg, generation: 1}
+	return &traceCollector{
+		cfg:        cfg,
+		generation: 1,
+		pending:    map[uint32][]model.TraceLine{},
+		tagged:     map[uint32][]string{},
+	}
+}
+
+// bufferPending remembers a line whose connection has not been claimed yet.
+func (c *traceCollector) bufferPending(logID uint32, l model.TraceLine) {
+	if _, done := c.tagged[logID]; done {
+		return
+	}
+	if _, ok := c.pending[logID]; !ok {
+		if len(c.pendingOrder) >= tracePendingConns {
+			oldest := c.pendingOrder[0]
+			c.pendingOrder = c.pendingOrder[1:]
+			delete(c.pending, oldest)
+		}
+		c.pendingOrder = append(c.pendingOrder, logID)
+	}
+	q := c.pending[logID]
+	if len(q) >= tracePendingPerConn {
+		return
+	}
+	c.pending[logID] = append(q, l)
+}
+
+// claimPending marks a connection captured and returns the opening lines that
+// were waiting for it, stamped with the sessions that claimed it.
+func (c *traceCollector) claimPending(logID uint32, sessionIDs []string) []model.TraceLine {
+	if _, done := c.tagged[logID]; done {
+		return nil
+	}
+	c.tagged[logID] = sessionIDs
+	q := c.pending[logID]
+	delete(c.pending, logID)
+	for i, id := range c.pendingOrder {
+		if id == logID {
+			c.pendingOrder = append(c.pendingOrder[:i], c.pendingOrder[i+1:]...)
+			break
+		}
+	}
+	out := make([]model.TraceLine, 0, len(q)*len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		for _, l := range q {
+			l.SessionID = sessionID
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// forgetConn drops per-connection bookkeeping once its record has been emitted.
+func (c *traceCollector) forgetConn(logID uint32) {
+	delete(c.tagged, logID)
+	if _, ok := c.pending[logID]; ok {
+		delete(c.pending, logID)
+		for i, id := range c.pendingOrder {
+			if id == logID {
+				c.pendingOrder = append(c.pendingOrder[:i], c.pendingOrder[i+1:]...)
+				break
+			}
+		}
+	}
 }
 
 // reconcile is called once per agent poll cycle. It fetches the node's trace
@@ -357,22 +442,79 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 		if sh == nil {
 			return
 		}
-		decision := set.Match(line, line.User, line.DstHost)
-		if !decision.Keep || len(decision.SessionIDs) == 0 {
+		// Match against the CONNECTION, not the line.
+		//
+		// A session filtered by user or destination can only ever match the one
+		// authenticated inbound line that carries them. The rule, sniff,
+		// outbound and close lines for the same connection carry neither, so
+		// matching per line would keep the predicate's echo and throw away the
+		// evidence chain the operator actually asked for. The assembler knows
+		// what the connection is; ask it.
+		user, dstHost := line.User, line.DstHost
+		if line.HasLogID {
+			if ctxInfo := asm.Context(line.LogID); ctxInfo.Known {
+				if ctxInfo.User != "" {
+					user = ctxInfo.User
+				}
+				if ctxInfo.DstHost != "" {
+					dstHost = ctxInfo.DstHost
+				}
+			}
+		}
+		decision := set.Match(line, user, dstHost)
+
+		base := model.TraceLine{
+			NodeID:  nodeID,
+			At:      now,
+			Level:   line.Level,
+			LogID:   line.LogID,
+			Tag:     line.Tag,
+			Message: line.Message,
+			Raw:     line.Raw,
+		}
+
+		c.mu.Lock()
+		claimed, alreadyTagged := c.tagged[line.LogID]
+		if line.HasLogID && !alreadyTagged && len(decision.SessionIDs) == 0 {
+			// Identity is not resolved yet. Hold the line so the chain can
+			// still start at the beginning if a session claims the connection
+			// on the very next line.
+			c.bufferPending(line.LogID, base)
+			c.mu.Unlock()
 			return
 		}
-		for _, sessionID := range decision.SessionIDs {
-			sh.AddLines([]model.TraceLine{{
-				SessionID: sessionID,
-				NodeID:    nodeID,
-				At:        now,
-				Level:     line.Level,
-				LogID:     line.LogID,
-				Tag:       line.Tag,
-				Message:   line.Message,
-				Raw:       line.Raw,
-			}})
+		sessions := decision.SessionIDs
+		var backlog []model.TraceLine
+		if line.HasLogID {
+			if alreadyTagged {
+				// Membership is the connection's, so every later line rides on
+				// it even when the line itself carries no matchable field.
+				sessions = claimed
+			} else if len(sessions) > 0 {
+				backlog = c.claimPending(line.LogID, sessions)
+			}
 		}
+		c.mu.Unlock()
+
+		if line.HasLogID && len(sessions) > 0 && !alreadyTagged {
+			asm.Tag(line.LogID, sessions)
+		}
+		if len(backlog) > 0 {
+			sh.AddLines(backlog)
+		}
+		if !decision.Keep && !alreadyTagged {
+			return
+		}
+		if len(sessions) == 0 {
+			return
+		}
+		out := make([]model.TraceLine, 0, len(sessions))
+		for _, sessionID := range sessions {
+			l := base
+			l.SessionID = sessionID
+			out = append(out, l)
+		}
+		sh.AddLines(out)
 	}
 
 	onError := func(err error) {
@@ -484,6 +626,16 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 		case now := <-ticker.C:
 			asm.Tick(now.UTC())
 			if records := asm.Drain(); len(records) > 0 {
+				// A finished connection will send no more lines, so its
+				// buffering state can go. Open snapshots are not final and keep
+				// theirs.
+				c.mu.Lock()
+				for _, r := range records {
+					if !r.Open {
+						c.forgetConn(r.LogID)
+					}
+				}
+				c.mu.Unlock()
 				sh.AddRecords(records)
 			}
 			c.mu.Lock()

@@ -35,6 +35,7 @@ package sessionasm
 import (
 	"container/list"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -208,9 +209,26 @@ type conn struct {
 	// which is an authoritative and level independent statement that it ended.
 	lastSnapSeq uint64
 
+	// sessions are the capture sessions that claimed this CONNECTION, not the
+	// individual line that happened to match. A session filtered by user or
+	// destination can only match the one line that carries them; the rule,
+	// sniff, outbound and close lines carry neither. Holding membership on the
+	// connection is what turns a single matching line into the whole evidence
+	// chain, and what lets the record be found by session at all.
+	sessions []string
+
 	lastEmitAt time.Time // last open snapshot, initialised to StartedAt
 	srcKey     string
 	elem       *list.Element // position in the insertion ordered list, for O(1) eviction
+}
+
+// ConnContext is what a caller needs to decide whether a capture session wants
+// a connection. It is resolved from the whole connection, not from one line.
+type ConnContext struct {
+	User       string
+	DstHost    string
+	InboundTag string
+	Known      bool
 }
 
 // Assembler turns lines and snapshots into records.
@@ -701,6 +719,7 @@ func (a *Assembler) Tick(now time.Time) {
 // the final record would.
 func (a *Assembler) emitOpen(c *conn, now time.Time) {
 	rec := c.rec
+	rec.SessionIDs = append([]string(nil), c.sessions...)
 	rec.Open = true
 	rec.CoreGeneration = a.gen
 	// The connection has not ended, so its close reason is genuinely not known
@@ -735,6 +754,7 @@ const (
 // finish emits a connection's final record and stops tracking it.
 func (a *Assembler) finish(c *conn, cand closeCandidate, endedAt time.Time, src durationSource) {
 	rec := c.rec
+	rec.SessionIDs = append([]string(nil), c.sessions...)
 	rec.Open = false
 	rec.EndedAt = endedAt
 	rec.CoreGeneration = a.gen
@@ -863,6 +883,55 @@ func (a *Assembler) Stats() Stats {
 // push queues a record. The queue is unbounded on purpose: backpressure and
 // the drop budget belong to traceship, which is the component that knows what
 // the server is accepting. Drain has to be called regularly.
+// Context returns what is currently known about a connection, so a caller can
+// evaluate session predicates against the connection rather than against a
+// single line that almost never carries them.
+func (a *Assembler) Context(logID uint32) ConnContext {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c, ok := a.open[logID]
+	if !ok {
+		return ConnContext{}
+	}
+	return ConnContext{
+		User:       c.rec.UserName,
+		DstHost:    c.rec.DstHost,
+		InboundTag: c.rec.InboundTag,
+		Known:      true,
+	}
+}
+
+// Tag records that these capture sessions claimed the connection. It is a set
+// union, so a session that matches on several of a connection's lines is still
+// recorded once, and later lines inherit the membership decided earlier.
+func (a *Assembler) Tag(logID uint32, sessionIDs []string) {
+	if len(sessionIDs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c, ok := a.open[logID]
+	if !ok {
+		return
+	}
+	for _, id := range sessionIDs {
+		if id == "" || containsSession(c.sessions, id) {
+			continue
+		}
+		c.sessions = append(c.sessions, id)
+	}
+	sort.Strings(c.sessions)
+}
+
+func containsSession(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *Assembler) push(rec model.ConnRecord) {
 	a.out = append(a.out, rec)
 	a.stats.Emitted++

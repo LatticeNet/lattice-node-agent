@@ -1095,3 +1095,71 @@ func TestHalfCloseDoesNotFinaliseAConnectionStillInTheTable(t *testing.T) {
 		t.Fatalf("the final record lost the sampled bytes: known=%v down=%d", final[0].BytesKnown, final[0].Download)
 	}
 }
+
+// Session membership belongs to the connection and reaches the record.
+//
+// Without it, /api/trace/connections?session_id= finds nothing and the detail
+// drawer cannot walk from a record to the lines captured for it, so a filtered
+// capture produces raw lines that nothing can be joined to.
+func TestSessionMembershipReachesTheRecord(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	clock := now
+	a := New(Options{NodeID: "n1", Now: func() time.Time { return clock }})
+
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 55,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.3", SrcPort: 9,
+	})
+	// Context is resolvable only after the authenticated line.
+	if got := a.Context(55); got.User != "" {
+		t.Fatalf("user known too early: %q", got.User)
+	}
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 55,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundTo, User: "u_aaaabbbbccccdddd",
+		DstHost: "example.com", DstPort: 443,
+	})
+	ctx := a.Context(55)
+	if ctx.User != "u_aaaabbbbccccdddd" || ctx.DstHost != "example.com" || !ctx.Known {
+		t.Fatalf("connection context wrong: %+v", ctx)
+	}
+
+	a.Tag(55, []string{"sess-b", "sess-a"})
+	a.Tag(55, []string{"sess-a"}) // idempotent
+
+	a.Line(singboxlog.Line{
+		At: clock, Level: "debug", HasLogID: true, LogID: 55,
+		TagKind: singboxlog.TagConnection, Event: singboxlog.EventFinished,
+		Direction: singboxlog.DirectionDownload, ElapsedMS: 10,
+	})
+	clock = clock.Add(5 * time.Second)
+	a.Tick(clock)
+
+	var final *model.ConnRecord
+	for _, r := range a.Drain() {
+		if !r.Open {
+			rec := r
+			final = &rec
+		}
+	}
+	if final == nil {
+		t.Fatal("no final record")
+	}
+	if len(final.SessionIDs) != 2 || final.SessionIDs[0] != "sess-a" || final.SessionIDs[1] != "sess-b" {
+		t.Fatalf("record session membership = %v; want [sess-a sess-b] deduped and sorted", final.SessionIDs)
+	}
+}
+
+// Tagging a connection that is not open must not panic or invent one.
+func TestTagUnknownConnectionIsANoop(t *testing.T) {
+	a := New(Options{NodeID: "n1"})
+	a.Tag(9999, []string{"s"})
+	if got := a.Stats().Open; got != 0 {
+		t.Fatalf("tagging an unknown id created %d connections", got)
+	}
+	if ctx := a.Context(9999); ctx.Known {
+		t.Fatal("context for an unknown id claims to be known")
+	}
+}
