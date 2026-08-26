@@ -65,6 +65,25 @@ func (r *recorder) handler(t *testing.T) http.HandlerFunc {
 	}
 }
 
+// delivered returns the distinct record ids and line sequence numbers the
+// server actually received, so a test can tell a real delivery count from a
+// counter that merely looks right.
+func (r *recorder) delivered() (map[uint32]int, map[uint64]int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	recordSeen := map[uint32]int{}
+	lineSeen := map[uint64]int{}
+	for _, req := range r.requests {
+		for _, rec := range req.batch.Records {
+			recordSeen[rec.LogID]++
+		}
+		for _, l := range req.batch.Lines {
+			lineSeen[l.Seq]++
+		}
+	}
+	return recordSeen, lineSeen
+}
+
 func (r *recorder) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -480,14 +499,33 @@ func TestRunFlushesAndStopsOnContextCancel(t *testing.T) {
 }
 
 func TestConcurrentAddsAndFlushes(t *testing.T) {
-	rec := &recorder{}
-	s := newShipper(t, rec, func(cfg *Config) { cfg.MaxPending = 64 })
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rec := &recorder{respond: func(n int, w http.ResponseWriter) bool {
+		if n == 1 {
+			close(started)
+			<-release
+		}
+		return false
+	}}
+	s := newShipper(t, rec, func(cfg *Config) {
+		cfg.MaxPending = 64
+		cfg.MaxBatchRecords = 8
+		cfg.MaxBatchLines = 8
+		cfg.FlushInterval = time.Millisecond
+	})
+	// One seed item gives the flush loop a batch to hold on the wire while the
+	// writers pile up behind it, so drop pressure during an in-flight ship is
+	// certain here rather than a matter of scheduling luck.
+	s.AddRecords(records(1))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		s.Run(ctx)
 	}()
+	<-started
 
 	var wg sync.WaitGroup
 	for w := range 4 {
@@ -495,8 +533,9 @@ func TestConcurrentAddsAndFlushes(t *testing.T) {
 		go func(base uint32) {
 			defer wg.Done()
 			for i := range uint32(50) {
-				s.AddRecords(records(base*100 + i))
-				s.AddLines(lines(uint64(base*100 + i)))
+				id := 1000 + base*100 + i
+				s.AddRecords(records(id))
+				s.AddLines(lines(uint64(id)))
 				s.AddUnparsed(1)
 				s.SetCore(uint64(base), time.Unix(int64(base), 0).UTC())
 				_ = s.Stats()
@@ -504,20 +543,49 @@ func TestConcurrentAddsAndFlushes(t *testing.T) {
 		}(uint32(w))
 	}
 	wg.Wait()
-	if err := s.Flush(ctx); err != nil {
-		t.Fatalf("final flush: %v", err)
+	close(release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := s.Flush(ctx); err != nil {
+			t.Fatalf("drain flush: %v", err)
+		}
+		if s.Stats().Pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queue never drained: %+v", s.Stats())
+		}
 	}
 	cancel()
 	<-done
 
 	st := s.Stats()
-	// Every record either shipped or was counted as dropped; nothing vanishes
-	// without being counted somewhere.
-	if total := st.ShippedRecords + st.ShippedLines + st.DroppedTotal; total != 400 {
-		t.Fatalf("shipped %d records, %d lines, dropped %d; want 400 accounted for", st.ShippedRecords, st.ShippedLines, st.DroppedTotal)
-	}
 	if st.Pending != 0 {
-		t.Fatalf("pending after the final flush: %+v", st)
+		t.Fatalf("pending after the drain: %+v", st)
+	}
+	// The invariant the package exists for: 401 items went in, and every one
+	// of them is counted exactly once, as shipped or as dropped.
+	const added = 401
+	if total := st.ShippedRecords + st.ShippedLines + st.DroppedTotal; total != added {
+		t.Fatalf("shipped %d records, %d lines, dropped %d; %d items accounted for, want %d",
+			st.ShippedRecords, st.ShippedLines, st.DroppedTotal, total, added)
+	}
+	if st.DroppedTotal == 0 {
+		t.Fatal("no drop pressure was applied; the test no longer exercises the path it exists for")
+	}
+	if st.Unparsed != 0 || st.UnparsedTotal != 200 {
+		t.Fatalf("unparsed counters: %+v", st)
+	}
+
+	// Counted once is not enough on its own: the same item must not have been
+	// delivered twice under a different name.
+	deliveredRecords, deliveredLines := rec.delivered()
+	if uint64(len(deliveredRecords)) != st.ShippedRecords {
+		t.Fatalf("delivered %d distinct records, but the shipper counted %d", len(deliveredRecords), st.ShippedRecords)
+	}
+	if uint64(len(deliveredLines)) != st.ShippedLines {
+		t.Fatalf("delivered %d distinct lines, but the shipper counted %d", len(deliveredLines), st.ShippedLines)
 	}
 }
 
