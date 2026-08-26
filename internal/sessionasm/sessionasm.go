@@ -343,14 +343,24 @@ func (a *Assembler) create(l singboxlog.Line, at time.Time) *conn {
 			LogID:     l.LogID,
 			Network:   networkOf(l),
 			StartedAt: started,
-			// Absent a name on the post auth line this stays unnamed. sing-box
-			// logs an index rather than a name for users vpn-core never named,
-			// and unnamed is the truthful label for that.
-			UserKind: model.UserKindUnnamed,
+			// Which kind of "no user" this is depends on whether the
+			// identity-bearing line was ever going to arrive. A connection
+			// that starts at its inbound line and simply carries no name is
+			// unnamed: sing-box logged an index because vpn-core never named
+			// that user. A connection first seen at routing or outbound never
+			// had a user-bearing line under its id at all, which is what a
+			// multiplexed inner stream looks like, so its identity is
+			// unobserved rather than absent. Set below once it is known.
+			UserKind: model.UserKindUnobserved,
 		},
 		lastSeenAt:    at,
 		lastElapsedMS: l.ElapsedMS,
 		lastEmitAt:    started,
+	}
+	if l.Event == singboxlog.EventInboundFrom || l.Event == singboxlog.EventInboundTo {
+		// The identity-bearing line is this one or the next. If no name turns
+		// up, sing-box genuinely declined to give one.
+		c.rec.UserKind = model.UserKindUnnamed
 	}
 	a.open[l.LogID] = c
 	c.elem = a.order.PushBack(c)

@@ -1163,3 +1163,69 @@ func TestTagUnknownConnectionIsANoop(t *testing.T) {
 		t.Fatal("context for an unknown id claims to be known")
 	}
 }
+
+// A connection whose identity line never existed is unobserved, not unnamed.
+//
+// A multiplexed VLESS transport authenticates the user on the outer connection
+// and sing-box then mints a fresh log id per inner stream, so the inner streams
+// begin at routing or outbound and no user-bearing line ever carries their id.
+// Reporting that as unnamed blames sing-box for declining to name a user it was
+// never asked about, and hides that the feature cannot attribute these.
+func TestMultiplexedInnerStreamIsUnobservedNotUnnamed(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	clock := now
+	a := New(Options{NodeID: "n1", Now: func() time.Time { return clock }})
+
+	// An inner stream: first sighting is the outbound, never an inbound line.
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 700,
+		TagKind: singboxlog.TagOutbound, TagType: "direct", TagName: "out",
+		Event: singboxlog.EventOutboundTo, DstHost: "mux.example", DstPort: 443,
+	})
+	a.Line(singboxlog.Line{
+		At: clock, Level: "debug", HasLogID: true, LogID: 700,
+		TagKind: singboxlog.TagConnection, Event: singboxlog.EventFinished,
+		Direction: singboxlog.DirectionDownload, ElapsedMS: 5,
+	})
+	clock = clock.Add(5 * time.Second)
+	a.Tick(clock)
+
+	var got *model.ConnRecord
+	for _, r := range a.Drain() {
+		if !r.Open {
+			rec := r
+			got = &rec
+		}
+	}
+	if got == nil {
+		t.Fatal("no record emitted for the inner stream")
+	}
+	if got.UserKind != model.UserKindUnobserved {
+		t.Fatalf("user kind = %q, want unobserved: no identity line ever carried this id", got.UserKind)
+	}
+
+	// A real inbound with no name is still unnamed: sing-box was asked and
+	// logged an index.
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 701,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.4", SrcPort: 5,
+	})
+	a.Line(singboxlog.Line{
+		At: clock, Level: "info", HasLogID: true, LogID: 701,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundTo, DstHost: "plain.example", DstPort: 443,
+	})
+	a.Line(singboxlog.Line{
+		At: clock, Level: "debug", HasLogID: true, LogID: 701,
+		TagKind: singboxlog.TagConnection, Event: singboxlog.EventFinished,
+		Direction: singboxlog.DirectionDownload, ElapsedMS: 5,
+	})
+	clock = clock.Add(5 * time.Second)
+	a.Tick(clock)
+	for _, r := range a.Drain() {
+		if !r.Open && r.LogID == 701 && r.UserKind != model.UserKindUnnamed {
+			t.Fatalf("a named-capable inbound with no name = %q, want unnamed", r.UserKind)
+		}
+	}
+}
