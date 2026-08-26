@@ -1,0 +1,31 @@
+{"type":"info","payload":"[2064424212 0ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62010"}
+{"type":"info","payload":"[2064424212 3ms] inbound/mixed[mixed-entry]: inbound connection to 127.0.0.1:18081"}
+{"type":"debug","payload":"[2064424212 4ms] router: match[0] inbound=mixed-entry =\u003e route(chain-to-exit)"}
+{"type":"info","payload":"[2064424212 5ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:18081"}
+{"type":"info","payload":"[2064424212 5ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:18081"}
+{"type":"debug","payload":"[2064424212 11ms] connection: connection download finished"}
+{"type":"trace","payload":"[2064424212 11ms] connection: connection upload closed"}
+{"type":"debug","payload":"[2064424212 11ms] inbound/mixed[mixed-entry]: connection closed: read http request: EOF"}
+{"type":"info","payload":"[3750554524 0ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62013"}
+{"type":"info","payload":"[3750554524 0ms] inbound/mixed[mixed-entry]: inbound connection to localhost:18081"}
+{"type":"debug","payload":"[3750554524 0ms] router: match[0] inbound=mixed-entry =\u003e route(chain-to-exit)"}
+{"type":"info","payload":"[3750554524 0ms] outbound/vless[chain-to-exit]: outbound connection to localhost:18081"}
+{"type":"info","payload":"[3750554524 0ms] outbound/vless[chain-to-exit]: outbound connection to localhost:18081"}
+{"type":"debug","payload":"[3750554524 2ms] connection: connection download finished"}
+{"type":"trace","payload":"[3750554524 2ms] connection: connection upload closed"}
+{"type":"debug","payload":"[3750554524 2ms] inbound/mixed[mixed-entry]: connection closed: read http request: EOF"}
+{"type":"info","payload":"[3101221041 0ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62016"}
+{"type":"info","payload":"[3101221041 0ms] inbound/mixed[mixed-entry]: inbound connection to 127.0.0.1:19999"}
+{"type":"debug","payload":"[3101221041 0ms] router: match[0] inbound=mixed-entry =\u003e route(chain-to-exit)"}
+{"type":"info","payload":"[3101221041 0ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:19999"}
+{"type":"info","payload":"[3101221041 0ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:19999"}
+{"type":"trace","payload":"[3101221041 0ms] connection: connection download closed"}
+{"type":"trace","payload":"[3101221041 0ms] connection: connection upload closed"}
+{"type":"debug","payload":"[3101221041 0ms] inbound/mixed[mixed-entry]: connection closed: (io: read/write on closed pipe | Get \"http://127.0.0.1:19999/\": EOF)"}
+{"type":"info","payload":"[3575763107 0ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62019"}
+{"type":"info","payload":"[3575763107 0ms] inbound/mixed[mixed-entry]: inbound connection to example.com:443"}
+{"type":"debug","payload":"[3575763107 0ms] router: match[0] inbound=mixed-entry =\u003e route(chain-to-exit)"}
+{"type":"info","payload":"[3575763107 0ms] outbound/vless[chain-to-exit]: outbound connection to example.com:443"}
+{"type":"info","payload":"[3575763107 0ms] outbound/vless[chain-to-exit]: outbound connection to example.com:443"}
+{"type":"trace","payload":"[3575763107 1.4s] connection: connection download closed"}
+{"type":"debug","payload":"[3575763107 1.4s] connection: connection upload finished"}

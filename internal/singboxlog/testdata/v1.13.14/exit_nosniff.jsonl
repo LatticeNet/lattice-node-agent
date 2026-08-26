@@ -1,0 +1,31 @@
+{"type":"info","payload":"[291839386 0ms] inbound/vless[vless-exit]: inbound connection from 127.0.0.1:62011"}
+{"type":"info","payload":"[291839386 1ms] inbound/vless[vless-exit]: [u_a1b2c3d4e5f60718] inbound connection to 127.0.0.1:18081"}
+{"type":"info","payload":"[291839386 2ms] outbound/direct[direct-out]: outbound connection to 127.0.0.1:18081"}
+{"type":"trace","payload":"[291839386 5ms] connection: connection upload closed"}
+{"type":"debug","payload":"[291839386 5ms] connection: connection download finished"}
+{"type":"info","payload":"[228733835 0ms] inbound/vless[vless-exit]: inbound connection from 127.0.0.1:62014"}
+{"type":"info","payload":"[228733835 0ms] inbound/vless[vless-exit]: [u_a1b2c3d4e5f60718] inbound connection to localhost:18081"}
+{"type":"info","payload":"[228733835 0ms] outbound/direct[direct-out]: outbound connection to localhost:18081"}
+{"type":"debug","payload":"[228733835 0ms] dns: lookup domain localhost"}
+{"type":"debug","payload":"[228733835 1ms] dns: exchanged localhost NOERROR 600"}
+{"type":"debug","payload":"[228733835 1ms] dns: exchanged localhost NOERROR 600"}
+{"type":"debug","payload":"[228733835 1ms] dns: exchanged A localhost. 600 IN A 127.0.0.1"}
+{"type":"debug","payload":"[228733835 1ms] dns: exchanged AAAA localhost. 600 IN AAAA ::1"}
+{"type":"debug","payload":"[228733835 1ms] dns: lookup succeed for localhost: 127.0.0.1 ::1"}
+{"type":"trace","payload":"[228733835 2ms] connection: connection upload closed"}
+{"type":"debug","payload":"[228733835 2ms] connection: connection download finished"}
+{"type":"info","payload":"[2099970926 0ms] inbound/vless[vless-exit]: inbound connection from 127.0.0.1:62017"}
+{"type":"info","payload":"[2099970926 0ms] inbound/vless[vless-exit]: [u_a1b2c3d4e5f60718] inbound connection to 127.0.0.1:19999"}
+{"type":"info","payload":"[2099970926 0ms] outbound/direct[direct-out]: outbound connection to 127.0.0.1:19999"}
+{"type":"error","payload":"[2099970926 0ms] connection: open connection to 127.0.0.1:19999 using outbound/direct[direct-out]: dial tcp 127.0.0.1:19999: connect: connection refused"}
+{"type":"info","payload":"[3281277749 0ms] inbound/vless[vless-exit]: inbound connection from 127.0.0.1:62020"}
+{"type":"info","payload":"[3281277749 0ms] inbound/vless[vless-exit]: [u_a1b2c3d4e5f60718] inbound connection to example.com:443"}
+{"type":"info","payload":"[3281277749 0ms] outbound/direct[direct-out]: outbound connection to example.com:443"}
+{"type":"debug","payload":"[3281277749 0ms] dns: lookup domain example.com"}
+{"type":"debug","payload":"[3281277749 2ms] dns: exchanged example.com NOERROR 0"}
+{"type":"debug","payload":"[3281277749 100ms] dns: exchanged example.com NOERROR 105"}
+{"type":"debug","payload":"[3281277749 100ms] dns: exchanged A example.com. 105 IN A 172.66.147.243"}
+{"type":"debug","payload":"[3281277749 100ms] dns: exchanged A example.com. 105 IN A 104.20.23.154"}
+{"type":"debug","payload":"[3281277749 100ms] dns: lookup succeed for example.com: 172.66.147.243 104.20.23.154"}
+{"type":"trace","payload":"[3281277749 1.4s] connection: connection download closed"}
+{"type":"debug","payload":"[3281277749 1.4s] connection: connection upload finished"}

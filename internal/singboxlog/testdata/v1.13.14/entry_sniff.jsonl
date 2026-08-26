@@ -1,0 +1,19 @@
+{"type":"info","payload":"[411327584 3ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62414"}
+{"type":"info","payload":"[3872684616 0ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62415"}
+{"type":"info","payload":"[411327584 9ms] inbound/mixed[mixed-entry]: inbound connection to example.com:443"}
+{"type":"debug","payload":"[411327584 10ms] router: match[0] =\u003e sniff"}
+{"type":"info","payload":"[3872684616 7ms] inbound/mixed[mixed-entry]: inbound connection to 127.0.0.1:18081"}
+{"type":"debug","payload":"[3872684616 7ms] router: match[0] =\u003e sniff"}
+{"type":"debug","payload":"[3872684616 8ms] router: sniffed protocol: http, domain: 127.0.0.1"}
+{"type":"debug","payload":"[3872684616 8ms] router: match[2] inbound=mixed-entry =\u003e route(chain-to-exit)"}
+{"type":"info","payload":"[3872684616 8ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:18081"}
+{"type":"info","payload":"[3872684616 8ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:18081"}
+{"type":"debug","payload":"[411327584 14ms] router: sniffed protocol: tls, domain: example.com"}
+{"type":"debug","payload":"[411327584 14ms] router: match[1] inbound=mixed-entry domain_suffix=example.com =\u003e route(chain-to-exit)"}
+{"type":"info","payload":"[411327584 14ms] outbound/vless[chain-to-exit]: outbound connection to example.com:443"}
+{"type":"info","payload":"[411327584 14ms] outbound/vless[chain-to-exit]: outbound connection to example.com:443"}
+{"type":"debug","payload":"[3872684616 16ms] connection: connection download finished"}
+{"type":"trace","payload":"[3872684616 16ms] connection: connection upload closed"}
+{"type":"debug","payload":"[3872684616 18ms] inbound/mixed[mixed-entry]: connection closed: read http request: EOF"}
+{"type":"trace","payload":"[411327584 1.26s] connection: connection download closed"}
+{"type":"debug","payload":"[411327584 1.26s] connection: connection upload finished"}

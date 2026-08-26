@@ -444,6 +444,8 @@ func main() {
 	}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
+	traceCollector := newTraceCollector(cfg)
+	defer traceCollector.stop()
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -482,6 +484,7 @@ func main() {
 		} else {
 			logTailers.reconcile(sources)
 		}
+		traceCollector.reconcile(context.Background(), cfg)
 		debugf(cfg, "poll cycle complete")
 		if err := flushDebugEvents(cfg); err != nil {
 			log.Printf("debug event report error: %v", err)
