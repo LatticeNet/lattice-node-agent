@@ -47,9 +47,13 @@ func (r *countingTaskRunner) Run(task model.Task) model.TaskResult {
 	return result
 }
 
+// The version an agent reports must be exactly the tag it was released under:
+// the server matches update targets against it, so a stale constant makes a
+// node look like it never took the update it just took. Pinning it here means
+// the bump is a deliberate edit rather than something that drifts.
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.4-alpha.1" {
-		t.Fatalf("version = %q, want 0.3.4-alpha.1", version)
+	if version != "0.3.5-alpha.1" {
+		t.Fatalf("version = %q, want 0.3.5-alpha.1", version)
 	}
 }
 
