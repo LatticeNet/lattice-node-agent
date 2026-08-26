@@ -337,6 +337,15 @@ func (s *Shipper) takeBatch() (model.TraceBatch, bool) {
 	}
 	recordN := min(len(s.records), s.maxBatchRecords)
 	lineN := min(len(s.lines), s.maxBatchLines)
+	// Also bound the batch by SIZE, not only by count.
+	//
+	// Individual lines can be large, so a handful of them can exceed the
+	// server's body cap. That produces a permanent 413, and because a failure
+	// holds position the same oversized head is retried forever and every item
+	// behind it never ships. Trimming to a byte budget keeps the queue moving;
+	// a single item that cannot fit on its own is still sent alone, so the
+	// server rejects one item rather than the queue wedging on it.
+	recordN, lineN = s.trimToByteBudget(recordN, lineN)
 	// An empty batch is still worth sending when counters are owed: drops that
 	// stopped the flow entirely would otherwise never be reported.
 	if recordN == 0 && lineN == 0 && s.dropped == 0 && s.unparsed == 0 {
@@ -515,4 +524,36 @@ func saturatingSub(a, b uint64) uint64 {
 		return 0
 	}
 	return a - b
+}
+
+// maxBatchBytes is the encoded-size budget for one request. It sits well under
+// the server's body cap so that JSON overhead cannot push a legal batch over.
+const maxBatchBytes = 4 << 20
+
+// trimToByteBudget reduces the head counts until their approximate encoded size
+// fits the budget, always leaving at least one item so the queue can drain even
+// when a single item is oversized on its own.
+func (s *Shipper) trimToByteBudget(recordN, lineN int) (int, int) {
+	size := 0
+	keptRecords := 0
+	for i := 0; i < recordN; i++ {
+		r := s.records[i]
+		n := len(r.DstHost) + len(r.CloseError) + len(r.RuleText) + len(r.UserName) + 256
+		if size+n > maxBatchBytes && keptRecords > 0 {
+			break
+		}
+		size += n
+		keptRecords++
+	}
+	keptLines := 0
+	for i := 0; i < lineN; i++ {
+		l := s.lines[i]
+		n := len(l.Message) + len(l.Raw) + len(l.Tag) + 128
+		if size+n > maxBatchBytes && keptRecords+keptLines > 0 {
+			break
+		}
+		size += n
+		keptLines++
+	}
+	return keptRecords, keptLines
 }
