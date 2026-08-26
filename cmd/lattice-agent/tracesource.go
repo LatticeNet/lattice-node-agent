@@ -111,10 +111,10 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 	// Either nothing is running, or the level moved. Both mean a fresh stream,
 	// because a Clash API log subscription fixes its level at open time.
 	c.stop()
-	c.start(ctx, cfg, addr, secretPath, set.SubscribeLevel(), agentCfg.Policy)
+	c.start(ctx, cfg, addr, secretPath, set.SubscribeLevel(), agentCfg.Policy, len(set.ActiveSessions()))
 }
 
-func (c *traceCollector) start(ctx context.Context, cfg agentConfig, addr, secretPath string, level model.TraceLevel, pol model.TracePolicy) {
+func (c *traceCollector) start(ctx context.Context, cfg agentConfig, addr, secretPath string, level model.TraceLevel, pol model.TracePolicy, sessionCount int) {
 	secret, err := resolveClashSecret(secretPath, cfg)
 	if err != nil {
 		log.Printf("trace: cannot read the Clash API secret: %v", err)
@@ -150,6 +150,12 @@ func (c *traceCollector) start(ctx context.Context, cfg agentConfig, addr, secre
 	c.mu.Unlock()
 
 	shipper.SetCore(generation, coreStart)
+
+	// Say what changed. An operator raising a node to trace needs to see that
+	// the subscription actually moved, and this is the only place that knows
+	// the level, the budget and how many sessions are riding on it.
+	debugf(cfg, "trace: subscribed to %s at level=%s budget=%d lines/s sessions=%d generation=%d",
+		addr, level, budget, sessionCount, generation)
 
 	go shipper.Run(streamCtx)
 	go c.pollConnections(streamCtx, client, asm)
