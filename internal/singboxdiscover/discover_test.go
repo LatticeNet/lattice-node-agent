@@ -432,7 +432,9 @@ func TestDiscoverSidecarCorruptLogsAndContinues(t *testing.T) {
 			if path == "/etc/sing-box/lattice-metadata.json" {
 				return []byte(`{"schema":"lattice.singbox-metadata.v2","inbounds":[broken`), nil
 			}
-			return nil, errors.New("unexpected read: " + path)
+			// The endpoints file is read from the same seam. Most nodes do not
+			// have one, and this case is about the sidecar.
+			return nil, os.ErrNotExist
 		},
 		Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
 	}
@@ -454,8 +456,14 @@ func TestDiscoverSidecarReadPermissionErrorLogsAndContinues(t *testing.T) {
 		MetaPath:     "/etc/sing-box/lattice-metadata.json",
 		runner:       listOnlyRunner(t, sidecarTestList),
 		runtimeFiles: func() []string { return nil },
-		readFile: func(string) ([]byte, error) {
-			return nil, os.ErrPermission
+		// Only the sidecar is unreadable here. Answering permission-denied for
+		// every path would also trip the endpoints reader and make this assert
+		// on two warnings for one fault.
+		readFile: func(path string) ([]byte, error) {
+			if strings.Contains(path, "lattice-metadata.json") {
+				return nil, os.ErrPermission
+			}
+			return nil, os.ErrNotExist
 		},
 		Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
 	}
@@ -485,8 +493,15 @@ func TestDiscoverSidecarInvalidV2IsRejectedAtomically(t *testing.T) {
 				MetaPath:     "/meta.json",
 				runner:       listOnlyRunner(t, sidecarTestList),
 				runtimeFiles: func() []string { return nil },
-				readFile:     func(string) ([]byte, error) { return []byte(tc.raw), nil },
-				Logf:         func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+				// Answer per path: this case is about the sidecar, and most
+				// nodes have no endpoints file at all.
+				readFile: func(path string) ([]byte, error) {
+					if path == "/meta.json" {
+						return []byte(tc.raw), nil
+					}
+					return nil, os.ErrNotExist
+				},
+				Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
 			}
 			inv, err := Discover(context.Background(), src, "node-invalid")
 			if err != nil || inv.Nodes[0].LineUUID != "" || inv.Nodes[0].DownstreamLineUUID != "" {
@@ -713,5 +728,146 @@ func TestInspectUsesAggregateDeadlineAndBoundedConcurrency(t *testing.T) {
 	}
 	if peak < 2 || peak > maxInspectWorkers {
 		t.Fatalf("inspect concurrency peak = %d, want 2..%d", peak, maxInspectWorkers)
+	}
+}
+
+// TestApplyNodeEndpoints covers the node-owned endpoint declaration.
+//
+// A NAT node listens on one port while the world dials another, and nothing in
+// its sing-box config says so: the mapping lives in the provider's router.
+// Without this the inventory reports the listen port as though it were
+// reachable, and a chain built on it dials a closed door.
+func TestApplyNodeEndpoints(t *testing.T) {
+	const doc = `{
+	  "schema": "lattice.node-endpoints.v1",
+	  "network": "nat",
+	  "public_host": "jp.nat.example.org",
+	  "inbounds": [
+	    {"tag": "VLESS-REALITY-488.json", "listen_port": 488, "public_port": 50100},
+	    {"tag": "Hysteria2-7890.json", "listen_port": 7890, "public_port": 50101,
+	     "public_host": "alt.example.org"}
+	  ]
+	}`
+	src := Source{
+		EndpointsPath: "/etc/sing-box/lattice-endpoints.json",
+		readFile:      func(string) ([]byte, error) { return []byte(doc), nil },
+	}
+	inv := model.SingBoxInventory{Nodes: []model.SingBoxNode{
+		{Name: "VLESS-REALITY-488.json", Address: "203.0.113.1", Port: "488"},
+		{Name: "Hysteria2-7890.json", Address: "203.0.113.1", Port: "7890"},
+		{Name: "Unlisted.json", Address: "203.0.113.1", Port: "9000"},
+	}}
+	applyNodeEndpoints(src, &inv)
+
+	if inv.Network != "nat" {
+		t.Fatalf("network = %q, want nat", inv.Network)
+	}
+	if got := inv.Nodes[0].PublicPort; got != "50100" {
+		t.Fatalf("public port = %q, want 50100", got)
+	}
+	if got := inv.Nodes[0].Address; got != "jp.nat.example.org" {
+		t.Fatalf("address should fall back to the document host, got %q", got)
+	}
+	if got := inv.Nodes[1].Address; got != "alt.example.org" {
+		t.Fatalf("a per-inbound host must win over the document host, got %q", got)
+	}
+	// An inbound the file does not mention keeps its listen port as public: most
+	// nodes are reached where they listen, and silence is the right answer.
+	if got := inv.Nodes[2].PublicPort; got != "" {
+		t.Fatalf("unlisted inbound got a public port: %q", got)
+	}
+	if got := inv.Nodes[2].Address; got != "jp.nat.example.org" {
+		t.Fatalf("unlisted inbound should still take the node-wide host, got %q", got)
+	}
+}
+
+// TestApplyNodeEndpointsIgnoresJunk pins the failure modes: a node without the
+// file is the common case and must not be treated as an error, and a document
+// this agent does not understand must not be half-applied.
+func TestApplyNodeEndpointsIgnoresJunk(t *testing.T) {
+	base := func() model.SingBoxInventory {
+		return model.SingBoxInventory{Nodes: []model.SingBoxNode{
+			{Name: "a.json", Address: "203.0.113.1", Port: "80"},
+		}}
+	}
+	for _, tc := range []struct{ name, body string }{
+		{"wrong schema", `{"schema":"something.else.v9","network":"nat","public_host":"x.example.org"}`},
+		{"not json", `{`},
+		{"empty", ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := base()
+			applyNodeEndpoints(Source{
+				readFile: func(string) ([]byte, error) { return []byte(tc.body), nil },
+				Logf:     func(string, ...any) {},
+			}, &inv)
+			if inv.Network != "" || inv.Nodes[0].Address != "203.0.113.1" || inv.Nodes[0].PublicPort != "" {
+				t.Fatalf("junk was applied: network=%q addr=%q port=%q",
+					inv.Network, inv.Nodes[0].Address, inv.Nodes[0].PublicPort)
+			}
+		})
+	}
+	t.Run("missing file", func(t *testing.T) {
+		inv := base()
+		applyNodeEndpoints(Source{EndpointsPath: "/nonexistent/lattice-endpoints.json"}, &inv)
+		if inv.Nodes[0].Address != "203.0.113.1" {
+			t.Fatalf("a missing file changed the inventory: %q", inv.Nodes[0].Address)
+		}
+	})
+	t.Run("out of range port", func(t *testing.T) {
+		inv := base()
+		applyNodeEndpoints(Source{
+			readFile: func(string) ([]byte, error) {
+				return []byte(`{"schema":"lattice.node-endpoints.v1","inbounds":[{"tag":"a.json","public_port":70000}]}`), nil
+			},
+		}, &inv)
+		if inv.Nodes[0].PublicPort != "" {
+			t.Fatalf("an impossible port was accepted: %q", inv.Nodes[0].PublicPort)
+		}
+	})
+}
+
+// TestDiscoverAppliesNodeEndpoints proves the reader is actually wired into
+// Discover, not merely present. A correct function nobody calls is the failure
+// this pins: the inventory would keep reporting listen ports as public and
+// nothing would look wrong until a chain failed to connect.
+func TestDiscoverAppliesNodeEndpoints(t *testing.T) {
+	const endpoints = `{"schema":"lattice.node-endpoints.v1","network":"nat",
+	  "public_host":"nat.example.org",
+	  "inbounds":[{"tag":"vless-31001","listen_port":31001,"public_port":40001}]}`
+	src := Source{
+		MetaPath:      "/meta.json",
+		EndpointsPath: "/endpoints.json",
+		runner:        listOnlyRunner(t, sidecarTestList),
+		runtimeFiles:  func() []string { return nil },
+		readFile: func(path string) ([]byte, error) {
+			if path == "/endpoints.json" {
+				return []byte(endpoints), nil
+			}
+			return nil, os.ErrNotExist
+		},
+		Logf: func(string, ...any) {},
+	}
+	inv, err := Discover(context.Background(), src, "node-endpoints")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.Network != "nat" {
+		t.Fatalf("Discover did not apply the network type: %q", inv.Network)
+	}
+	var found bool
+	for _, n := range inv.Nodes {
+		if n.Name == "vless-31001" {
+			found = true
+			if n.PublicPort != "40001" {
+				t.Fatalf("Discover did not apply the public port: %q", n.PublicPort)
+			}
+			if n.Address != "nat.example.org" {
+				t.Fatalf("Discover did not apply the public host: %q", n.Address)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("test fixture no longer contains vless-31001")
 	}
 }

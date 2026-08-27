@@ -35,6 +35,12 @@ const (
 	// defaultMetaPath is the design-15 sidecar written by the server/sb next to
 	// (never inside) the sing-box -C directory; sing-box itself never reads it.
 	defaultMetaPath = "/etc/sing-box/lattice-metadata.json"
+	// defaultEndpointsPath is the node's own description of how the outside
+	// reaches it. It is the mirror image of the sidecar above: that file is
+	// written BY the control plane to assign identity, this one is written ON
+	// the node and only read centrally, so a machine that leaves still carries
+	// the mapping its provider gave it.
+	defaultEndpointsPath = "/etc/sing-box/lattice-endpoints.json"
 	// maxInspectCalls bounds the per-line `sb --json inspect <name>` enrichment
 	// so a large fleet cannot stretch the discovery cycle.
 	maxInspectCalls            = 64
@@ -49,6 +55,7 @@ const (
 	// selector fix, but an unbounded read of a file the agent does not own is
 	// still a way to take the agent down with the disk.
 	maxRuntimeConfigBytes = 8 << 20 // 8 MiB
+	nodeEndpointsSchema   = "lattice.node-endpoints.v1"
 )
 
 // Source configures on-box sing-box discovery.
@@ -64,6 +71,9 @@ type Source struct {
 	// MetaPath is the design-15 sidecar path; default
 	// /etc/sing-box/lattice-metadata.json (LATTICE_SINGBOX_META in the agent).
 	MetaPath string
+	// EndpointsPath is the node-owned endpoint declaration; default
+	// /etc/sing-box/lattice-endpoints.json.
+	EndpointsPath string
 	// MaxInspect bounds per-line `sb --json inspect` enrichment calls; default 64.
 	MaxInspect int
 	// Logf receives best-effort degradation notes (unavailable inspect, corrupt
@@ -150,6 +160,7 @@ func Discover(ctx context.Context, source Source, nodeID string) (model.SingBoxI
 	// design-15 sidecar annotations (line_uuid + declared chain edges), joined by
 	// inbound tag. Read-only: a missing/corrupt file never fails discovery.
 	applySingBoxSidecar(source, inv.Nodes)
+	applyNodeEndpoints(source, &inv)
 
 	// Best-effort core version/health; a failure here must not fail discovery.
 	provCtx, cancel2 := context.WithTimeout(ctx, timeout)
@@ -183,6 +194,7 @@ func discoverRuntimeConfig(source Source, nodeID string, at time.Time) (model.Si
 	// The sidecar joins by inbound tag, so the config-fallback path annotates
 	// exactly like the primary path.
 	applySingBoxSidecar(source, inv.Nodes)
+	applyNodeEndpoints(source, &inv)
 	return inv, nil
 }
 
@@ -503,6 +515,85 @@ type singBoxSidecar struct {
 // (node.Name == sidecar inbounds[].tag). Degrades quietly: a missing file or a
 // legacy v1 sidecar leaves every field empty; a corrupt file is logged and
 // skipped. The sidecar is a read-only annotation and must never fail discovery.
+// nodeEndpoints is the node-owned endpoint declaration.
+type nodeEndpoints struct {
+	Schema     string `json:"schema"`
+	Network    string `json:"network"`
+	PublicHost string `json:"public_host"`
+	Inbounds   []struct {
+		Tag        string `json:"tag"`
+		ListenPort int    `json:"listen_port"`
+		PublicPort int    `json:"public_port"`
+		PublicHost string `json:"public_host"`
+	} `json:"inbounds"`
+}
+
+// applyNodeEndpoints annotates the inventory with how the outside reaches this
+// node, and reports the declared network type.
+//
+// Only a NAT node needs it, and only that node can supply it: the port a
+// provider forwards lives in the provider's router, not in any config here, so
+// discovery would otherwise report the listen port as though it were reachable
+// and every chain built on it would dial a closed door.
+//
+// A missing or unreadable file is not an error. Most nodes are reached on the
+// port they listen on, and for them the absence is the correct answer.
+func applyNodeEndpoints(source Source, inv *model.SingBoxInventory) {
+	path := strings.TrimSpace(source.EndpointsPath)
+	if path == "" {
+		path = defaultEndpointsPath
+	}
+	readFn := source.readFile
+	if readFn == nil {
+		readFn = os.ReadFile
+	}
+	raw, err := readFn(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			logf(source, "node endpoints %s unreadable (%v); reporting listen ports as public", path, boundedErr(err))
+		}
+		return
+	}
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return
+	}
+	var doc nodeEndpoints
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		logf(source, "node endpoints %s unreadable (%v); reporting listen ports as public", path, boundedErr(err))
+		return
+	}
+	if doc.Schema != nodeEndpointsSchema {
+		logf(source, "node endpoints %s has schema %q, want %q; ignoring", path, doc.Schema, nodeEndpointsSchema)
+		return
+	}
+	inv.Network = strings.TrimSpace(doc.Network)
+	byTag := map[string]int{}
+	hostByTag := map[string]string{}
+	for _, ib := range doc.Inbounds {
+		tag := strings.TrimSpace(ib.Tag)
+		if tag == "" || ib.PublicPort <= 0 || ib.PublicPort > 65535 {
+			continue
+		}
+		byTag[tag] = ib.PublicPort
+		if h := strings.TrimSpace(ib.PublicHost); h != "" {
+			hostByTag[tag] = h
+		}
+	}
+	fallbackHost := strings.TrimSpace(doc.PublicHost)
+	for i := range inv.Nodes {
+		tag := strings.TrimSpace(inv.Nodes[i].Name)
+		if port, ok := byTag[tag]; ok {
+			inv.Nodes[i].PublicPort = strconv.Itoa(port)
+		}
+		if h, ok := hostByTag[tag]; ok {
+			inv.Nodes[i].Address = h
+		} else if fallbackHost != "" {
+			inv.Nodes[i].Address = fallbackHost
+		}
+	}
+}
+
 func applySingBoxSidecar(source Source, nodes []model.SingBoxNode) {
 	if len(nodes) == 0 {
 		return
