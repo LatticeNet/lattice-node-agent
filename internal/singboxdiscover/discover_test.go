@@ -992,3 +992,62 @@ func TestNoRouteRuleLeavesInspectAnswerAlone(t *testing.T) {
 		t.Fatalf("a direct outbound has no downstream: %+v", n)
 	}
 }
+
+// sing-box accepts a route rule's `inbound` as either one name or a list of
+// them, and both forms appear across this fleet. Typing it as []string only
+// looked like a cosmetic mismatch: the scalar form fails to decode, the whole
+// file is dropped, and its outbounds, route rules and identity block go with
+// it. The lines it declares still arrive from `sb --json list`, so the box
+// looks healthy while one relay quietly has no downstream.
+//
+// This mirrors dmit-eb-wee, where the inbound tag inside the config is also not
+// the file name, so the line is named by file while the rule is written against
+// the tag.
+func TestScalarRouteInboundStillYieldsTheDownstream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		inbound string
+	}{
+		{"scalar", `"inbound-for-aaitr-frontier-nat-vless-7899"`},
+		{"list", `["inbound-for-aaitr-frontier-nat-vless-7899"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"/etc/sing-box/conf/VLESS-REALITY-17893.json": `{
+					"inbounds":[{"tag":"inbound-for-aaitr-frontier-nat-vless-7899","type":"vless","listen":"::","listen_port":17893}],
+					"outbounds":[{"tag":"out-to-aaitr-frontier-nat-vless-7899","type":"vless","server":"nat-us-28tz.aproxy.top","server_port":25499}],
+					"route":{"rules":[{"inbound":` + tc.inbound + `,"outbound":"out-to-aaitr-frontier-nat-vless-7899"}]}
+				}`,
+			}
+			src := Source{
+				Addr: "154.17.233.187",
+				runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+					last := args[len(args)-1]
+					switch last {
+					case "list":
+						return []byte(`{"ok":true,"count":1,"nodes":[{"name":"VLESS-REALITY-17893.json","protocol":"vless","port":"17893"}]}`), nil
+					case "provision":
+						return []byte(`{}`), nil
+					}
+					if len(args) >= 2 && args[len(args)-2] == "inspect" {
+						return []byte(`{"ok":true,"line":{"core":"sing-box","tag":"inbound-for-aaitr-frontier-nat-vless-7899","type":"vless","listen_port":17893,"outbound":{"tag":"out-to-aaitr-frontier-nat-vless-7899","protocol":"vless"}}}`), nil
+					}
+					return nil, errors.New("unexpected: " + strings.Join(args, " "))
+				},
+				runtimeFiles: func() []string { return []string{"/etc/sing-box/conf/VLESS-REALITY-17893.json"} },
+				readFile:     func(p string) ([]byte, error) { return []byte(files[p]), nil },
+			}
+			inv, err := Discover(context.Background(), src, "eb-wee")
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			n := inv.Nodes[0]
+			if n.OutboundServer != "nat-us-28tz.aproxy.top" || n.OutboundPort != "25499" {
+				t.Fatalf("downstream unresolved: server=%q port=%q (whole file likely dropped)", n.OutboundServer, n.OutboundPort)
+			}
+			if n.OutboundRef != "out-to-aaitr-frontier-nat-vless-7899" {
+				t.Fatalf("outbound ref = %q", n.OutboundRef)
+			}
+		})
+	}
+}

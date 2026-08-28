@@ -229,6 +229,11 @@ func loadSingBoxRuntimeConfigFiles(source Source) []singBoxRuntimeConfigFile {
 		}
 		var cfg singBoxRuntimeConfig
 		if err := json.Unmarshal(bytes.TrimSpace(raw), &cfg); err != nil {
+			// Silence here hid a real gap for a long time: a file that does not
+			// decode takes its outbounds, route rules and identity block with
+			// it, while the lines it declares still arrive from `sb --json list`
+			// and look fine.
+			logf(source, "sing-box config %s does not decode (%v); its outbounds and route rules are not visible", path, boundedErr(err))
 			continue
 		}
 		configs = append(configs, singBoxRuntimeConfigFile{path: path, cfg: cfg})
@@ -1069,9 +1074,39 @@ type singBoxRuntimeRoute struct {
 }
 
 type singBoxRuntimeRouteRule struct {
-	Inbound  []string `json:"inbound"`
-	Outbound string   `json:"outbound"`
-	Action   string   `json:"action"`
+	Inbound  singBoxListable `json:"inbound"`
+	Outbound string          `json:"outbound"`
+	Action   string          `json:"action"`
+}
+
+// singBoxListable is a sing-box field that accepts either one value or a list
+// of them. Typing it as a plain []string is not a cosmetic mismatch: the whole
+// file fails to decode, loadSingBoxRuntimeConfigFiles drops it, and with it go
+// that file's outbounds, route rules and identity block. One relay lost its
+// downstream that way while the rest of the box looked healthy, because the
+// line itself still arrived from `sb --json list`.
+type singBoxListable []string
+
+func (l *singBoxListable) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		*l = nil
+		return nil
+	}
+	if data[0] == '[' {
+		var many []string
+		if err := json.Unmarshal(data, &many); err != nil {
+			return err
+		}
+		*l = many
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(data, &one); err != nil {
+		return err
+	}
+	*l = []string{one}
+	return nil
 }
 
 type singBoxRuntimeOutbound struct {
