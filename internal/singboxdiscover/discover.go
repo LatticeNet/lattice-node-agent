@@ -534,7 +534,12 @@ type nodeEndpoints struct {
 	Schema     string `json:"schema"`
 	Network    string `json:"network"`
 	PublicHost string `json:"public_host"`
-	Inbounds   []struct {
+	// ProviderEdge is the hostname the provider forwards from. A relay elsewhere
+	// in the fleet names it as its outbound server, so it is what the control
+	// plane has to match a chain against; the node's own public host never
+	// appears there.
+	ProviderEdge string `json:"provider_edge"`
+	Inbounds     []struct {
 		Tag        string `json:"tag"`
 		ListenPort int    `json:"listen_port"`
 		PublicPort int    `json:"public_port"`
@@ -582,6 +587,7 @@ func applyNodeEndpoints(source Source, inv *model.SingBoxInventory) {
 		return
 	}
 	inv.Network = strings.TrimSpace(doc.Network)
+	inv.ProviderEdge = strings.TrimSpace(doc.ProviderEdge)
 	byTag := map[string]int{}
 	hostByTag := map[string]string{}
 	for _, ib := range doc.Inbounds {

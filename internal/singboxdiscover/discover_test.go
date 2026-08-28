@@ -742,6 +742,7 @@ func TestApplyNodeEndpoints(t *testing.T) {
 	  "schema": "lattice.node-endpoints.v1",
 	  "network": "nat",
 	  "public_host": "jp.nat.example.org",
+	  "provider_edge": "nat-jp-3h8e.aproxy.top",
 	  "inbounds": [
 	    {"tag": "VLESS-REALITY-488.json", "listen_port": 488, "public_port": 50100},
 	    {"tag": "Hysteria2-7890.json", "listen_port": 7890, "public_port": 50101,
@@ -761,6 +762,11 @@ func TestApplyNodeEndpoints(t *testing.T) {
 
 	if inv.Network != "nat" {
 		t.Fatalf("network = %q, want nat", inv.Network)
+	}
+	// A relay names the provider edge as its outbound server, never the node's
+	// own public host, so losing this loses the chain into this node.
+	if inv.ProviderEdge != "nat-jp-3h8e.aproxy.top" {
+		t.Fatalf("provider edge = %q, want nat-jp-3h8e.aproxy.top", inv.ProviderEdge)
 	}
 	if got := inv.Nodes[0].PublicPort; got != "50100" {
 		t.Fatalf("public port = %q, want 50100", got)
