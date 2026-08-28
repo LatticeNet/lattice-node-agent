@@ -52,8 +52,8 @@ func (r *countingTaskRunner) Run(task model.Task) model.TaskResult {
 // node look like it never took the update it just took. Pinning it here means
 // the bump is a deliberate edit rather than something that drifts.
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.7" {
-		t.Fatalf("version = %q, want 0.3.7", version)
+	if version != "0.3.8-alpha.1" {
+		t.Fatalf("version = %q, want 0.3.8-alpha.1", version)
 	}
 }
 
