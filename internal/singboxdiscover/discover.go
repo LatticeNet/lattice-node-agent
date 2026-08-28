@@ -306,10 +306,24 @@ func enrichSingBoxNodesFromConfig(source Source, nodes []model.SingBoxNode) {
 		if tag == "" {
 			continue
 		}
-		if nodes[i].OutboundRef == "" {
-			if ref, ok := routeMap[tag]; ok {
-				nodes[i].OutboundRef = ref
-			}
+		// The route map is merged across every config file on the box, so it
+		// sees the rule that steers this inbound even when the rule lives in a
+		// different file than the inbound itself (a hub keeps its inbounds in
+		// per-line files and its relay rules in a shared fragment). Both weaker
+		// sources read one file at a time and call such a line terminal, so this
+		// has to overrule them rather than only fill a gap.
+		//
+		// It used to only fill a gap, and the inspect pass that runs before this
+		// one is bounded by a call count and a deadline. Which lines inspect
+		// reached varied from cycle to cycle, and so did which lines kept the
+		// correct cross-file answer: the reported outbound flipped between the
+		// relay tag and "direct", which re-rendered the metadata sidecar and
+		// re-queued an approval every time it moved.
+		if ref, ok := routeMap[tag]; ok && ref != "" && nodes[i].OutboundRef != ref {
+			nodes[i].OutboundRef = ref
+			// Derived from the ref just replaced, so it cannot be kept; the
+			// lookup below refills it from the outbound actually in use.
+			nodes[i].OutboundType = ""
 		}
 		if nodes[i].OutboundRef != "" {
 			// outboundMap already zeroes Server/ServerPort for terminal/logical

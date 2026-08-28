@@ -871,3 +871,118 @@ func TestDiscoverAppliesNodeEndpoints(t *testing.T) {
 		t.Fatal("test fixture no longer contains vless-31001")
 	}
 }
+
+// A route rule may live in a different config file than the inbound it steers.
+// `sb --json inspect` reads one file, so on such a box it reports the file's
+// default outbound, "direct", for a line that is really a relay. The route map
+// here is merged across every config file and must overrule that, not merely
+// fill in behind it.
+//
+// The old fill-only order made this cycle-dependent: the inspect pass runs
+// first and is bounded by a call count and a deadline, so which lines it
+// reached varied, and so did which lines kept the correct answer. The reported
+// outbound flipped between the relay tag and "direct" between discoveries, and
+// re-queued a line metadata approval on every flip.
+func TestCrossFileRouteRuleBeatsInspectDirect(t *testing.T) {
+	files := map[string]string{
+		// The inbound file: no route rules of its own, and the second `direct`
+		// outbound is the reality public-key storage slot.
+		"/etc/sing-box/conf/VLESS-REALITY-31009.json": `{
+			"inbounds":[{"tag":"VLESS-REALITY-31009.json","type":"vless","listen":"::","listen_port":31009}],
+			"outbounds":[{"type":"direct"},{"tag":"public_key_f--Yyj9d1jBzi0M","type":"direct"}]
+		}`,
+		// The shared fragment that actually routes it out to a relay.
+		"/etc/sing-box/conf/home_outbounds_route.vless.json": `{
+			"route":{"rules":[{"inbound":["VLESS-REALITY-31009.json"],"outbound":"[openjobs]-vircs-us-ca-home-vless"}]},
+			"outbounds":[{"tag":"[openjobs]-vircs-us-ca-home-vless","type":"vless","server":"12.22.163.232","server_port":57289}]
+		}`,
+	}
+	src := Source{
+		Addr: "103.112.1.30",
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			last := args[len(args)-1]
+			switch last {
+			case "list":
+				return []byte(`{"ok":true,"count":1,"nodes":[{"name":"VLESS-REALITY-31009.json","protocol":"vless","port":"31009"}]}`), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			if len(args) >= 2 && args[len(args)-2] == "inspect" {
+				// What a single-file resolver can honestly say about that file.
+				return []byte(`{"ok":true,"line":{
+					"core":"sing-box",
+					"tag":"VLESS-REALITY-31009.json",
+					"type":"vless",
+					"listen_host":"::",
+					"listen_port":31009,
+					"outbound":{"tag":"direct","protocol":"direct"}
+				}}`), nil
+			}
+			return nil, errors.New("unexpected command: " + strings.Join(args, " "))
+		},
+		runtimeFiles: func() []string {
+			return []string{
+				"/etc/sing-box/conf/VLESS-REALITY-31009.json",
+				"/etc/sing-box/conf/home_outbounds_route.vless.json",
+			}
+		},
+		readFile: func(path string) ([]byte, error) { return []byte(files[path]), nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-crossfile")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(inv.Nodes) != 1 {
+		t.Fatalf("unexpected inventory: %+v", inv)
+	}
+	n := inv.Nodes[0]
+	if n.OutboundRef != "[openjobs]-vircs-us-ca-home-vless" {
+		t.Fatalf("cross-file route rule must beat the inspect answer, got %q: %+v", n.OutboundRef, n)
+	}
+	if n.OutboundType != "vless" {
+		t.Fatalf("outbound type must be re-derived from the corrected ref, got %q: %+v", n.OutboundType, n)
+	}
+	if n.OutboundServer != "12.22.163.232" || n.OutboundPort != "57289" {
+		t.Fatalf("downstream must resolve from the fragment: %+v", n)
+	}
+}
+
+// The override must not invent a route where none exists: a genuinely terminal
+// line keeps whatever the stronger per-line sources reported.
+func TestNoRouteRuleLeavesInspectAnswerAlone(t *testing.T) {
+	files := map[string]string{
+		"/etc/sing-box/conf/VLESS-REALITY-57289.json": `{
+			"inbounds":[{"tag":"VLESS-REALITY-57289.json","type":"vless","listen":"::","listen_port":57289}],
+			"outbounds":[{"type":"direct"},{"tag":"public_key_0DOEy5MItmPhI6h6","type":"direct"}]
+		}`,
+	}
+	src := Source{
+		Addr: "108.195.128.236",
+		runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			last := args[len(args)-1]
+			switch last {
+			case "list":
+				return []byte(`{"ok":true,"count":1,"nodes":[{"name":"VLESS-REALITY-57289.json","protocol":"vless","port":"57289"}]}`), nil
+			case "provision":
+				return []byte(`{}`), nil
+			}
+			if len(args) >= 2 && args[len(args)-2] == "inspect" {
+				return []byte(`{"ok":true,"line":{"core":"sing-box","tag":"VLESS-REALITY-57289.json","type":"vless","listen_port":57289,"outbound":{"tag":"direct","protocol":"direct"}}}`), nil
+			}
+			return nil, errors.New("unexpected command: " + strings.Join(args, " "))
+		},
+		runtimeFiles: func() []string { return []string{"/etc/sing-box/conf/VLESS-REALITY-57289.json"} },
+		readFile:     func(path string) ([]byte, error) { return []byte(files[path]), nil },
+	}
+	inv, err := Discover(context.Background(), src, "node-terminal")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	n := inv.Nodes[0]
+	if n.OutboundRef != "direct" || n.OutboundType != "direct" {
+		t.Fatalf("terminal line must keep the reported direct outbound: %+v", n)
+	}
+	if n.OutboundServer != "" || n.OutboundPort != "" {
+		t.Fatalf("a direct outbound has no downstream: %+v", n)
+	}
+}
