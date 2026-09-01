@@ -855,8 +855,31 @@ func singBoxRuntimeConfigFiles() []string {
 // The validated path replaces argv[0] in the returned vector, so every consumer
 // downstream reasons about the kernel's answer rather than the process's claim.
 func singBoxProcessArgs() [][]string {
+	procs := TrustedProcesses()
+	out := make([][]string, 0, len(procs))
+	for _, p := range procs {
+		out = append(out, p.Args)
+	}
+	return out
+}
+
+// TrustedProcess is one running sing-box process the trust selector accepted.
+type TrustedProcess struct {
+	PID  int
+	Args []string
+	// StartedAt is best-effort (the proc entry's mtime, which the kernel sets
+	// at process creation); zero when it could not be read.
+	StartedAt time.Time
+}
+
+// TrustedProcesses lists the running processes the selector accepts as
+// sing-box, with their pids and best-effort start times. It applies exactly
+// the trust rules documented above; the liveness probe (design-19) consumes
+// it so that "a sing-box process exists" is decided by one selector in one
+// place, never re-derived with looser rules.
+func TrustedProcesses() []TrustedProcess {
 	matches, _ := filepath.Glob(filepath.Join(procRoot, "[0-9]*", "cmdline"))
-	var out [][]string
+	var out []TrustedProcess
 	for _, cmdlinePath := range matches {
 		procDir := filepath.Dir(cmdlinePath)
 		if !processRunsAsRoot(procDir) {
@@ -884,8 +907,17 @@ func singBoxProcessArgs() [][]string {
 			continue
 		}
 		args[0] = filepath.Clean(exe)
-		out = append(out, args)
+		pid, err := strconv.Atoi(filepath.Base(procDir))
+		if err != nil {
+			continue
+		}
+		proc := TrustedProcess{PID: pid, Args: args}
+		if info, err := os.Stat(procDir); err == nil {
+			proc.StartedAt = info.ModTime()
+		}
+		out = append(out, proc)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
 	return out
 }
 

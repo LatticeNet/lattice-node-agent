@@ -34,6 +34,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
+	"github.com/LatticeNet/lattice-node-agent/internal/singboxlive"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
@@ -1058,6 +1059,28 @@ func reportSingBoxInventory(cfg agentConfig) error {
 		Addr:     cfg.PublicIP,
 		MetaPath: cfg.SingBoxMeta,
 	}, cfg.NodeID)
+	// Service liveness rides the same report (design-19): discovery says what
+	// the config declares, the probe says what the machine is doing, and the
+	// server needs both in one atomic snapshot to tell "configured" from
+	// "running". Probe failures land in Runtime.ProbeError, never abort.
+	runtime, bound := singboxlive.Collect(context.Background(), singboxlive.Source{
+		Runner: guardreality.RunBoundedCommand,
+	})
+	inv.Runtime = &runtime
+	if bound.Known {
+		for i := range inv.Nodes {
+			port, perr := strconv.Atoi(strings.TrimSpace(inv.Nodes[i].Port))
+			if perr != nil || port <= 0 {
+				continue
+			}
+			isBound := false
+			if proc, ok := bound.Ports[port]; ok {
+				isBound = true
+				inv.Nodes[i].PortBoundBy = proc
+			}
+			inv.Nodes[i].PortBound = &isBound
+		}
+	}
 	// Always post what we have (ok list OR error status); the post error, if any,
 	// is combined with any discovery error for the caller's log.
 	postErr := postAgentJSON(cfg, "/api/agent/singbox-inventory", map[string]any{

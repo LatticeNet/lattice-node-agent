@@ -435,6 +435,11 @@ func ParseNFTVersion(raw []byte) string {
 	return trimBounded(line, 128)
 }
 
+// RunBoundedCommand is the production Runner: no shell, bounded output. It is
+// exported so sibling read-only probes (singboxlive, design-19) execute
+// commands under exactly the same discipline instead of growing their own.
+var RunBoundedCommand Runner = runBoundedCommand
+
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout limitedBuffer
