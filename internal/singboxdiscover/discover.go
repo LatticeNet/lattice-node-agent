@@ -966,6 +966,7 @@ func processRunsAsRoot(procDir string) bool {
 // (/tmp, a home directory, a world-writable app directory) is refused. A node
 // whose sing-box lives elsewhere loses process-derived discovery and falls back
 // to the conventional /etc/sing-box paths rather than trusting the process.
+// ResolveTrustedExecutable applies the same list to sibling probes.
 var trustedSingBoxExecutableDirs = []string{
 	"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin",
 }
@@ -984,13 +985,46 @@ func trustedSingBoxExecutable(exe string) bool {
 // what the liveness probe reports when it cannot prove the service, so it
 // says which rule and, where the file can be stat'd, who owns it.
 func explainSingBoxExecutable(exe string) string {
+	return explainTrustedExecutable(exe, singBoxExecutableName)
+}
+
+// ResolveTrustedExecutable looks for a binary named name in the trusted
+// executable directories and applies the same ownership and permission rules
+// the sing-box selector applies. It exists so a sibling probe that must run a
+// root-only external command (the sshd facts step of the guard-reality
+// report) executes from exactly this trust boundary instead of growing its
+// own. It returns the first trusted path, or "" and the reason: the failed
+// rule of the first candidate that exists, or a not-found note that names the
+// directories searched.
+func ResolveTrustedExecutable(name string) (string, string) {
+	name = strings.TrimSpace(name)
+	if name == "" || name != filepath.Base(name) {
+		return "", "executable name must be a bare file name"
+	}
+	for _, dir := range trustedSingBoxExecutableDirs {
+		candidate := filepath.Join(dir, name)
+		if _, err := statIdentity(candidate); err != nil {
+			continue
+		}
+		if reason := explainTrustedExecutable(candidate, name); reason != "" {
+			return "", candidate + ": " + reason
+		}
+		return candidate, ""
+	}
+	return "", name + " not found in the trusted executable directories (" + strings.Join(trustedSingBoxExecutableDirs, ", ") + ")"
+}
+
+// explainTrustedExecutable is the rule set behind both selectors: absolute
+// path, exact base name, trusted directory, and (where the file can be
+// stat'd) a root-owned regular file nobody else can write.
+func explainTrustedExecutable(exe, name string) string {
 	exe = strings.TrimSpace(exe)
 	if !filepath.IsAbs(exe) {
 		return "executable path is not absolute"
 	}
 	clean := filepath.Clean(exe)
-	if filepath.Base(clean) != singBoxExecutableName {
-		return "executable is not named " + singBoxExecutableName
+	if filepath.Base(clean) != name {
+		return "executable is not named " + name
 	}
 	id, statErr := statIdentity(clean)
 	owner := ""

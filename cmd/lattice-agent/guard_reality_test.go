@@ -135,10 +135,13 @@ func TestReportGuardReality(t *testing.T) {
 			NodeID:             "node-a",
 			Token:              "node-secret",
 			ReportGuardReality: true,
-		}, func(_ context.Context, _ guardreality.Source, nodeID string) (model.GuardNodeReality, error) {
+		}, func(_ context.Context, source guardreality.Source, nodeID string) (model.GuardNodeReality, error) {
 			collectorCalls++
 			if nodeID != "node-a" {
 				t.Fatalf("collector node id = %q, want node-a", nodeID)
+			}
+			if source.SSHD == nil {
+				t.Fatal("report must hand the collector the sshd facts step")
 			}
 			return wantReality, nil
 		})
