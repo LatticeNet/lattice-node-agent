@@ -4,6 +4,8 @@ github.com/LatticeNet/lattice-sdk v0.2.24-0.20260901093327-74bc00a34288 h1:V86Lj
 github.com/LatticeNet/lattice-sdk v0.2.24-0.20260901093327-74bc00a34288/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
 github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902071941-558e2ed7ef2a h1:YXo2EqwrYiT3jYqf6uY9LPKVs26zEpXobpNJunws4yo=
 github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902071941-558e2ed7ef2a/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902150344-1019b1888484 h1:eVgu4Eqdd6q0oMUtGxUhLIKNKO+f548JEu9W9AjBpb8=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902150344-1019b1888484/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=

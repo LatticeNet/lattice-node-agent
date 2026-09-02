@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -91,6 +93,38 @@ func TestDecodeUsageSnapshotV2RayStats(t *testing.T) {
 	if snapshot.NodeID != "node-a" || !snapshot.At.Equal(fixed) || !reflect.DeepEqual(snapshot.UserBytes, want) {
 		t.Fatalf("unexpected v2ray snapshot: %+v", snapshot)
 	}
+	if want := map[string]model.ProxyTrafficCounter{"alice": {Uplink: 100, Downlink: 50}, "bob": {Uplink: 7}}; !reflect.DeepEqual(snapshot.UserTraffic, want) {
+		t.Fatalf("user_traffic: %+v", snapshot.UserTraffic)
+	}
+	if want := map[string]model.ProxyTrafficCounter{"proxy-in": {Uplink: 999}}; !reflect.DeepEqual(snapshot.InboundTraffic, want) {
+		t.Fatalf("inbound_traffic: %+v", snapshot.InboundTraffic)
+	}
+	if snapshot.OutboundTraffic != nil {
+		t.Fatalf("no outbound counters were given: %+v", snapshot.OutboundTraffic)
+	}
+}
+
+func TestDecodeUsageSnapshotDirectShapeCarriesTrafficMaps(t *testing.T) {
+	fixed := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	body := []byte(`{
+	  "inbound_traffic": {"vless-reality-443": {"uplink": 10, "downlink": 20}},
+	  "user_traffic": {"u_0123abcd": {"uplink": 1, "downlink": 2}},
+	  "outbound_traffic": {"direct": {"uplink": 3, "downlink": 4}}
+	}`)
+	snapshot, err := DecodeUsageSnapshot(body, "node-a", fixed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.InboundTraffic["vless-reality-443"] != (model.ProxyTrafficCounter{Uplink: 10, Downlink: 20}) ||
+		snapshot.UserTraffic["u_0123abcd"] != (model.ProxyTrafficCounter{Uplink: 1, Downlink: 2}) ||
+		snapshot.OutboundTraffic["direct"] != (model.ProxyTrafficCounter{Uplink: 3, Downlink: 4}) {
+		t.Fatalf("traffic maps: %+v", snapshot)
+	}
+	// The direct shape does not derive user_bytes from user_traffic: a source
+	// that speaks the new shape is expected to send user_bytes itself.
+	if len(snapshot.UserBytes) != 0 {
+		t.Fatalf("user_bytes: %+v", snapshot.UserBytes)
+	}
 }
 
 func TestDecodeUsageSnapshotRejectsMalformedCounters(t *testing.T) {
@@ -101,6 +135,9 @@ func TestDecodeUsageSnapshotRejectsMalformedCounters(t *testing.T) {
 		`{"line_user_bytes":{"line-a": {"": 1}}}`,
 		`{"line_user_bytes":{"line-a": {"alice": -1}}}`,
 		`{"stat":[{"name":"user>>>alice>>>traffic>>>uplink","value":-1}]}`,
+		`{"stat":[{"name":"inbound>>>vless>>>traffic>>>uplink","value":-1}]}`,
+		`{"inbound_traffic":{"vless":{"uplink":-1,"downlink":0}}}`,
+		`{"user_traffic":{"":{"uplink":1,"downlink":0}}}`,
 		`{"hello":"world"}`,
 	}
 	for _, body := range cases {

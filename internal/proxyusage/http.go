@@ -36,8 +36,9 @@ type HTTPSource struct {
 //   - V2Ray-style stats JSON:
 //     {"stat":[{"name":"user>>>alice>>>traffic>>>uplink","value":123}]}
 //
-// The V2Ray shape is transport-agnostic; a future sing-box/xray gRPC adapter can
-// reuse the same parser after obtaining QueryStats output.
+// The V2Ray shape is transport-agnostic and shares its parser with the
+// sing-box gRPC collector, so inbound>>> and outbound>>> names fill the same
+// direction-split traffic maps here.
 func LoadHTTP(ctx context.Context, source HTTPSource, nodeID string) (model.ProxyUsageSnapshot, error) {
 	endpoint, err := ValidateLocalHTTPURL(source.URL)
 	if err != nil {
@@ -138,9 +139,10 @@ func DecodeUsageSnapshot(data []byte, nodeID string, now time.Time) (model.Proxy
 		return NormalizeSnapshot(snapshot, nodeID, now)
 	}
 	if raw, ok := top["stat"]; ok {
-		return decodeV2RayStats(raw, nodeID, now)
+		return decodeV2RayStats(raw, nodeID, now, true)
 	}
-	if _, ok := top["user_bytes"]; ok || top["line_user_bytes"] != nil || top["core_uptime_sec"] != nil || top["at"] != nil {
+	if _, ok := top["user_bytes"]; ok || top["line_user_bytes"] != nil || top["core_uptime_sec"] != nil || top["at"] != nil ||
+		top["inbound_traffic"] != nil || top["user_traffic"] != nil || top["outbound_traffic"] != nil {
 		var snapshot model.ProxyUsageSnapshot
 		if err := json.Unmarshal(data, &snapshot); err != nil {
 			return model.ProxyUsageSnapshot{}, err
@@ -150,7 +152,10 @@ func DecodeUsageSnapshot(data []byte, nodeID string, now time.Time) (model.Proxy
 	return model.ProxyUsageSnapshot{}, fmt.Errorf("proxy usage source JSON has no supported snapshot fields")
 }
 
-func decodeV2RayStats(raw json.RawMessage, nodeID string, at time.Time) (model.ProxyUsageSnapshot, error) {
+// decodeV2RayStats decodes a `[{"name":...,"value":...}]` counter list.
+// includeTraffic says whether the direction-split maps are kept; see
+// snapshotFromV2RayStats for why the xray CLI source leaves them empty.
+func decodeV2RayStats(raw json.RawMessage, nodeID string, at time.Time, includeTraffic bool) (model.ProxyUsageSnapshot, error) {
 	var stats []struct {
 		Name  string `json:"name"`
 		Value int64String
@@ -158,17 +163,13 @@ func decodeV2RayStats(raw json.RawMessage, nodeID string, at time.Time) (model.P
 	if err := json.Unmarshal(raw, &stats); err != nil {
 		return model.ProxyUsageSnapshot{}, err
 	}
-	snapshot := model.ProxyUsageSnapshot{UserBytes: map[string]int64{}}
+	counters := make([]nameValue, 0, len(stats))
 	for _, stat := range stats {
-		value := int64(stat.Value)
-		if value < 0 {
-			return model.ProxyUsageSnapshot{}, fmt.Errorf("proxy usage stat %q cannot be negative", stat.Name)
-		}
-		user, ok := v2rayUserFromStatName(stat.Name)
-		if !ok {
-			continue
-		}
-		snapshot.UserBytes[user] += value
+		counters = append(counters, nameValue{name: stat.Name, value: int64(stat.Value)})
+	}
+	snapshot, err := snapshotFromV2RayStats(counters, includeTraffic)
+	if err != nil {
+		return model.ProxyUsageSnapshot{}, err
 	}
 	return NormalizeSnapshot(snapshot, nodeID, at)
 }
@@ -188,21 +189,6 @@ func (v *int64String) UnmarshalJSON(data []byte) error {
 	}
 	*v = int64String(n)
 	return nil
-}
-
-func v2rayUserFromStatName(name string) (string, bool) {
-	parts := strings.Split(name, ">>>")
-	if len(parts) != 4 {
-		return "", false
-	}
-	if parts[0] != "user" || parts[2] != "traffic" {
-		return "", false
-	}
-	if parts[3] != "uplink" && parts[3] != "downlink" {
-		return "", false
-	}
-	user := strings.TrimSpace(parts[1])
-	return user, user != ""
 }
 
 func now(fn func() time.Time) time.Time {

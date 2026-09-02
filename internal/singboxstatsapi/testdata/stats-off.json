@@ -1,0 +1,6 @@
+{
+  "inbounds": [
+    {"type": "vless", "tag": "vless-reality-443", "listen": "::", "listen_port": 443, "users": []}
+  ],
+  "outbounds": [{"type": "direct", "tag": "direct"}]
+}

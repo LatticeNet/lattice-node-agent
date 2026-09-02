@@ -1,0 +1,12 @@
+{
+  "experimental": {
+    "v2ray_api": {
+      "listen": "0.0.0.0:8080",
+      "stats": {"enabled": true}
+    }
+  },
+  "inbounds": [
+    {"type": "vless", "tag": "vless-reality-443", "listen": "::", "listen_port": 443, "users": []}
+  ],
+  "outbounds": [{"type": "direct", "tag": "direct"}]
+}

@@ -35,13 +35,14 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxlive"
+	"github.com/LatticeNet/lattice-node-agent/internal/singboxstatsapi"
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.9-alpha.5"
+var version = "0.3.9-alpha.7"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -161,13 +162,18 @@ type agentConfig struct {
 	ProxyUsageXrayBin     string
 	ProxyUsageXrayPattern string
 	SingBoxStatsAPI       string
-	SingBoxDiscover       bool
-	SingBoxBin            string
-	SingBoxMeta           string
-	LogStateDir           string
-	TaskOutboxDir         string
-	LinechainTxnDir       string
-	LinechainReady        bool
+	// SingBoxStatsAPIDiscovered is the stats API address read from the on-box
+	// sing-box config when -singbox-discover is on and no usage source is
+	// configured. It is refreshed every interval and never reported as
+	// configuration: the explicit flag, env, or profile value always wins.
+	SingBoxStatsAPIDiscovered string
+	SingBoxDiscover           bool
+	SingBoxBin                string
+	SingBoxMeta               string
+	LogStateDir               string
+	TaskOutboxDir             string
+	LinechainTxnDir           string
+	LinechainReady            bool
 }
 
 type agentRuntimePayload struct {
@@ -457,6 +463,7 @@ func main() {
 	}
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
+	statsDiscovery := newSingBoxStatsDiscovery()
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -476,6 +483,7 @@ func main() {
 		if err := reportMetrics(cfg); err != nil {
 			log.Printf("metrics error: %v", err)
 		}
+		statsDiscovery.refresh(&cfg)
 		if err := reportProxyUsage(cfg); err != nil {
 			log.Printf("proxy usage error: %v", err)
 		}
@@ -969,19 +977,81 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-func reportProxyUsage(cfg agentConfig) error {
-	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
-	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
-	hasXray := strings.TrimSpace(cfg.ProxyUsageXrayAPI) != ""
-	hasSingBox := strings.TrimSpace(cfg.SingBoxStatsAPI) != ""
+// proxyUsageSourcesConfigured counts the explicitly configured usage sources
+// (flag, env, or profile). The address discovered from the sing-box config is
+// not one of them: it only fills the gap when this returns zero.
+func proxyUsageSourcesConfigured(cfg agentConfig) int {
 	configured := 0
-	for _, on := range []bool{hasFile, hasURL, hasXray, hasSingBox} {
-		if on {
+	for _, value := range []string{cfg.ProxyUsageFile, cfg.ProxyUsageURL, cfg.ProxyUsageXrayAPI, cfg.SingBoxStatsAPI} {
+		if strings.TrimSpace(value) != "" {
 			configured++
 		}
 	}
+	return configured
+}
+
+// singBoxStatsDiscovery re-reads the on-box sing-box config each interval,
+// because the sb manager can toggle stats on or off while the agent runs, and
+// remembers the last outcome so each change is logged once rather than every
+// interval.
+type singBoxStatsDiscovery struct {
+	discover func() (singboxstatsapi.Result, error)
+	last     singboxstatsapi.Result
+	lastErr  string
+}
+
+func newSingBoxStatsDiscovery() *singBoxStatsDiscovery {
+	return &singBoxStatsDiscovery{discover: func() (singboxstatsapi.Result, error) {
+		return singboxstatsapi.Discover(singboxstatsapi.ConfigFiles())
+	}}
+}
+
+// refresh stores the discovered address on cfg, or clears it. Discovery runs
+// only when -singbox-discover is on and nothing is configured explicitly, so
+// it can neither override an operator's choice nor trip the "configure only
+// one" rule.
+func (d *singBoxStatsDiscovery) refresh(cfg *agentConfig) {
+	cfg.SingBoxStatsAPIDiscovered = ""
+	if !cfg.SingBoxDiscover || proxyUsageSourcesConfigured(*cfg) > 0 {
+		d.last, d.lastErr = singboxstatsapi.Result{}, ""
+		return
+	}
+	result, err := d.discover()
+	if err != nil {
+		if msg := err.Error(); msg != d.lastErr {
+			log.Printf("singbox stats api discovery refused: %v", err)
+			d.lastErr = msg
+		}
+		d.last = singboxstatsapi.Result{}
+		return
+	}
+	d.lastErr = ""
+	if result.Addr == "" {
+		if d.last.Addr != "" {
+			log.Printf("singbox stats api no longer declared in %s", d.last.Path)
+		}
+		d.last = singboxstatsapi.Result{}
+		return
+	}
+	if result != d.last {
+		log.Printf("singbox stats api discovered at %s from %s", result.Addr, result.Path)
+		d.last = result
+	}
+	cfg.SingBoxStatsAPIDiscovered = result.Addr
+}
+
+func reportProxyUsage(cfg agentConfig) error {
+	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
+	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
+	hasSingBox := strings.TrimSpace(cfg.SingBoxStatsAPI) != ""
+	singBoxAPI := cfg.SingBoxStatsAPI
+	configured := proxyUsageSourcesConfigured(cfg)
 	if configured == 0 {
-		return nil
+		singBoxAPI = strings.TrimSpace(cfg.SingBoxStatsAPIDiscovered)
+		if singBoxAPI == "" {
+			return nil
+		}
+		hasSingBox = true
 	}
 	if configured > 1 {
 		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, proxy-usage-xray-api, or singbox-stats-api")
@@ -1005,7 +1075,7 @@ func reportProxyUsage(cfg agentConfig) error {
 	case hasSingBox:
 		source = "singbox-stats"
 		snapshot, err = proxyusage.LoadSingBoxStats(context.Background(), proxyusage.SingBoxStatsSource{
-			APIAddr: cfg.SingBoxStatsAPI,
+			APIAddr: singBoxAPI,
 			Timeout: cfg.ProxyUsageTimeout,
 		}, cfg.NodeID)
 	default:
@@ -1120,18 +1190,11 @@ func boundedProxyUsageError(err error) string {
 }
 
 func validateProxyUsageConfig(cfg agentConfig) error {
-	hasFile := strings.TrimSpace(cfg.ProxyUsageFile) != ""
 	hasURL := strings.TrimSpace(cfg.ProxyUsageURL) != ""
 	hasXray := strings.TrimSpace(cfg.ProxyUsageXrayAPI) != ""
 	hasSingBox := strings.TrimSpace(cfg.SingBoxStatsAPI) != ""
 	hasSecretFile := strings.TrimSpace(cfg.ProxyUsageSecretFile) != ""
-	configured := 0
-	for _, on := range []bool{hasFile, hasURL, hasXray, hasSingBox} {
-		if on {
-			configured++
-		}
-	}
-	if configured > 1 {
+	if proxyUsageSourcesConfigured(cfg) > 1 {
 		return fmt.Errorf("configure only one of proxy-usage-file, proxy-usage-url, proxy-usage-xray-api, or singbox-stats-api")
 	}
 	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" && hasSecretFile {

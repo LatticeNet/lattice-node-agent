@@ -13,7 +13,6 @@ import (
 )
 
 const (
-	defaultSingBoxStatsPattern = "user>>>"
 	defaultSingBoxStatsTimeout = 5 * time.Second
 	// sing-box rewrites its generated StatsService descriptor at runtime to
 	// the V2Ray-compatible service name. The protobuf messages keep the local
@@ -21,29 +20,28 @@ const (
 	singBoxStatsQueryMethod = "/v2ray.core.app.stats.command.StatsService/QueryStats"
 )
 
-// SingBoxStatsSource collects per-user usage from sing-box's experimental
-// V2Ray Stats API over loopback gRPC (ADR-004). sing-box has no CLI stats
-// subcommand, so — unlike the xray path (ADR-003) — the gRPC call happens in
-// the agent itself, using the vendored proto in singboxstats (byte-identical
-// service/messages with upstream, only go_package adjusted).
+// SingBoxStatsSource collects usage from sing-box's experimental V2Ray Stats
+// API over loopback gRPC (ADR-004). sing-box has no CLI stats subcommand, so
+// unlike the xray path (ADR-003) the gRPC call happens in the agent itself,
+// using the vendored proto in singboxstats (byte-identical service/messages
+// with upstream, only go_package adjusted).
 //
 // Queries are read-only (never reset): counters stay monotonic and the server
 // keeps ownership of successive-snapshot diffing, eligibility, and audit. The
-// API address must be loopback, mirroring the HTTP source's loopback rule —
+// API address must be loopback, mirroring the HTTP source's loopback rule:
 // a node must not be configured into dialing arbitrary networks.
 type SingBoxStatsSource struct {
-	APIAddr string        // loopback host:port of the sing-box experimental API
-	Pattern string        // optional substring stat-name filter; default "user>>>"
+	APIAddr string // loopback host:port of the sing-box experimental API
+	// Pattern is an optional substring stat-name filter. The default is empty,
+	// which returns every counter: inbound counters are the only usage signal
+	// for legacy inbounds whose users carry no name, and outbound counters
+	// feed the server's chain analysis, so "user>>>" alone is not enough.
+	Pattern string
 	Timeout time.Duration // per-invocation timeout; default 5s
 	Now     func() time.Time
 
 	// query is a test seam; production uses grpcQueryStats.
 	query func(ctx context.Context, addr, pattern string) ([]nameValue, error)
-}
-
-type nameValue struct {
-	name  string
-	value int64
 }
 
 // ValidateSingBoxStatsSource checks the loopback API address and pattern
@@ -63,19 +61,18 @@ func ValidateSingBoxStatsSource(source SingBoxStatsSource) error {
 // LoadSingBoxStats runs one read-only QueryStats call and normalizes the
 // counters into a server-ingestible snapshot. An empty counter set (a freshly
 // started core with no traffic yet) is a valid empty snapshot, not an error.
-// Counter names keep their on-box users[].name (design-15 §5 u_<hash>) — the
-// server reverses them into (user, line) pairs.
+// Counter names keep their on-box users[].name (design-15 §5 u_<hash>) and
+// inbound/outbound tags; the server reverses them into (user, line) pairs.
 func LoadSingBoxStats(ctx context.Context, source SingBoxStatsSource, nodeID string) (model.ProxyUsageSnapshot, error) {
 	addr, err := validateLoopbackHostPort(source.APIAddr)
 	if err != nil {
 		return model.ProxyUsageSnapshot{}, err
 	}
 	pattern := strings.TrimSpace(source.Pattern)
-	if pattern == "" {
-		pattern = defaultSingBoxStatsPattern
-	}
-	if err := validateXrayStatsPattern(pattern); err != nil {
-		return model.ProxyUsageSnapshot{}, err
+	if pattern != "" {
+		if err := validateXrayStatsPattern(pattern); err != nil {
+			return model.ProxyUsageSnapshot{}, err
+		}
 	}
 	timeout := source.Timeout
 	if timeout <= 0 {
@@ -95,16 +92,9 @@ func LoadSingBoxStats(ctx context.Context, source SingBoxStatsSource, nodeID str
 	if err != nil {
 		return model.ProxyUsageSnapshot{}, fmt.Errorf("sing-box stats query: %w", err)
 	}
-	snapshot := model.ProxyUsageSnapshot{UserBytes: map[string]int64{}}
-	for _, stat := range stats {
-		if stat.value < 0 {
-			return model.ProxyUsageSnapshot{}, fmt.Errorf("sing-box stats counter %q cannot be negative", stat.name)
-		}
-		user, ok := v2rayUserFromStatName(stat.name)
-		if !ok {
-			continue
-		}
-		snapshot.UserBytes[user] += stat.value
+	snapshot, err := snapshotFromV2RayStats(stats, true)
+	if err != nil {
+		return model.ProxyUsageSnapshot{}, fmt.Errorf("sing-box stats: %w", err)
 	}
 	return NormalizeSnapshot(snapshot, nodeID, now(source.Now))
 }
@@ -123,6 +113,9 @@ var statsNewClientConn = func(addr string, opts ...grpc.DialOption) (statsConn, 
 
 // grpcQueryStats dials the loopback experimental API (plaintext: loopback
 // only, exactly like xray's own statsquery) and issues a substring QueryStats.
+// An empty pattern is sent as-is: sing-box matches patterns by substring, and
+// the empty string is contained in every name, so this returns every counter
+// without depending on how the server treats a missing pattern list.
 func grpcQueryStats(ctx context.Context, addr, pattern string) ([]nameValue, error) {
 	conn, err := statsNewClientConn(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
