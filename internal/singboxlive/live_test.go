@@ -113,3 +113,43 @@ func TestCollectListenerFailureIsUnknownNotEmpty(t *testing.T) {
 		t.Fatalf("ss failure must be reported: %q", rt.ProbeError)
 	}
 }
+
+// A unit that is active with no trusted process is what the server reports
+// as unknown. The probe error must carry the candidate and the rule, because
+// that is the one line the operator needs to act on.
+func TestCollectNamesRefusedCandidatesWhenNothingTrustedRuns(t *testing.T) {
+	rt, _ := Collect(context.Background(), Source{
+		Now:       fixedNow,
+		Processes: func() []singboxdiscover.TrustedProcess { return nil },
+		Refused: func() []singboxdiscover.RefusedProcess {
+			return []singboxdiscover.RefusedProcess{{PID: 3917185, Exe: "/etc/sing-box/bin/sing-box", Reason: "outside the trusted executable directories (/usr/local/bin); owned by uid 1001, not root"}}
+		},
+		Runner: runner(map[string][]byte{
+			"systemctl": []byte("ActiveState=active\nSubState=running\nNRestarts=0\n"),
+			"ss":        []byte(`tcp LISTEN 0 4096 [::]:17893 [::]:* users:(("sing-box",pid=3917185,fd=8))`),
+		}, nil),
+	})
+	if rt.Running {
+		t.Fatal("no trusted process means not running")
+	}
+	if rt.ActiveState != "active" {
+		t.Fatalf("systemd answer must survive: %+v", rt)
+	}
+	want := "refused sing-box candidate /etc/sing-box/bin/sing-box (pid 3917185): outside the trusted executable directories (/usr/local/bin); owned by uid 1001, not root"
+	if rt.ProbeError != want {
+		t.Fatalf("probe error = %q, want %q", rt.ProbeError, want)
+	}
+}
+
+func TestCollectDoesNotConsultRefusalsWhenATrustedProcessRuns(t *testing.T) {
+	called := false
+	rt, _ := Collect(context.Background(), Source{
+		Now:       fixedNow,
+		Processes: func() []singboxdiscover.TrustedProcess { return []singboxdiscover.TrustedProcess{{PID: 1}} },
+		Refused:   func() []singboxdiscover.RefusedProcess { called = true; return nil },
+		Runner:    runner(map[string][]byte{"systemctl": []byte("ActiveState=active\n"), "ss": []byte("")}, nil),
+	})
+	if called || !rt.Running || rt.ProbeError != "" {
+		t.Fatalf("refusals consulted=%v running=%v err=%q", called, rt.Running, rt.ProbeError)
+	}
+}

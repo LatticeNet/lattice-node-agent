@@ -976,13 +976,26 @@ var trustedSingBoxExecutableDirs = []string{
 // applied only when the file can be stat'd, and refuse anything that is not a
 // root-owned, non-group/world-writable regular file.
 func trustedSingBoxExecutable(exe string) bool {
+	return explainSingBoxExecutable(exe) == ""
+}
+
+// explainSingBoxExecutable applies the executable rules and names the first
+// one the path fails, or returns "" when the path is trusted. The reason is
+// what the liveness probe reports when it cannot prove the service, so it
+// says which rule and, where the file can be stat'd, who owns it.
+func explainSingBoxExecutable(exe string) string {
 	exe = strings.TrimSpace(exe)
 	if !filepath.IsAbs(exe) {
-		return false
+		return "executable path is not absolute"
 	}
 	clean := filepath.Clean(exe)
 	if filepath.Base(clean) != singBoxExecutableName {
-		return false
+		return "executable is not named " + singBoxExecutableName
+	}
+	id, statErr := statIdentity(clean)
+	owner := ""
+	if statErr == nil && id.uid != 0 {
+		owner = fmt.Sprintf("; owned by uid %d, not root", id.uid)
 	}
 	trustedDir := false
 	for _, dir := range trustedSingBoxExecutableDirs {
@@ -992,19 +1005,93 @@ func trustedSingBoxExecutable(exe string) bool {
 		}
 	}
 	if !trustedDir {
-		return false
+		return "outside the trusted executable directories (" + strings.Join(trustedSingBoxExecutableDirs, ", ") + ")" + owner
 	}
-	id, err := statIdentity(clean)
-	if err != nil {
+	if statErr != nil {
 		// The binary is not visible from here (a test vector, or a chroot). The
 		// path rules above still applied, and in the /proc collector the process
 		// was already proven to be root.
-		return true
+		return ""
 	}
-	if !id.mode.IsRegular() || id.mode.Perm()&0o022 != 0 {
-		return false
+	if !id.mode.IsRegular() {
+		return "not a regular file"
 	}
-	return id.uid == 0
+	if id.mode.Perm()&0o022 != 0 {
+		return "group or world writable"
+	}
+	if id.uid != 0 {
+		return fmt.Sprintf("owned by uid %d, not root", id.uid)
+	}
+	return ""
+}
+
+// RefusedProcess is a running process that presents as a sing-box `run` and
+// that the trust selector did not accept, with the rule it failed. It exists
+// so the liveness probe can say why it could not prove the service instead of
+// reporting a bare unknown: on a fleet whose manager installs sing-box under
+// /etc/sing-box/bin owned by an unprivileged uid, every node reads unknown
+// and nothing says why.
+type RefusedProcess struct {
+	PID    int
+	Exe    string
+	Reason string
+}
+
+// maxRefusedProcesses bounds the listing; three candidates say everything a
+// probe error can carry, and a host running hundreds of sing-box lookalikes
+// is not a case worth a megabyte of reasons.
+const maxRefusedProcesses = 3
+
+// RefusedProcesses lists the sing-box candidates the selector refused. A
+// candidate is any process whose command line carries `run` and whose
+// executable, by argv[0] or by the kernel's exe link, is named sing-box. It
+// applies the same rules as TrustedProcesses and keeps the rejections.
+func RefusedProcesses() []RefusedProcess {
+	matches, _ := filepath.Glob(filepath.Join(procRoot, "[0-9]*", "cmdline"))
+	var out []RefusedProcess
+	for _, cmdlinePath := range matches {
+		if len(out) >= maxRefusedProcesses {
+			break
+		}
+		procDir := filepath.Dir(cmdlinePath)
+		raw, err := os.ReadFile(cmdlinePath)
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		parts := bytes.Split(bytes.TrimRight(raw, "\x00"), []byte{0})
+		args := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if len(part) > 0 {
+				args = append(args, string(part))
+			}
+		}
+		if len(args) == 0 || !containsArg(args, "run") {
+			continue
+		}
+		exe, err := os.Readlink(filepath.Join(procDir, "exe"))
+		if err != nil {
+			exe = args[0]
+		}
+		if filepath.Base(exe) != singBoxExecutableName && filepath.Base(args[0]) != singBoxExecutableName {
+			continue
+		}
+		pid, err := strconv.Atoi(filepath.Base(procDir))
+		if err != nil {
+			continue
+		}
+		reason := ""
+		if !processRunsAsRoot(procDir) {
+			reason = "process does not run as root"
+		} else {
+			reason = explainSingBoxExecutable(exe)
+		}
+		if reason == "" {
+			continue
+		}
+		out = append(out, RefusedProcess{PID: pid, Exe: filepath.Clean(exe), Reason: reason})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
+	return out
 }
 
 // ResolveRuntimeLayout returns the one locally observed sing-box -C directory
