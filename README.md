@@ -363,7 +363,14 @@ missing checksum manifest aborts the install before the binary is written.
   `LATTICE_PROXY_USAGE_XRAY_API` configure proxy usage reporting sources.
 - `LATTICE_SINGBOX_STATS_API=127.0.0.1:8080` enables the sing-box stats
   collector (read-only loopback gRPC against the core's experimental API;
-  vendored proto, ADR-004).
+  vendored proto, ADR-004). When it is unset and no other usage source is
+  configured, an agent with `LATTICE_SINGBOX_DISCOVER=1` reads
+  `experimental.v2ray_api.listen` from the sing-box config it already
+  discovers and uses that address if it is loopback; the agent logs the
+  address once when it appears. The collector reports `user_bytes` plus the
+  direction-split `inbound_traffic`, `user_traffic`, and `outbound_traffic`
+  maps, each capped at 4096 entries with the overflow counted in
+  `ignored_counters`.
 
 If a task-backed dashboard action reports `agent task execution disabled`, rerun
 the node detail page's generated reconfigure command with `allow_exec=true`

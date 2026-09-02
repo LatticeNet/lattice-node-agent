@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
+	"github.com/LatticeNet/lattice-node-agent/internal/singboxstatsapi"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -52,8 +53,8 @@ func (r *countingTaskRunner) Run(task model.Task) model.TaskResult {
 // node look like it never took the update it just took. Pinning it here means
 // the bump is a deliberate edit rather than something that drifts.
 func TestVersionMatchesCurrentRelease(t *testing.T) {
-	if version != "0.3.9-alpha.6" {
-		t.Fatalf("version = %q, want 0.3.9-alpha.6", version)
+	if version != "0.3.9-alpha.7" {
+		t.Fatalf("version = %q, want 0.3.9-alpha.7", version)
 	}
 }
 
@@ -1219,6 +1220,153 @@ func TestReportProxyUsageIncludesCollectorHealthOnSuccess(t *testing.T) {
 	}
 	if body.Snapshot.CollectorError != "" || body.Snapshot.CollectorCheckedAt.IsZero() {
 		t.Fatalf("unexpected success collector fields: %+v", body.Snapshot)
+	}
+}
+
+func TestReportProxyUsagePostsTrafficMaps(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	usageFile := filepath.Join(t.TempDir(), "usage.json")
+	body := `{
+	  "user_bytes": {"u_0123abcd": 350},
+	  "inbound_traffic": {"vless-reality-443": {"uplink": 1000, "downlink": 2000}, "legacy-ss": {"uplink": 5, "downlink": 6}},
+	  "user_traffic": {"u_0123abcd": {"uplink": 100, "downlink": 250}},
+	  "outbound_traffic": {"direct": {"uplink": 30, "downlink": 40}}
+	}`
+	if err := os.WriteFile(usageFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var posted map[string]json.RawMessage
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/api/agent/proxy-usage" {
+			return testResponse(http.StatusBadRequest, "bad path"), nil
+		}
+		var envelope struct {
+			Snapshot map[string]json.RawMessage `json:"snapshot"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&envelope); err != nil {
+			t.Fatal(err)
+		}
+		posted = envelope.Snapshot
+		return testResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	if err := reportProxyUsage(agentConfig{
+		Server:         "http://lattice.test",
+		NodeID:         "node-a",
+		Token:          "node-secret",
+		ProxyUsageFile: usageFile,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The wire names are the contract the server lane pins against, so the
+	// assertion reads the raw JSON rather than the SDK struct.
+	for key, want := range map[string]string{
+		"user_bytes":       `{"u_0123abcd":350}`,
+		"inbound_traffic":  `{"legacy-ss":{"uplink":5,"downlink":6},"vless-reality-443":{"uplink":1000,"downlink":2000}}`,
+		"user_traffic":     `{"u_0123abcd":{"uplink":100,"downlink":250}}`,
+		"outbound_traffic": `{"direct":{"uplink":30,"downlink":40}}`,
+	} {
+		if got := string(posted[key]); got != want {
+			t.Fatalf("%s posted as %s, want %s", key, got, want)
+		}
+	}
+	if _, ok := posted["ignored_counters"]; ok {
+		t.Fatalf("ignored_counters must be omitted when nothing was dropped: %s", posted["ignored_counters"])
+	}
+}
+
+// TestReportProxyUsageUsesDiscoveredSingBoxStatsAPI proves the discovered
+// address drives the sing-box collector when nothing is configured explicitly,
+// and that an explicit source still wins. The discovered port has no listener,
+// so the collector fails fast and the health report names the source.
+func TestReportProxyUsageUsesDiscoveredSingBoxStatsAPI(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+
+	var sources []string
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body struct {
+			Snapshot model.ProxyUsageSnapshot `json:"snapshot"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, body.Snapshot.CollectorSource+"/"+body.Snapshot.CollectorStatus)
+		return testResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	base := agentConfig{
+		Server:                    "http://lattice.test",
+		NodeID:                    "node-a",
+		Token:                     "node-secret",
+		ProxyUsageTimeout:         200 * time.Millisecond,
+		SingBoxStatsAPIDiscovered: "127.0.0.1:1",
+	}
+	if err := reportProxyUsage(base); err == nil {
+		t.Fatal("expected the unreachable discovered API to surface as a collector error")
+	}
+	usageFile := filepath.Join(t.TempDir(), "usage.json")
+	if err := os.WriteFile(usageFile, []byte(`{"user_bytes":{"alice":1}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	explicit := base
+	explicit.ProxyUsageFile = usageFile
+	if err := reportProxyUsage(explicit); err != nil {
+		t.Fatalf("explicit file source must win over discovery: %v", err)
+	}
+	if want := []string{"singbox-stats/error", "file/ok"}; !reflect.DeepEqual(sources, want) {
+		t.Fatalf("collector sources = %v, want %v", sources, want)
+	}
+}
+
+func TestSingBoxStatsDiscoveryRefresh(t *testing.T) {
+	calls := 0
+	result := singboxstatsapi.Result{Addr: "127.0.0.1:8080", Path: "/etc/sing-box/config.json"}
+	var discoverErr error
+	d := &singBoxStatsDiscovery{discover: func() (singboxstatsapi.Result, error) {
+		calls++
+		return result, discoverErr
+	}}
+
+	cfg := agentConfig{SingBoxDiscover: true}
+	d.refresh(&cfg)
+	if cfg.SingBoxStatsAPIDiscovered != "127.0.0.1:8080" || calls != 1 {
+		t.Fatalf("discovered address not applied: %+v calls=%d", cfg, calls)
+	}
+
+	// An explicit value wins and discovery does not even run.
+	cfg = agentConfig{SingBoxDiscover: true, SingBoxStatsAPI: "127.0.0.1:9090", SingBoxStatsAPIDiscovered: "stale"}
+	d.refresh(&cfg)
+	if cfg.SingBoxStatsAPIDiscovered != "" || calls != 1 {
+		t.Fatalf("explicit stats api must suppress discovery: %+v calls=%d", cfg, calls)
+	}
+	cfg = agentConfig{SingBoxDiscover: true, ProxyUsageFile: "/run/usage.json"}
+	d.refresh(&cfg)
+	if cfg.SingBoxStatsAPIDiscovered != "" || calls != 1 {
+		t.Fatalf("another explicit source must suppress discovery: %+v calls=%d", cfg, calls)
+	}
+
+	// Discovery off: nothing runs, nothing is set.
+	cfg = agentConfig{}
+	d.refresh(&cfg)
+	if cfg.SingBoxStatsAPIDiscovered != "" || calls != 1 {
+		t.Fatalf("discovery must be gated on -singbox-discover: %+v calls=%d", cfg, calls)
+	}
+
+	// A refused listen clears the address instead of keeping a stale one.
+	cfg = agentConfig{SingBoxDiscover: true}
+	discoverErr = errors.New("not loopback")
+	d.refresh(&cfg)
+	if cfg.SingBoxStatsAPIDiscovered != "" || calls != 2 {
+		t.Fatalf("a refused listen must clear the address: %+v calls=%d", cfg, calls)
+	}
+
+	// Stats toggled off: the address goes away on the next interval.
+	discoverErr = nil
+	result = singboxstatsapi.Result{}
+	d.refresh(&cfg)
+	if cfg.SingBoxStatsAPIDiscovered != "" || calls != 3 {
+		t.Fatalf("stats off must clear the address: %+v calls=%d", cfg, calls)
 	}
 }
 

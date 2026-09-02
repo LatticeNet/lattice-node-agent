@@ -42,6 +42,9 @@ func TestLoadXrayCLIParsesStatsQuery(t *testing.T) {
 	if snapshot.NodeID != "node-a" || !snapshot.At.Equal(fixed) || !reflect.DeepEqual(snapshot.UserBytes, want) {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
 	}
+	if snapshot.UserTraffic != nil || snapshot.InboundTraffic != nil || snapshot.OutboundTraffic != nil {
+		t.Fatalf("the xray path reports user_bytes only: %+v", snapshot)
+	}
 }
 
 func TestLoadXrayCLIEmptyStatsIsValid(t *testing.T) {

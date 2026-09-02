@@ -101,7 +101,9 @@ func LoadXrayCLI(ctx context.Context, source XrayCLISource, nodeID string) (mode
 
 // decodeXrayStats parses xray's `{"stat":[{"name":...,"value":...}]}` output.
 // xray's protojson encoding emits int64 values as strings; the shared
-// int64String/v2rayUserFromStatName helpers already tolerate both.
+// int64String/parseV2RayTrafficStat helpers already tolerate both. Only
+// user_bytes is filled: the xray path is queried with a user>>> pattern and
+// its inbound tags are not something the server joins on.
 func decodeXrayStats(data []byte, nodeID string, at time.Time) (model.ProxyUsageSnapshot, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
@@ -117,7 +119,7 @@ func decodeXrayStats(data []byte, nodeID string, at time.Time) (model.ProxyUsage
 	if len(bytes.TrimSpace(payload.Stat)) == 0 || string(bytes.TrimSpace(payload.Stat)) == "null" {
 		return NormalizeSnapshot(model.ProxyUsageSnapshot{UserBytes: map[string]int64{}}, nodeID, at)
 	}
-	return decodeV2RayStats(payload.Stat, nodeID, at)
+	return decodeV2RayStats(payload.Stat, nodeID, at, false)
 }
 
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {

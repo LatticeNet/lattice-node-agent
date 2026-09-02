@@ -1,0 +1,19 @@
+{
+  "log": {"level": "warn"},
+  "experimental": {
+    "v2ray_api": {
+      "listen": "127.0.0.1:8080",
+      "stats": {"enabled": true}
+    }
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-443",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{"name": "u_0123abcd4567ef89", "uuid": "8c1d6f4e-2b7a-4c0e-9f3d-5a6b7c8d9e0f"}]
+    }
+  ],
+  "outbounds": [{"type": "direct", "tag": "direct"}]
+}
