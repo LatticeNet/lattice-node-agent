@@ -175,10 +175,16 @@ func (r *terminalRunner) runPoll(ctx context.Context) {
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- cmd.Wait() }()
 
+	// Closing the PTY only hangs up the terminal; a child that ignored SIGHUP
+	// or detached with nohup kept running as the agent's user after the
+	// operator closed the session. Every exit path that did not come from the
+	// shell exiting on its own kills the whole process group, the way the
+	// stream transport already does.
 	inputTicker := time.NewTicker(terminalInputInterval)
 	defer inputTicker.Stop()
 	var waitErr error
 	finished := false
+	shellExited := false
 	for !finished {
 		select {
 		case <-ctx.Done():
@@ -186,10 +192,11 @@ func (r *terminalRunner) runPoll(ctx context.Context) {
 			waitErr = ctx.Err()
 			finished = true
 		case waitErr = <-waitDone:
+			shellExited = true
 			finished = true
 		case <-inputTicker.C:
 			if err := r.pollInputs(ptmx); err != nil {
-				if errors.Is(err, errTerminalSessionGone) {
+				if errors.Is(err, errTerminalSessionGone) || errors.Is(err, errTerminalClosedByOperator) {
 					_ = ptmx.Close()
 					waitErr = err
 					finished = true
@@ -198,6 +205,9 @@ func (r *terminalRunner) runPoll(ctx context.Context) {
 				log.Printf("terminal input poll error: %v", err)
 			}
 		}
+	}
+	if !shellExited {
+		terminalKillProcessGroup(cmd)
 	}
 	_ = ptmx.Close()
 	<-readDone
@@ -238,11 +248,17 @@ func (r *terminalRunner) pollInputs(ptmx *os.File) error {
 				}
 			}
 		case "close":
-			return ptmx.Close()
+			_ = ptmx.Close()
+			return errTerminalClosedByOperator
 		}
 	}
 	return nil
 }
+
+// errTerminalClosedByOperator ends the poll loop on a close input so the
+// process group is killed, instead of waiting for the shell to notice the
+// hang-up on its own.
+var errTerminalClosedByOperator = errors.New("terminal closed by operator")
 
 func (r *terminalRunner) postStatus(status, message string) error {
 	return r.postTerminalPayload(map[string]any{
