@@ -286,6 +286,13 @@ func parseHostPort(value string) (string, int, bool) {
 	if zone := strings.LastIndex(host, "%"); zone >= 0 {
 		host = host[:zone]
 	}
+	// Older iproute2 prints the IPv6 any-address as a bare "*" (newer builds
+	// print "[::]"); the control plane takes an IP or prefix and refused the
+	// whole snapshot for a node with one such socket, which on this fleet is
+	// every node running a sing-box bank.
+	if host == "*" {
+		host = "::"
+	}
 	port, err := strconv.Atoi(strings.TrimSpace(portText))
 	if err != nil {
 		return "", 0, false
