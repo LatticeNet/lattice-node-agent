@@ -33,6 +33,10 @@ type Source struct {
 	Now             func() time.Time
 	Runner          guardreality.Runner
 	Processes       func() []singboxdiscover.TrustedProcess
+	// Refused lists the sing-box candidates the trust selector turned down.
+	// Consulted only when Processes finds nothing, so the probe error can say
+	// why the service could not be proven rather than leaving a bare unknown.
+	Refused func() []singboxdiscover.RefusedProcess
 }
 
 func (s Source) withDefaults() Source {
@@ -53,6 +57,9 @@ func (s Source) withDefaults() Source {
 	}
 	if s.Processes == nil {
 		s.Processes = singboxdiscover.TrustedProcesses
+	}
+	if s.Refused == nil {
+		s.Refused = singboxdiscover.RefusedProcesses
 	}
 	return s
 }
@@ -86,6 +93,14 @@ func Collect(ctx context.Context, src Source) (model.SingBoxRuntime, BoundPorts)
 		rt.PID = procs[0].PID
 		if !procs[0].StartedAt.IsZero() {
 			rt.StartedAt = procs[0].StartedAt.UTC()
+		}
+	} else {
+		// Nothing trusted is running. If something that looks like sing-box
+		// is, say so and say which rule refused it: the server turns "unit
+		// active, no trusted process" into unknown, and unknown without a
+		// reason is the state an operator cannot act on.
+		for _, refused := range src.Refused() {
+			problems = append(problems, fmt.Sprintf("refused sing-box candidate %s (pid %d): %s", refused.Exe, refused.PID, refused.Reason))
 		}
 	}
 
