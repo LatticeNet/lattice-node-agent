@@ -1,6 +1,7 @@
 package taskexec
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -544,4 +545,41 @@ func normalizePathForTest(path string) string {
 		}
 	}
 	return path
+}
+
+// Shutdown has to be able to stop a task that would otherwise run for its whole
+// timeout. Cancelling the run context kills the process group and the result
+// comes back promptly, failed, and saying it was interrupted rather than the
+// bare "context canceled" that reads as a bug.
+func TestRunContextCancelKillsRunningTask(t *testing.T) {
+	r := Runner{AllowExec: true, getUID: nonRootUID}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	result := r.RunContext(ctx, model.Task{ID: "task_1", Interpreter: "sh", Script: "sleep 30", TimeoutSec: 60, OutputLimit: 1024})
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("cancelled task took %s to return", elapsed)
+	}
+	if result.ExitCode != -1 {
+		t.Fatalf("exit code = %d, want -1: %#v", result.ExitCode, result)
+	}
+	if !strings.Contains(result.Error, "task interrupted before completion") {
+		t.Fatalf("error = %q, want interruption message", result.Error)
+	}
+	if result.FinishedAt.IsZero() || result.FinishedAt.Before(result.StartedAt) {
+		t.Fatalf("finished_at not set after started_at: %#v", result)
+	}
+}
+
+// A task that finishes on its own is unaffected by the outer context, and the
+// task's own deadline still reports the plain deadline error.
+func TestRunContextKeepsOwnTimeout(t *testing.T) {
+	r := Runner{AllowExec: true, getUID: nonRootUID}
+	result := r.RunContext(context.Background(), model.Task{ID: "task_1", Interpreter: "sh", Script: "sleep 5", TimeoutSec: 1, OutputLimit: 1024})
+	if result.ExitCode != -1 || result.Error != context.DeadlineExceeded.Error() {
+		t.Fatalf("unexpected result %#v", result)
+	}
 }

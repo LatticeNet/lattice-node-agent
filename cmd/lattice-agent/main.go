@@ -18,12 +18,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
@@ -42,7 +44,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.9-alpha.7"
+var version = "0.3.9-alpha.8"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -461,16 +463,42 @@ func main() {
 		AllowExec: cfg.AllowExec, AllowRoot: cfg.AllowRoot, Cgroup: cfg.taskCgroupConfig(),
 		WorkdirRoot: cfg.TaskWorkRoot, AgentBinary: agentBinary, LinechainTxnDir: linechainDir, LinechainConfigDir: linechainConfigDir, LinechainSidecarPath: linechainSidecarPath,
 	}
+	// Tasks run on their own goroutine so a script that blocks (a curl to a
+	// host the node cannot reach, for its whole timeout) never stops the node
+	// from reporting; the loop below only hands leases over and keeps going.
+	worker := newTaskWorker(runner, taskResults, linechainManager)
 	monitors := newMonitorManager(cfg)
 	logTailers := newLogTailManager(cfg)
 	statsDiscovery := newSingBoxStatsDiscovery()
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
+	// From here on SIGTERM (systemd stop) and Ctrl-C end the loop in order, so
+	// a task that is still running gets a bounded grace, is killed if it does
+	// not finish, and has its result reported. The startup phases above keep
+	// the default signal action (immediate exit), as before.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	// wait blocks until the next tick; false means shutdown was requested.
+	wait := func() bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			return true
+		}
+	}
 	for {
-		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
-			log.Printf("linechain recovery blocked cycle: %v", err)
-			<-ticker.C
-			continue
+		// Recovery reads and rewrites the same journals the running task owns,
+		// so it only runs while no task is in flight; the worker's own poll
+		// repeats this check before it leases anything.
+		if worker.idle() {
+			if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
+				log.Printf("linechain recovery blocked cycle: %v", err)
+				if !wait() {
+					break
+				}
+				continue
+			}
 		}
 		if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 			debugf(cfg, "agent config fetch failed: %v", err)
@@ -490,7 +518,7 @@ func main() {
 		if err := reportSingBoxInventory(cfg); err != nil {
 			log.Printf("singbox discover error: %v", err)
 		}
-		if err := runTasks(cfg, runner, taskResults, linechainManager); err != nil {
+		if err := worker.poll(cfg); err != nil {
 			log.Printf("task poll error: %v", err)
 		}
 		if assigned, err := fetchMonitors(cfg); err != nil {
@@ -513,8 +541,12 @@ func main() {
 			log.Printf("guard reality error: %v", err)
 		}
 		cancelReport()
-		<-ticker.C
+		if !wait() {
+			break
+		}
 	}
+	log.Printf("lattice-agent stopping: shutdown signal received")
+	worker.shutdown(taskShutdownGrace, taskShutdownReportGrace)
 }
 
 var guardManagedSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -1286,158 +1318,342 @@ type leasedAgentTask struct {
 	DurableProtocol string `json:"durable_protocol,omitempty"`
 }
 
+// runTasks is one complete synchronous task cycle: poll, then execute the
+// leased batch in order. The agent's main loop no longer calls it (the
+// taskWorker splits the two halves across goroutines); it remains the single
+// place that states the whole cycle and is what the cycle tests drive.
 func runTasks(cfg agentConfig, runner taskRunner, outbox taskResultOutbox, managers ...*linechain.Manager) error {
 	var manager *linechain.Manager
 	if len(managers) > 0 {
 		manager = managers[0]
 	}
+	tasks, err := pollTasks(cfg, outbox, manager)
+	if err != nil {
+		return err
+	}
+	return executeTasks(context.Background(), cfg, runner, outbox, manager, tasks, nil)
+}
+
+// pollTasks is the poll-side half of a task cycle: it finishes any pending
+// recovery, uploads results still in the outbox, and asks the server for a
+// lease batch. It executes nothing. It touches the outbox, so the caller must
+// guarantee no task is running at the same time.
+func pollTasks(cfg agentConfig, outbox taskResultOutbox, manager *linechain.Manager) ([]leasedAgentTask, error) {
 	if manager != nil {
 		if err := requireLinechainRecovered(context.Background(), manager, outbox, cfg.NodeID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := outbox.RecoverInterrupted(cfg.NodeID); err != nil {
-		return fmt.Errorf("recover interrupted task results: %w", err)
+		return nil, fmt.Errorf("recover interrupted task results: %w", err)
 	}
 	if err := flushTaskResults(cfg, outbox); err != nil {
-		return err
+		return nil, err
 	}
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/tasks?node_id=%s", cfg.Server, cfg.NodeID), nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	req.Header.Set(agentCapabilitiesHeader, strings.Join(capabilitiesFor(cfg.LinechainReady), ","))
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return agentHTTPError(resp, "fetch tasks")
+		return nil, agentHTTPError(resp, "fetch tasks")
 	}
 	var tasks []leasedAgentTask
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
-		return err
+		return nil, err
 	}
 	debugf(cfg, "tasks fetched: count=%d", len(tasks))
-	for _, leased := range tasks {
-		task := leased.Task
-		if err := validateDurablePair(leased, manager, cfg.LinechainReady); err != nil {
-			return err
+	return tasks, nil
+}
+
+// executeTasks runs one leased batch in lease order, one task at a time, and
+// stops at the first error exactly as the old inline loop did. Once stop is
+// closed (agent shutdown) it does not start another task; leases it never
+// started expire on the server and are redelivered, the same as if the process
+// had died between them. A nil stop never fires.
+func executeTasks(ctx context.Context, cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manager *linechain.Manager, tasks []leasedAgentTask, stop <-chan struct{}) error {
+	for i, leased := range tasks {
+		select {
+		case <-stop:
+			log.Printf("task poll: leaving %d leased task(s) to expire: agent shutting down", len(tasks)-i)
+			return nil
+		default:
 		}
-		if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v2" && leased.DurableProtocol != "netguard-v1" {
-			return fmt.Errorf("unsupported durable protocol %q", leased.DurableProtocol)
-		}
-		if !leased.DurableResult {
-			debugf(cfg, "task start without durable-result protocol: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
-			result := runner.Run(task)
-			result.NodeID = cfg.NodeID
-			if result.FinishedAt.IsZero() {
-				result.FinishedAt = time.Now().UTC()
-			}
-			if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": result}, nil); err != nil {
-				return fmt.Errorf("post task result %s: %w", task.ID, err)
-			}
-			continue
-		}
-		var committed bool
-		var err error
-		if typed, ok := outbox.(interface {
-			BeginWithProtocol(model.Task, string) (bool, error)
-		}); ok {
-			committed, err = typed.BeginWithProtocol(task, leased.DurableProtocol)
-		} else {
-			committed, err = outbox.Begin(task)
-		}
-		if err != nil {
-			journalErr := fmt.Errorf("journal task lease %s before execution: %w", task.ID, err)
-			if committed {
-				// The lease journal is visible but its directory durability is
-				// uncertain. Do not post a different direct result: the next poll
-				// will recover this exact journal as an unknown outcome.
-				return journalErr
-			}
-			// No host code ran, so it is safe to make one best-effort terminal
-			// report even though durable retry storage is unavailable. This avoids
-			// silently stranding the server lease while preserving the fail-closed
-			// rule that an unjournaled task is never executed.
-			failure := model.TaskResult{
-				TaskID: task.ID, LeaseID: task.LeaseID, NodeID: cfg.NodeID, ExitCode: -1,
-				Error:      "task was not executed because its durable lease journal could not be written",
-				FinishedAt: time.Now().UTC(),
-			}
-			if postErr := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": failure}, nil); postErr != nil {
-				return fmt.Errorf("%v; report unexecuted task: %w", journalErr, postErr)
-			}
-			return journalErr
-		}
-		if !committed {
-			// The server intentionally redelivers an unacknowledged lease when a
-			// prior task-poll response may have been lost. An exact existing journal
-			// is the execution authority, so the duplicate response is a no-op.
-			debugf(cfg, "task lease already journaled: id=%s", task.ID)
-			continue
-		}
-		debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
-		var result model.TaskResult
-		if isLinechainTask(leased) {
-			typed, ok := runner.(interface {
-				RunLinechain(model.Task) model.TaskResult
-			})
-			if !ok {
-				return fmt.Errorf("linechain task runner does not expose trusted E3 execution")
-			}
-			result = typed.RunLinechain(task)
-		} else {
-			result = runner.Run(task)
-		}
-		result.NodeID = cfg.NodeID
-		if manager != nil && isLinechainTask(leased) {
-			result, err = manager.ResolveAfterRun(context.Background(), task, result)
-			if err != nil {
-				return fmt.Errorf("resolve linechain task %s: %w", task.ID, err)
-			}
-		}
-		debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
-		completed, completeErr := outbox.Complete(result)
-		if completeErr != nil {
-			journalErr := fmt.Errorf("journal task result %s before upload: %w", task.ID, completeErr)
-			if completed {
-				// Rename published the exact result even though directory durability
-				// was uncertain. Confirm the local transition before allowing the
-				// server to commit the result; otherwise a crash could expose the old
-				// leased journal and synthesize a conflicting unknown-outcome result.
-				if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
-					return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
-				}
-				if manager != nil && isLinechainTask(leased) {
-					if cleanupErr := manager.Cleanup(task.ID, task.LeaseID); cleanupErr != nil {
-						if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
-							return fmt.Errorf("%v; cleanup confirmed linechain task: %v; upload stable result: %w", journalErr, cleanupErr, uploadErr)
-						}
-						return fmt.Errorf("%v; cleanup confirmed linechain task: %w; result remains replayable", journalErr, cleanupErr)
-					}
-				}
-				if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
-					return fmt.Errorf("%v; upload confirmed task result: %w", journalErr, flushErr)
-				}
-			}
-			return journalErr
-		}
-		if manager != nil && isLinechainTask(leased) {
-			if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
-				if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
-					return fmt.Errorf("cleanup linechain task %s: %v; upload stable result: %w", task.ID, err, uploadErr)
-				}
-				return fmt.Errorf("cleanup linechain task %s after durable outbox completion; result remains replayable: %w", task.ID, err)
-			}
-		}
-		if err := flushTaskResults(cfg, outbox); err != nil {
+		if err := executeTask(ctx, cfg, runner, outbox, manager, leased); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// executeTask runs one leased task with the journal discipline that gives the
+// at-most-once guarantee: a durable task is journaled immediately before it
+// runs, its result is journaled before upload, and an exact redelivery of an
+// already journaled lease is a no-op. ctx bounds the run itself; cancelling it
+// kills the task's process group and the failed result is still reported.
+func executeTask(ctx context.Context, cfg agentConfig, runner taskRunner, outbox taskResultOutbox, manager *linechain.Manager, leased leasedAgentTask) error {
+	task := leased.Task
+	if err := validateDurablePair(leased, manager, cfg.LinechainReady); err != nil {
+		return err
+	}
+	if leased.DurableProtocol != "" && leased.DurableProtocol != "linechain-e3-v2" && leased.DurableProtocol != "netguard-v1" {
+		return fmt.Errorf("unsupported durable protocol %q", leased.DurableProtocol)
+	}
+	if !leased.DurableResult {
+		debugf(cfg, "task start without durable-result protocol: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
+		result, err := runTask(ctx, runner, task, false)
+		if err != nil {
+			return err
+		}
+		result.NodeID = cfg.NodeID
+		if result.FinishedAt.IsZero() {
+			result.FinishedAt = time.Now().UTC()
+		}
+		if err := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": result}, nil); err != nil {
+			return fmt.Errorf("post task result %s: %w", task.ID, err)
+		}
+		return nil
+	}
+	var committed bool
+	var err error
+	if typed, ok := outbox.(interface {
+		BeginWithProtocol(model.Task, string) (bool, error)
+	}); ok {
+		committed, err = typed.BeginWithProtocol(task, leased.DurableProtocol)
+	} else {
+		committed, err = outbox.Begin(task)
+	}
+	if err != nil {
+		journalErr := fmt.Errorf("journal task lease %s before execution: %w", task.ID, err)
+		if committed {
+			// The lease journal is visible but its directory durability is
+			// uncertain. Do not post a different direct result: the next poll
+			// will recover this exact journal as an unknown outcome.
+			return journalErr
+		}
+		// No host code ran, so it is safe to make one best-effort terminal
+		// report even though durable retry storage is unavailable. This avoids
+		// silently stranding the server lease while preserving the fail-closed
+		// rule that an unjournaled task is never executed.
+		failure := model.TaskResult{
+			TaskID: task.ID, LeaseID: task.LeaseID, NodeID: cfg.NodeID, ExitCode: -1,
+			Error:      "task was not executed because its durable lease journal could not be written",
+			FinishedAt: time.Now().UTC(),
+		}
+		if postErr := postAgentJSON(cfg, "/api/agent/task-result", map[string]any{"result": failure}, nil); postErr != nil {
+			return fmt.Errorf("%v; report unexecuted task: %w", journalErr, postErr)
+		}
+		return journalErr
+	}
+	if !committed {
+		// The server intentionally redelivers an unacknowledged lease when a
+		// prior task-poll response may have been lost. An exact existing journal
+		// is the execution authority, so the duplicate response is a no-op.
+		debugf(cfg, "task lease already journaled: id=%s", task.ID)
+		return nil
+	}
+	debugf(cfg, "task start: id=%s interpreter=%s timeout=%ds", task.ID, task.Interpreter, task.TimeoutSec)
+	result, err := runTask(ctx, runner, task, isLinechainTask(leased))
+	if err != nil {
+		return err
+	}
+	result.NodeID = cfg.NodeID
+	if manager != nil && isLinechainTask(leased) {
+		result, err = manager.ResolveAfterRun(context.Background(), task, result)
+		if err != nil {
+			return fmt.Errorf("resolve linechain task %s: %w", task.ID, err)
+		}
+	}
+	debugf(cfg, "task complete: id=%s exit_code=%d error=%t", task.ID, result.ExitCode, result.Error != "")
+	completed, completeErr := outbox.Complete(result)
+	if completeErr != nil {
+		journalErr := fmt.Errorf("journal task result %s before upload: %w", task.ID, completeErr)
+		if completed {
+			// Rename published the exact result even though directory durability
+			// was uncertain. Confirm the local transition before allowing the
+			// server to commit the result; otherwise a crash could expose the old
+			// leased journal and synthesize a conflicting unknown-outcome result.
+			if confirmErr := outbox.ConfirmDurability(); confirmErr != nil {
+				return fmt.Errorf("%v; confirm published task result: %w", journalErr, confirmErr)
+			}
+			if manager != nil && isLinechainTask(leased) {
+				if cleanupErr := manager.Cleanup(task.ID, task.LeaseID); cleanupErr != nil {
+					if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
+						return fmt.Errorf("%v; cleanup confirmed linechain task: %v; upload stable result: %w", journalErr, cleanupErr, uploadErr)
+					}
+					return fmt.Errorf("%v; cleanup confirmed linechain task: %w; result remains replayable", journalErr, cleanupErr)
+				}
+			}
+			if flushErr := flushTaskResults(cfg, outbox); flushErr != nil {
+				return fmt.Errorf("%v; upload confirmed task result: %w", journalErr, flushErr)
+			}
+		}
+		return journalErr
+	}
+	if manager != nil && isLinechainTask(leased) {
+		if err := manager.Cleanup(task.ID, task.LeaseID); err != nil {
+			if uploadErr := flushTaskResultsRetain(cfg, outbox, true); uploadErr != nil {
+				return fmt.Errorf("cleanup linechain task %s: %v; upload stable result: %w", task.ID, err, uploadErr)
+			}
+			return fmt.Errorf("cleanup linechain task %s after durable outbox completion; result remains replayable: %w", task.ID, err)
+		}
+	}
+	return flushTaskResults(cfg, outbox)
+}
+
+// runTask hands one task to the runner. Runners that take a context (the real
+// taskexec.Runner) can be cut short by shutdown; the plain Run form is kept so
+// existing fakes and any runner without a context still work. The linechain
+// path is chosen from lease metadata, never from script contents.
+func runTask(ctx context.Context, runner taskRunner, task model.Task, viaLinechain bool) (model.TaskResult, error) {
+	if viaLinechain {
+		switch typed := runner.(type) {
+		case interface {
+			RunLinechainContext(context.Context, model.Task) model.TaskResult
+		}:
+			return typed.RunLinechainContext(ctx, task), nil
+		case interface {
+			RunLinechain(model.Task) model.TaskResult
+		}:
+			return typed.RunLinechain(task), nil
+		default:
+			return model.TaskResult{}, fmt.Errorf("linechain task runner does not expose trusted E3 execution")
+		}
+	}
+	if typed, ok := runner.(interface {
+		RunContext(context.Context, model.Task) model.TaskResult
+	}); ok {
+		return typed.RunContext(ctx, task), nil
+	}
+	return runner.Run(task), nil
+}
+
+// Shutdown budget for a task that is still running when the agent is told to
+// stop: taskShutdownGrace lets it finish on its own, then it is killed and
+// taskShutdownReportGrace covers journaling and one result upload (the HTTP
+// client timeout is 30s). Together they stay under systemd's default 90s
+// TimeoutStopSec, which the installed unit does not override.
+const (
+	taskShutdownGrace       = 10 * time.Second
+	taskShutdownReportGrace = 45 * time.Second
+)
+
+// taskWorker runs leased tasks off the poll loop, one at a time in lease
+// order, so a task that blocks never stops the node from reporting. The poll
+// hands over at most one batch (what one lease response returned) and only
+// while the worker is idle, so no lease waits in memory long enough to expire.
+// That handoff is also what keeps the outbox single-threaded: the poll touches
+// it only while idle, the worker only while busy, and the busy flag's mutex
+// orders the two.
+type taskWorker struct {
+	runner  taskRunner
+	outbox  taskResultOutbox
+	manager *linechain.Manager
+
+	mu   sync.Mutex
+	busy bool
+
+	batches  chan taskBatch
+	stopping chan struct{}
+	done     chan struct{}
+
+	// runCtx is the parent of every task run; shutdown cancels it to kill a
+	// task that outlived its grace.
+	runCtx     context.Context
+	cancelRuns context.CancelFunc
+}
+
+// taskBatch is one lease response together with the config it was leased
+// under, which is what the sequential loop used for the whole batch too.
+type taskBatch struct {
+	cfg   agentConfig
+	tasks []leasedAgentTask
+}
+
+func newTaskWorker(runner taskRunner, outbox taskResultOutbox, manager *linechain.Manager) *taskWorker {
+	runCtx, cancelRuns := context.WithCancel(context.Background())
+	w := &taskWorker{
+		runner: runner, outbox: outbox, manager: manager,
+		batches: make(chan taskBatch, 1), stopping: make(chan struct{}), done: make(chan struct{}),
+		runCtx: runCtx, cancelRuns: cancelRuns,
+	}
+	go w.run()
+	return w
+}
+
+func (w *taskWorker) run() {
+	defer close(w.done)
+	for batch := range w.batches {
+		if err := executeTasks(w.runCtx, batch.cfg, w.runner, w.outbox, w.manager, batch.tasks, w.stopping); err != nil {
+			log.Printf("task error: %v", err)
+		}
+		w.setBusy(false)
+	}
+}
+
+func (w *taskWorker) setBusy(busy bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.busy = busy
+}
+
+// idle reports whether no batch is in flight. Only the poll goroutine moves
+// the worker from idle to busy (in poll), so a true answer holds until that
+// goroutine itself hands over a batch.
+func (w *taskWorker) idle() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.busy
+}
+
+// poll runs the poll-side half of a task cycle and hands any leased batch to
+// the worker. While a batch is in flight it does nothing: leasing would leave
+// tasks waiting in memory, and recovery or upload would touch the outbox under
+// the running task. poll and shutdown must be called from one goroutine.
+func (w *taskWorker) poll(cfg agentConfig) error {
+	if !w.idle() {
+		debugf(cfg, "task poll skipped: task in progress")
+		return nil
+	}
+	tasks, err := pollTasks(cfg, w.outbox, w.manager)
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	w.setBusy(true)
+	w.batches <- taskBatch{cfg: cfg, tasks: tasks}
+	return nil
+}
+
+// shutdown stops the worker. A running task gets grace to finish on its own;
+// after that its process group is killed through the run context and the
+// worker gets reportGrace to journal and upload the failed result. Leases in
+// the batch that never started are dropped and expire on the server. If even
+// reportGrace runs out the journal is left as is and the next start recovers
+// it as an unknown outcome, which is the crash path and stays correct.
+func (w *taskWorker) shutdown(grace, reportGrace time.Duration) {
+	close(w.stopping)
+	close(w.batches)
+	select {
+	case <-w.done:
+		return
+	case <-time.After(grace):
+	}
+	log.Printf("shutdown: task still running after %s; killing it", grace)
+	w.cancelRuns()
+	select {
+	case <-w.done:
+	case <-time.After(reportGrace):
+		log.Printf("shutdown: task result not reported within %s; its journal is recovered on the next start", reportGrace)
+	}
 }
 
 func crossCheckLinechainAuthority(manager *linechain.Manager, outbox taskResultOutbox) error {
