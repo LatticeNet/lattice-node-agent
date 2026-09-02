@@ -251,3 +251,52 @@ func nftFixture(tableHandle, ruleHandle string) string {
   ]
 }`
 }
+
+func TestCollectAttachesSSHDFactsOrNote(t *testing.T) {
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch name + " " + strings.Join(args, " ") {
+		case "ss -tulpnH":
+			return []byte(ssFixture), nil
+		case "ip -j addr":
+			return []byte(ipFixture), nil
+		case "nft -j list ruleset":
+			return []byte(nftFixture("11", "22")), nil
+		case "nft --version":
+			return []byte("nftables v1.0.9\n"), nil
+		}
+		return nil, errors.New("unexpected command")
+	}
+	got, err := Collect(context.Background(), Source{Runner: runner}, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SSHD != nil || got.SSHDNote != "sshd facts collector not configured" {
+		t.Fatalf("unwired sshd step must say so: sshd=%+v note=%q", got.SSHD, got.SSHDNote)
+	}
+
+	facts := &model.GuardSSHDFacts{
+		PubkeyAuthentication: true,
+		PermitRootLogin:      "no",
+		Ports:                []int{58394},
+		ObservedAt:           time.Date(2026, 9, 2, 7, 0, 0, 0, time.UTC),
+	}
+	got, err = Collect(context.Background(), Source{Runner: runner, SSHD: func(context.Context) (*model.GuardSSHDFacts, string) {
+		return facts, ""
+	}}, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.SSHD, facts) || got.SSHDNote != "" {
+		t.Fatalf("facts not attached: sshd=%+v note=%q", got.SSHD, got.SSHDNote)
+	}
+
+	got, err = Collect(context.Background(), Source{Runner: runner, SSHD: func(context.Context) (*model.GuardSSHDFacts, string) {
+		return nil, "sshd -T needs root to read the effective configuration; agent runs as uid 1000"
+	}}, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SSHD != nil || !strings.Contains(got.SSHDNote, "needs root") || len(got.Listeners) == 0 {
+		t.Fatalf("a refused sshd step must keep the rest of the snapshot: %+v", got)
+	}
+}

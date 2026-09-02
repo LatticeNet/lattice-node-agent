@@ -33,6 +33,12 @@ const (
 // coverage never depends on the local host's nftables, ss, or ip state.
 type Runner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
+// SSHDCollector returns the effective sshd facts, or nil and the reason they
+// could not be proven. The type lives here rather than in the sshd probe so
+// the probe can be injected without this package importing it (the probe
+// imports this package for its runner).
+type SSHDCollector func(ctx context.Context) (*model.GuardSSHDFacts, string)
+
 // Source configures guard reality collection.
 type Source struct {
 	SSBinary  string
@@ -41,6 +47,10 @@ type Source struct {
 	Timeout   time.Duration
 	Now       func() time.Time
 	Runner    Runner
+	// SSHD reads the effective sshd configuration for the report. nil leaves
+	// the report's sshd block absent and says so in the note, so a step that
+	// was never wired cannot pass for a node that refused.
+	SSHD SSHDCollector
 }
 
 // CollectManagedTableSHA reads the current nftables ruleset and returns the
@@ -160,7 +170,7 @@ func Collect(ctx context.Context, source Source, nodeID string) (model.GuardNode
 	if source.Now != nil {
 		at = source.Now().UTC()
 	}
-	return model.GuardNodeReality{
+	reality := model.GuardNodeReality{
 		NodeID:        nodeID,
 		Listeners:     listeners,
 		Interfaces:    interfaces,
@@ -168,7 +178,15 @@ func Collect(ctx context.Context, source Source, nodeID string) (model.GuardNode
 		ForeignTables: foreignTables,
 		NFTVersion:    ParseNFTVersion(versionOut),
 		CollectedAt:   at,
-	}, nil
+	}
+	// The sshd step rides the same snapshot but never blocks it: a refusal
+	// or failure is data (nil plus a note), so the listeners still post.
+	if source.SSHD != nil {
+		reality.SSHD, reality.SSHDNote = source.SSHD(ctx)
+	} else {
+		reality.SSHDNote = "sshd facts collector not configured"
+	}
+	return reality, nil
 }
 
 func runStep(ctx context.Context, timeout time.Duration, run Runner, name string, args ...string) ([]byte, error) {

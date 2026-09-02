@@ -77,3 +77,32 @@ func TestExplainSingBoxExecutableOrdersTheRules(t *testing.T) {
 		t.Fatalf("directory rule must apply without a stat: %q", got)
 	}
 }
+
+// The sshd facts probe runs a root-only command from whatever
+// ResolveTrustedExecutable hands it, so the resolver has to apply the
+// selector's rules in the selector's order and name the rule it failed.
+func TestResolveTrustedExecutableSharesTheSelectorRules(t *testing.T) {
+	f := newProcFixture(t)
+	if path, reason := ResolveTrustedExecutable("sshd"); path != "" || !strings.Contains(reason, "sshd not found in the trusted executable directories") || !strings.Contains(reason, f.bin) {
+		t.Fatalf("missing: path=%q reason=%q", path, reason)
+	}
+	if path, reason := ResolveTrustedExecutable("../sshd"); path != "" || reason != "executable name must be a bare file name" {
+		t.Fatalf("relative name: path=%q reason=%q", path, reason)
+	}
+	loose := f.binary(t, f.bin, "sshd", 0o777)
+	f.ownedByRoot(loose)
+	if path, reason := ResolveTrustedExecutable("sshd"); path != "" || reason != loose+": group or world writable" {
+		t.Fatalf("writable: path=%q reason=%q", path, reason)
+	}
+	if err := os.Chmod(loose, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.ownedBy(1001, loose)
+	if path, reason := ResolveTrustedExecutable("sshd"); path != "" || reason != loose+": owned by uid 1001, not root" {
+		t.Fatalf("owner: path=%q reason=%q", path, reason)
+	}
+	f.ownedByRoot(loose)
+	if path, reason := ResolveTrustedExecutable("sshd"); path != loose || reason != "" {
+		t.Fatalf("trusted: path=%q reason=%q", path, reason)
+	}
+}

@@ -41,7 +41,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.9-alpha.2"
+var version = "0.3.9-alpha.3"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -788,7 +788,7 @@ func reportGuardReality(ctx context.Context, cfg agentConfig, collect guardReali
 	if !cfg.ReportGuardReality {
 		return nil
 	}
-	reality, err := collect(ctx, guardreality.Source{}, cfg.NodeID)
+	reality, err := collect(ctx, guardreality.Source{SSHD: reportSSHDFacts}, cfg.NodeID)
 	if err != nil {
 		return fmt.Errorf("collect guard reality: %w", err)
 	}

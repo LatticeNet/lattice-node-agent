@@ -30,6 +30,18 @@ before this optional report, so a degraded collector cannot delay that work in
 the current cycle. Reported facts are low-trust input for display, drift, and
 suggestions only. They never mutate nftables or author policy.
 
+The same snapshot carries sshd facts for SSH Guard under `reality.sshd`: the
+effective `sshd -T` configuration (`password_authentication`,
+`pubkey_authentication`, `permit_root_login` as sshd prints it,
+`max_auth_tries`, every `port` line under `ports`, every `listenaddress` line
+under `listen_addresses`) plus `observed_at`. The agent reads it only when it
+runs as root and `sshd` resolves in the trusted executable directories the
+sing-box probe uses (`/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`,
+`/usr/local/bin`, `/usr/local/sbin`) as a root-owned file nobody else can
+write, under a 3-second deadline. Anything else leaves `sshd` out of the
+report and puts the reason in `reality.sshd_note`; the agent never fills in a
+default it did not read, and the rest of the snapshot still posts.
+
 ## Run
 
 ```sh
