@@ -52,9 +52,13 @@ func TestDiscoverParsesListAndVersion(t *testing.T) {
 }
 
 func TestResolveRuntimeLayoutUsesLocalProcessAuthority(t *testing.T) {
+	f := newProcFixture(t)
+	exe := f.binary(t, f.bin, "sing-box", 0o755)
+	other := f.binary(t, f.dir(t, "usr", "local", "bin"), "sing-box", 0o755)
+	f.ownedByRoot(exe, other)
 	dir := t.TempDir()
 	meta := filepath.Join(t.TempDir(), "lattice-metadata.json")
-	config, sidecar, err := resolveRuntimeLayout([][]string{{"/usr/bin/sing-box", "run", "-C", dir}}, meta)
+	config, sidecar, err := resolveRuntimeLayout([][]string{{exe, "run", "-C", dir}}, meta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +68,7 @@ func TestResolveRuntimeLayoutUsesLocalProcessAuthority(t *testing.T) {
 	// Ambiguity must still be refused. Both vectors carry a trusted executable
 	// path so this asserts the ambiguity rule itself rather than being satisfied
 	// by the executable-identity check added for the decoy-process finding.
-	if _, _, err := resolveRuntimeLayout([][]string{{"/usr/bin/sing-box", "run", "-C", dir}, {"/usr/local/bin/sing-box", "run", "-C", t.TempDir()}}, meta); err == nil {
+	if _, _, err := resolveRuntimeLayout([][]string{{exe, "run", "-C", dir}, {other, "run", "-C", t.TempDir()}}, meta); err == nil {
 		t.Fatal("ambiguous config directories accepted")
 	}
 }

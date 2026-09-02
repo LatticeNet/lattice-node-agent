@@ -1,7 +1,6 @@
 package singboxdiscover
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 )
@@ -21,26 +20,27 @@ import (
 // the control plane as this node's inventory.
 //
 // The load-bearing fix is the uid-0 and /proc/<pid>/exe check in
-// singBoxProcessArgs, which needs a live /proc and so is not exercised here.
-// These tests pin the second layer, which is pure and portable: a process may
-// only name host paths if it is running a sing-box binary out of a system
-// executable directory.
+// singBoxProcessArgs, pinned in audit_proc_authority_test.go. These tests pin
+// the second layer: a process may only name host paths if its argument vector
+// starts with a sing-box binary whose file and whole ancestry are root-owned
+// and writable by nobody else.
 func TestResolveRuntimeLayoutRefusesUnprivilegedDirectory(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("this test models an unprivileged decoy against a root agent")
-	}
-	attacker := t.TempDir() // owned by the caller, not by root
+	f := newProcFixture(t)
+	attacker := f.dir(t, "home", "mallory")
+	f.ownedBy(1000, attacker)
+	decoy := f.binary(t, attacker, "sing-box", 0o755)
+	f.ownedByRoot(decoy) // even a root-owned file is refused under a user-owned directory
 	meta := filepath.Join(t.TempDir(), "lattice-metadata.json")
 
-	for _, decoy := range [][]string{
+	for _, vector := range [][]string{
+		{decoy, "run", "-C", attacker},
 		{"/tmp/sing-box", "run", "-C", attacker},
-		{filepath.Join(attacker, "sing-box"), "run", "-C", attacker},
 		{"sing-box", "run", "-C", attacker},                  // bare, resolved through PATH
 		{"/usr/bin/my-sing-box-shim", "run", "-C", attacker}, // basename merely contains sing-box
 	} {
-		config, _, err := resolveRuntimeLayout([][]string{decoy}, meta)
+		config, _, err := resolveRuntimeLayout([][]string{vector}, meta)
 		if err == nil {
-			t.Fatalf("decoy %q nominated the layout authority: config dir = %q", decoy[0], config)
+			t.Fatalf("decoy %q nominated the layout authority: config dir = %q", vector[0], config)
 		}
 	}
 }
@@ -49,15 +49,18 @@ func TestResolveRuntimeLayoutRefusesUnprivilegedDirectory(t *testing.T) {
 // which is what an unfiltered second -C directory did (len(dirs) != 1 disables
 // durable linechain tasks for as long as the decoy runs).
 func TestResolveRuntimeLayoutIgnoresDecoyBesideRealProcess(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("this test models an unprivileged decoy against a root agent")
-	}
+	f := newProcFixture(t)
+	exe := f.binary(t, f.bin, "sing-box", 0o755)
+	f.ownedByRoot(exe)
+	attacker := f.dir(t, "home", "mallory")
+	f.ownedBy(1000, attacker)
+	decoy := f.binary(t, attacker, "sing-box", 0o755)
 	real := t.TempDir()
 	meta := filepath.Join(t.TempDir(), "lattice-metadata.json")
 
 	config, _, err := resolveRuntimeLayout([][]string{
-		{"/usr/bin/sing-box", "run", "-C", real},
-		{"/tmp/sing-box", "run", "-C", t.TempDir()},
+		{exe, "run", "-C", real},
+		{decoy, "run", "-C", attacker},
 	}, meta)
 	if err != nil {
 		t.Fatalf("decoy displaced the real sing-box authority: %v", err)
@@ -68,15 +71,13 @@ func TestResolveRuntimeLayoutIgnoresDecoyBesideRealProcess(t *testing.T) {
 }
 
 func TestTrustedSingBoxExecutable(t *testing.T) {
-	accept := []string{
-		"/usr/bin/sing-box",
-		"/usr/local/bin/sing-box",
-		"/usr/sbin/sing-box",
-		"/bin/sing-box",
-	}
-	for _, exe := range accept {
+	f := newProcFixture(t)
+	systemBin := f.binary(t, f.bin, "sing-box", 0o755)
+	managerBin := f.binary(t, f.dir(t, "etc", "sing-box", "bin"), "sing-box", 0o755)
+	f.ownedByRoot(systemBin, managerBin)
+	for _, exe := range []string{systemBin, managerBin} {
 		if !trustedSingBoxExecutable(exe) {
-			t.Fatalf("legitimate sing-box path refused: %s", exe)
+			t.Fatalf("legitimate sing-box path refused: %s (%s)", exe, explainSingBoxExecutable(exe))
 		}
 	}
 	refuse := []string{
@@ -90,6 +91,7 @@ func TestTrustedSingBoxExecutable(t *testing.T) {
 		"/usr/bin/my-sing-box",
 		"/usr/bin/sing-box/../../tmp/sing-box",
 		"/usr/bin/subdir/sing-box",
+		filepath.Join(f.bin, "sing-box", "..", "..", "sing-box"),
 	}
 	for _, exe := range refuse {
 		if trustedSingBoxExecutable(exe) {

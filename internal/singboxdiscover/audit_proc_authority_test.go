@@ -12,76 +12,132 @@ import (
 //
 // singBoxProcessArgs decides which local processes may name host paths for the
 // root agent. Its load-bearing checks read /proc: the process must be owned by
-// uid 0, and its executable is taken from /proc/<pid>/exe rather than the
-// self-reported argv[0]. Those checks previously had nothing exercising them,
-// so removing either one left the package green. These tests fabricate a
-// process tree and pin every refusal.
+// uid 0, its executable is taken from /proc/<pid>/exe rather than the
+// self-reported argv[0], and that executable must sit in a root-owned,
+// non-writable ancestry. Those checks previously had nothing exercising them,
+// so removing one left the package green. These tests fabricate a process
+// tree and pin every refusal.
 //
-// Only one fact is fabricated: file ownership, because a test process that is
-// not root cannot create a root-owned file. Modes, symlinks, and the /proc
-// layout are real on disk.
+// Two facts are fabricated, because a test process that is not root cannot
+// create a root-owned file: the uid of paths inside the fixture, and the
+// identity of the host directories above it (the temp directory tree, where
+// /tmp is world writable and /var is a symlink on macOS), which stand in for
+// the root-owned system tree. Modes, symlinks, inodes and the /proc layout
+// are real on disk.
 
 type procFixture struct {
-	root  string
-	bin   string
-	owner map[string]uint32
+	// root is the fake /proc.
+	root string
+	// base is the canonical per-test temp directory; every fixture path sits
+	// below it and everything below it is real on disk.
+	base string
+	// bin is a root-owned executable directory under base; the fixture points
+	// the resolver's search order at it.
+	bin    string
+	owner  map[string]uint32
+	broken map[string]error
 }
 
 func newProcFixture(t *testing.T) *procFixture {
 	t.Helper()
-	base := t.TempDir()
-	f := &procFixture{
-		root:  filepath.Join(base, "proc"),
-		bin:   filepath.Join(base, "sbin"),
-		owner: map[string]uint32{},
-	}
-	if err := os.MkdirAll(f.root, 0o755); err != nil {
+	base, err := filepath.EvalSymlinks(filepath.Dir(t.TempDir()))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(f.bin, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	f := &procFixture{base: base, owner: map[string]uint32{}, broken: map[string]error{}}
+	f.ownedByRoot(base)
+	f.root = f.dir(t, "proc")
+	f.bin = f.dir(t, "sbin")
 
-	realStat := statIdentity
+	realLstat, realStat := lstatIdentity, statIdentity
 	realRoot := procRoot
-	realDirs := trustedSingBoxExecutableDirs
+	realDirs := trustedExecutableSearchDirs
 	procRoot = f.root
-	trustedSingBoxExecutableDirs = []string{f.bin}
-	// Keep the real mode from disk and substitute only the uid, so the mode,
-	// permission and regular-file rules are still exercised against real files.
-	statIdentity = func(path string) (fileIdentity, error) {
-		id, err := realStat(path)
-		if err != nil {
-			return id, err
-		}
-		if uid, ok := f.owner[filepath.Clean(path)]; ok {
-			id.uid = uid
-		}
-		return id, nil
-	}
+	trustedExecutableSearchDirs = []string{f.bin}
+	lstatIdentity = f.identity(realLstat, false)
+	statIdentity = f.identity(realStat, true)
 	t.Cleanup(func() {
+		lstatIdentity = realLstat
 		statIdentity = realStat
 		procRoot = realRoot
-		trustedSingBoxExecutableDirs = realDirs
+		trustedExecutableSearchDirs = realDirs
 	})
 	return f
 }
 
-// ownedByRoot marks a path as uid 0 for the duration of the test.
+// identity wraps a real stat function with the fixture's fabrications: an
+// injected error, a substituted uid for paths inside the fixture, and a
+// root-owned 0755 directory for every host directory above it. Everything
+// else (mode, symlink, inode, mtime) comes from disk. A following stat keys
+// the uid by the link's target, as the kernel would own it.
+func (f *procFixture) identity(real func(string) (fileIdentity, error), follow bool) func(string) (fileIdentity, error) {
+	return func(path string) (fileIdentity, error) {
+		clean := filepath.Clean(path)
+		if err, ok := f.broken[clean]; ok {
+			return fileIdentity{}, err
+		}
+		if clean != f.base && !strings.HasPrefix(clean, f.base+"/") {
+			if clean == "/" || strings.HasPrefix(f.base, clean+"/") {
+				return fileIdentity{mode: os.ModeDir | 0o755}, nil
+			}
+			return real(path)
+		}
+		id, err := real(path)
+		if err != nil {
+			return id, err
+		}
+		key := clean
+		if follow {
+			if target, err := filepath.EvalSymlinks(clean); err == nil {
+				key = target
+			}
+		}
+		if uid, ok := f.owner[key]; ok {
+			id.uid = uid
+		}
+		return id, nil
+	}
+}
+
+// ownedByRoot marks paths as uid 0 for the duration of the test.
 func (f *procFixture) ownedByRoot(paths ...string) {
 	for _, p := range paths {
 		f.owner[filepath.Clean(p)] = 0
 	}
 }
 
-// ownedBy marks a path as an arbitrary uid.
+// ownedBy marks paths as an arbitrary uid.
 func (f *procFixture) ownedBy(uid uint32, paths ...string) {
 	for _, p := range paths {
 		f.owner[filepath.Clean(p)] = uid
 	}
 }
 
+// unstatable makes every stat of exactly this path fail with err.
+func (f *procFixture) unstatable(path string, err error) {
+	f.broken[filepath.Clean(path)] = err
+}
+
+// dir creates a directory chain under base with mode 0755 and marks every
+// component root-owned, so the result models a system directory.
+func (f *procFixture) dir(t *testing.T, elems ...string) string {
+	t.Helper()
+	path := f.base
+	for _, elem := range elems {
+		path = filepath.Join(path, elem)
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f.ownedByRoot(path)
+	}
+	return path
+}
+
 // binary writes an executable file into a directory and returns its path.
+// Ownership is not marked: the test says who owns it.
 func (f *procFixture) binary(t *testing.T, dir, name string, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -95,7 +151,7 @@ func (f *procFixture) binary(t *testing.T, dir, name string, mode os.FileMode) s
 }
 
 // process writes a fake /proc/<pid> whose cmdline holds argv and whose exe link
-// points at exeTarget (skipped when empty, modelling a link the agent may not
+// points at exeTarget (skipped when empty, modelling a link that cannot be
 // read).
 func (f *procFixture) process(t *testing.T, pid string, argv []string, exeTarget string) string {
 	t.Helper()
@@ -148,9 +204,10 @@ func TestSingBoxProcessArgsRefusesUnprivilegedAndSpoofedProcesses(t *testing.T) 
 		requireNoProcesses(t)
 	})
 
-	t.Run("exe resolves outside a trusted location while argv0 lies", func(t *testing.T) {
+	t.Run("exe resolves into a user-owned directory while argv0 lies", func(t *testing.T) {
 		f := newProcFixture(t)
-		elsewhere := t.TempDir()
+		elsewhere := f.dir(t, "home", "mallory")
+		f.ownedBy(1000, elsewhere)
 		exe := f.binary(t, elsewhere, "sing-box", 0o755)
 		// The process claims the trusted path in argv[0]; only /proc/<pid>/exe
 		// tells the truth.
@@ -193,32 +250,15 @@ func TestSingBoxProcessArgsRefusesUnprivilegedAndSpoofedProcesses(t *testing.T) 
 	})
 }
 
-// When /proc/<pid>/exe cannot be read (a non-root agent has no ptrace permission
-// over a root process) the selector falls back to the self-reported argv[0].
-// That is only sound because the uid-0 check already passed, so the fallback
-// must still apply the full executable rules.
-func TestSingBoxProcessArgsUnreadableExeFallsBackToArgv0Rules(t *testing.T) {
-	cfg := t.TempDir()
-
-	t.Run("trusted argv0 is accepted", func(t *testing.T) {
-		f := newProcFixture(t)
-		exe := f.binary(t, f.bin, "sing-box", 0o755)
-		proc := f.process(t, "1234", []string{exe, "run", "-C", cfg}, "")
-		f.ownedByRoot(proc, exe)
-		got := singBoxProcessArgs()
-		if len(got) != 1 || got[0][0] != exe {
-			t.Fatalf("root process with a trusted argv[0] was not accepted: %v", got)
-		}
-	})
-
-	t.Run("untrusted argv0 is refused", func(t *testing.T) {
-		f := newProcFixture(t)
-		elsewhere := t.TempDir()
-		exe := f.binary(t, elsewhere, "sing-box", 0o755)
-		proc := f.process(t, "1234", []string{exe, "run", "-C", cfg}, "")
-		f.ownedByRoot(proc, exe)
-		requireNoProcesses(t)
-	})
+// A root agent can always read /proc/<pid>/exe, so a link that cannot be
+// read is a process that cannot be identified, and argv[0] is never consulted
+// in its place: a trusted-looking argv[0] behind an unreadable link is refused.
+func TestSingBoxProcessArgsRefusesUnreadableExeLink(t *testing.T) {
+	f := newProcFixture(t)
+	exe := f.binary(t, f.bin, "sing-box", 0o755)
+	proc := f.process(t, "1234", []string{exe, "run", "-C", t.TempDir()}, "")
+	f.ownedByRoot(proc, exe)
+	requireNoProcesses(t)
 }
 
 // A decoy must not displace the legitimate process, which is the denial half of
@@ -231,10 +271,10 @@ func TestSingBoxProcessArgsIgnoresDecoyBesideRealProcess(t *testing.T) {
 	realProc := f.process(t, "1000", []string{"sing-box", "run", "-C", realCfg}, realExe)
 	f.ownedByRoot(realProc, realExe)
 
-	decoyDir := t.TempDir()
+	decoyDir := f.dir(t, "home", "mallory")
 	decoyExe := f.binary(t, decoyDir, "sing-box", 0o755)
 	decoyProc := f.process(t, "2000", []string{"sing-box", "run", "-C", decoyDir}, decoyExe)
-	f.ownedBy(1000, decoyProc, decoyExe)
+	f.ownedBy(1000, decoyDir, decoyProc, decoyExe)
 
 	got := singBoxProcessArgs()
 	if len(got) != 1 {

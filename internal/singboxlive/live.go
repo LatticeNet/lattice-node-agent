@@ -91,6 +91,10 @@ func Collect(ctx context.Context, src Source) (model.SingBoxRuntime, BoundPorts)
 	if len(procs) > 0 {
 		rt.Running = true
 		rt.PID = procs[0].PID
+		// The digest is of the inode the process runs, so the control plane
+		// can compare a node against release digests without trusting the
+		// path the binary was launched from.
+		rt.ExeSHA256 = procs[0].ExeSHA256
 		if !procs[0].StartedAt.IsZero() {
 			rt.StartedAt = procs[0].StartedAt.UTC()
 		}

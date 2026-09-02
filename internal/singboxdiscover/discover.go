@@ -10,6 +10,8 @@ package singboxdiscover
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -832,25 +835,32 @@ func singBoxRuntimeConfigFiles() []string {
 // This selector is a trust boundary, not a convenience filter: whatever it
 // admits gets to name the directory the root agent uses as the linechain layout
 // authority (ResolveRuntimeLayout) and as an inventory source
-// (singBoxRuntimeConfigFiles). It previously admitted any process whose argv[0]
-// basename merely contained "sing-box" and whose argv contained "run", so an
-// unprivileged local user only had to run `cp /bin/sleep /tmp/sing-box &&
-// /tmp/sing-box run -C /tmp/mine` to steer a root process.
+// (singBoxRuntimeConfigFiles), and it decides whether the liveness probe
+// (design-19) reports the service as running at all. It used to admit a
+// root-owned sing-box only from a fixed list of system executable
+// directories. That read the whole fleet as unknown once the manager
+// installed the binary under /etc/sing-box/bin, and the list never said
+// anything about integrity anyway: a root-owned file in /usr/local/bin is
+// only as trustworthy as every directory above it.
 //
-// Three things are checked now, in order of how hard they are to forge:
+// A process P is accepted as sing-box iff, in this order:
 //
-//  1. The process runs as uid 0, read from the kernel's ownership of
-//     /proc/<pid>. An unprivileged attacker cannot produce a root process, so
-//     this is the check that actually excludes them.
-//  2. Its executable is identified from /proc/<pid>/exe, which the kernel
-//     maintains, rather than from the self-reported argv[0]. A process can set
-//     argv[0] to anything; it cannot relabel its own exe link. When the link
-//     cannot be read (a non-root agent lacks ptrace permission over a root
-//     process) the self-reported path is used instead, which is sound only
-//     because step 1 already established the process is root.
-//  3. The resolved executable must be a sing-box binary living in a system
-//     executable directory, owned by root and not group/world writable, so a
-//     root-run script from a writable path is not authority either.
+//  1. /proc/P is owned by uid 0. The kernel sets that ownership from the
+//     process credentials, so an unprivileged user cannot produce it.
+//  2. exe = readlink(/proc/P/exe) is absolute and its base name is sing-box.
+//     The kernel maintains the link and a root agent can always read it;
+//     argv[0] is never consulted because a process can put anything there.
+//  3. S = stat through the magic link /proc/P/exe is a regular file owned by
+//     uid 0 with no group or world write bit. S is the inode the process
+//     actually loaded, whatever the path holds now.
+//  4. lstat(exe) is the same (dev, ino) as S. A binary renamed or replaced
+//     under a running process, or a path that means something else in this
+//     mount namespace, refuses here.
+//  5. Every directory from / down to dirname(exe), by lstat, is a directory
+//     (not a symlink) owned by uid 0 with no group or world write bit. A
+//     writable or foreign-owned ancestor lets its owner swap the binary for
+//     the next restart, so the path is only as trusted as its weakest link.
+//  6. Any stat error refuses. "Could not look" is never "fine".
 //
 // The validated path replaces argv[0] in the returned vector, so every consumer
 // downstream reasons about the kernel's answer rather than the process's claim.
@@ -870,13 +880,17 @@ type TrustedProcess struct {
 	// StartedAt is best-effort (the proc entry's mtime, which the kernel sets
 	// at process creation); zero when it could not be read.
 	StartedAt time.Time
+	// ExeSHA256 is the hex sha256 of the executable, read through
+	// /proc/<pid>/exe so it covers the inode the process runs rather than
+	// whatever the path holds now; empty when the file could not be read.
+	ExeSHA256 string
 }
 
 // TrustedProcesses lists the running processes the selector accepts as
-// sing-box, with their pids and best-effort start times. It applies exactly
-// the trust rules documented above; the liveness probe (design-19) consumes
-// it so that "a sing-box process exists" is decided by one selector in one
-// place, never re-derived with looser rules.
+// sing-box, with their pids, best-effort start times and executable digests.
+// It applies exactly the trust rules documented above; the liveness probe
+// (design-19) consumes it so that "a sing-box process exists" is decided by
+// one selector in one place, never re-derived with looser rules.
 func TrustedProcesses() []TrustedProcess {
 	matches, _ := filepath.Glob(filepath.Join(procRoot, "[0-9]*", "cmdline"))
 	var out []TrustedProcess
@@ -885,33 +899,28 @@ func TrustedProcesses() []TrustedProcess {
 		if !processRunsAsRoot(procDir) {
 			continue
 		}
-		raw, err := os.ReadFile(cmdlinePath)
-		if err != nil || len(raw) == 0 {
-			continue
-		}
-		parts := bytes.Split(bytes.TrimRight(raw, "\x00"), []byte{0})
-		args := make([]string, 0, len(parts))
-		for _, part := range parts {
-			if len(part) > 0 {
-				args = append(args, string(part))
-			}
-		}
+		args := readCmdline(cmdlinePath)
 		if len(args) == 0 || !containsArg(args, "run") {
 			continue
 		}
 		exe, err := os.Readlink(filepath.Join(procDir, "exe"))
 		if err != nil {
-			exe = args[0]
-		}
-		if !trustedSingBoxExecutable(exe) {
 			continue
 		}
-		args[0] = filepath.Clean(exe)
+		exe, running, reason := explainProcessExecutable(procDir, exe)
+		if reason != "" {
+			continue
+		}
+		args[0] = exe
 		pid, err := strconv.Atoi(filepath.Base(procDir))
 		if err != nil {
 			continue
 		}
-		proc := TrustedProcess{PID: pid, Args: args}
+		proc := TrustedProcess{
+			PID:       pid,
+			Args:      args,
+			ExeSHA256: executableDigest(filepath.Join(procDir, "exe"), running),
+		}
 		if info, err := os.Stat(procDir); err == nil {
 			proc.StartedAt = info.ModTime()
 		}
@@ -921,150 +930,336 @@ func TrustedProcesses() []TrustedProcess {
 	return out
 }
 
+// readCmdline splits a /proc/<pid>/cmdline into its NUL-separated arguments.
+func readCmdline(path string) []string {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	parts := bytes.Split(bytes.TrimRight(raw, "\x00"), []byte{0})
+	args := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if len(part) > 0 {
+			args = append(args, string(part))
+		}
+	}
+	return args
+}
+
 // procRoot is the process table the selector reads. It is a variable so a test
 // can point the privileged half of this trust boundary at a fabricated tree;
 // production always reads /proc.
 var procRoot = "/proc"
 
 // fileIdentity is the subset of file metadata the trust checks need: the mode
-// decides regular-file and writability questions, the uid decides ownership.
+// decides regular-file, directory and writability questions, the uid decides
+// ownership, (dev, ino) decides whether two names are one file, and modTime
+// keys the digest cache.
 type fileIdentity struct {
-	mode os.FileMode
-	uid  uint32
+	mode    os.FileMode
+	uid     uint32
+	dev     uint64
+	ino     uint64
+	modTime time.Time
 }
 
-// statIdentity resolves a path's mode and owning uid. It is a package variable
-// for one reason: ownership is the load-bearing half of this selector, and a
-// test process that is not root cannot create a root-owned file to exercise it.
-// Tests substitute the uid and keep the real mode, so only the fact under test
-// is fabricated.
-var statIdentity = func(path string) (fileIdentity, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fileIdentity{}, err
-	}
+func identityOf(path string, info os.FileInfo) (fileIdentity, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fileIdentity{}, fmt.Errorf("no ownership metadata for %s", path)
 	}
-	return fileIdentity{mode: info.Mode(), uid: stat.Uid}, nil
+	return fileIdentity{
+		mode:    info.Mode(),
+		uid:     stat.Uid,
+		dev:     uint64(stat.Dev),
+		ino:     uint64(stat.Ino),
+		modTime: info.ModTime(),
+	}, nil
+}
+
+// lstatIdentity and statIdentity resolve a path's identity without and with
+// following a final symlink. They are package variables for one reason:
+// ownership is the load-bearing half of this selector, and a test process
+// that is not root cannot create a root-owned file to exercise it. Tests
+// substitute the uid (and present the host's temp directory ancestry as the
+// root-owned system tree it stands in for) and keep everything else real, so
+// only the fact under test is fabricated.
+var lstatIdentity = func(path string) (fileIdentity, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	return identityOf(path, info)
+}
+
+var statIdentity = func(path string) (fileIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	return identityOf(path, info)
 }
 
 // processRunsAsRoot reports whether /proc/<pid> is owned by uid 0. The kernel
 // owns that directory to the process credentials, so it is not forgeable from
 // inside the process.
 func processRunsAsRoot(procDir string) bool {
-	id, err := statIdentity(procDir)
+	id, err := lstatIdentity(procDir)
 	if err != nil {
 		return false
 	}
 	return id.uid == 0
 }
 
-// trustedSingBoxExecutableDirs are the system executable directories a sing-box
-// binary may live in to be accepted as local authority. Anything outside them
-// (/tmp, a home directory, a world-writable app directory) is refused. A node
-// whose sing-box lives elsewhere loses process-derived discovery and falls back
-// to the conventional /etc/sing-box paths rather than trusting the process.
-// ResolveTrustedExecutable applies the same list to sibling probes.
-var trustedSingBoxExecutableDirs = []string{
+// trustedExecutableSearchDirs is the order ResolveTrustedExecutable searches
+// when there is no process to read. It is a search order, not a trust list:
+// a hit is accepted only after the file and its whole ancestry pass the same
+// rules the sing-box selector applies to /proc/<pid>/exe, and a sing-box
+// running from anywhere else is judged by those rules, never by this list.
+var trustedExecutableSearchDirs = []string{
 	"/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin",
 }
 
-// trustedSingBoxExecutable reports whether an executable path may be treated as
-// sing-box. The path rules are pure so both the /proc collector and the layout
-// resolver apply the same identity; the ownership and permission rules are
-// applied only when the file can be stat'd, and refuse anything that is not a
-// root-owned, non-group/world-writable regular file.
+// trustedSingBoxExecutable reports whether a path with no process behind it
+// may be treated as sing-box. The layout resolver applies it as a second
+// layer to argument vectors that the /proc selector already validated.
 func trustedSingBoxExecutable(exe string) bool {
-	return explainSingBoxExecutable(exe) == ""
+	return explainExecutablePath(exe, singBoxExecutableName) == ""
 }
 
-// explainSingBoxExecutable applies the executable rules and names the first
-// one the path fails, or returns "" when the path is trusted. The reason is
-// what the liveness probe reports when it cannot prove the service, so it
-// says which rule and, where the file can be stat'd, who owns it.
+// explainSingBoxExecutable applies the path rules to a sing-box candidate and
+// names the first one it fails, or returns "" when the path is trusted.
 func explainSingBoxExecutable(exe string) string {
-	return explainTrustedExecutable(exe, singBoxExecutableName)
+	return explainExecutablePath(exe, singBoxExecutableName)
 }
 
-// ResolveTrustedExecutable looks for a binary named name in the trusted
-// executable directories and applies the same ownership and permission rules
-// the sing-box selector applies. It exists so a sibling probe that must run a
-// root-only external command (the sshd facts step of the guard-reality
-// report) executes from exactly this trust boundary instead of growing its
-// own. It returns the first trusted path, or "" and the reason: the failed
-// rule of the first candidate that exists, or a not-found note that names the
-// directories searched.
+// ResolveTrustedExecutable looks for a binary named name along the search
+// directories and applies the sing-box selector's file and ancestry rules to
+// the hit. It exists so a sibling probe that must run a root-only external
+// command (the sshd facts step of the guard-reality report) executes from
+// exactly this trust boundary instead of growing its own. It returns the
+// first candidate that exists, resolved to its canonical path, when that
+// path passes; otherwise "" and the reason: the failed rule of the first
+// candidate that exists, or a not-found note naming the directories searched.
 func ResolveTrustedExecutable(name string) (string, string) {
 	name = strings.TrimSpace(name)
 	if name == "" || name != filepath.Base(name) {
 		return "", "executable name must be a bare file name"
 	}
-	for _, dir := range trustedSingBoxExecutableDirs {
+	for _, dir := range trustedExecutableSearchDirs {
 		candidate := filepath.Join(dir, name)
-		if _, err := statIdentity(candidate); err != nil {
+		if _, err := lstatIdentity(candidate); err != nil {
 			continue
 		}
-		if reason := explainTrustedExecutable(candidate, name); reason != "" {
-			return "", candidate + ": " + reason
+		// Merged-usr hosts alias /bin and /sbin to /usr/bin and /usr/sbin
+		// through symlinks, and the ancestry rule refuses a symlinked
+		// directory. Judge the canonical path instead, which is what the
+		// kernel would report in /proc/<pid>/exe had the candidate been run;
+		// the name and ancestry rules then apply to where the link really
+		// leads, so a link to some other trusted binary is still refused.
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			return "", fmt.Sprintf("%s: cannot stat: %v", candidate, statErr(err))
 		}
-		return candidate, ""
+		if reason := explainExecutablePath(resolved, name); reason != "" {
+			return "", resolved + ": " + reason
+		}
+		return resolved, ""
 	}
-	return "", name + " not found in the trusted executable directories (" + strings.Join(trustedSingBoxExecutableDirs, ", ") + ")"
+	return "", name + " not found in the executable search directories (" + strings.Join(trustedExecutableSearchDirs, ", ") + ")"
 }
 
-// explainTrustedExecutable is the rule set behind both selectors: absolute
-// path, exact base name, trusted directory, and (where the file can be
-// stat'd) a root-owned regular file nobody else can write.
-func explainTrustedExecutable(exe, name string) string {
-	exe = strings.TrimSpace(exe)
+// explainExecutablePath applies rules 2, 3, 5 and 6 to a path with no process
+// behind it: the layout resolver's second layer and ResolveTrustedExecutable
+// use it. Rule 4 compares against a running inode and does not apply.
+func explainExecutablePath(exe, name string) string {
+	clean, reason := cleanExecutablePath(exe, name)
+	if reason != "" {
+		return reason
+	}
+	id, err := lstatIdentity(clean)
+	if err != nil {
+		return fmt.Sprintf("cannot stat %s: %v", clean, statErr(err))
+	}
+	if reason := explainExecutableFile(id); reason != "" {
+		return reason
+	}
+	return explainAncestry(filepath.Dir(clean))
+}
+
+// explainProcessExecutable applies rules 2 to 6 to the executable behind
+// /proc/<pid>, given exe as read from the exe link. It returns the cleaned
+// path and the identity of the running inode so the caller can hash it under
+// the same key, plus the first failed rule or "" when the process is trusted.
+func explainProcessExecutable(procDir, exe string) (string, fileIdentity, string) {
+	pid := filepath.Base(procDir)
+	clean, reason := cleanExecutablePath(exe, singBoxExecutableName)
+	if reason != "" {
+		return clean, fileIdentity{}, reason
+	}
+	running, err := statIdentity(filepath.Join(procDir, "exe"))
+	if err != nil {
+		return clean, fileIdentity{}, fmt.Sprintf("cannot stat /proc/%s/exe: %v", pid, statErr(err))
+	}
+	if reason := explainExecutableFile(running); reason != "" {
+		return clean, running, reason
+	}
+	onPath, err := lstatIdentity(clean)
+	if err != nil {
+		return clean, running, fmt.Sprintf("cannot stat %s: %v", clean, statErr(err))
+	}
+	if onPath.dev != running.dev || onPath.ino != running.ino {
+		return clean, running, fmt.Sprintf("path and /proc/%s/exe are different files", pid)
+	}
+	return clean, running, explainAncestry(filepath.Dir(clean))
+}
+
+// cleanExecutablePath applies rule 2: an absolute path whose base name is
+// exactly name. The kernel appends " (deleted)" to an exe link whose file was
+// unlinked after exec (an in-place upgrade without a restart); the suffix is
+// stripped so the path rules judge the name and rule 4 then reports that the
+// path and the running inode are different files, which is the truth.
+func cleanExecutablePath(exe, name string) (string, string) {
+	exe = strings.TrimSuffix(strings.TrimSpace(exe), " (deleted)")
 	if !filepath.IsAbs(exe) {
-		return "executable path is not absolute"
+		return "", "executable path is not absolute"
 	}
 	clean := filepath.Clean(exe)
 	if filepath.Base(clean) != name {
-		return "executable is not named " + name
+		return clean, "executable is not named " + name
 	}
-	id, statErr := statIdentity(clean)
-	owner := ""
-	if statErr == nil && id.uid != 0 {
-		owner = fmt.Sprintf("; owned by uid %d, not root", id.uid)
-	}
-	trustedDir := false
-	for _, dir := range trustedSingBoxExecutableDirs {
-		if filepath.Dir(clean) == dir {
-			trustedDir = true
-			break
-		}
-	}
-	if !trustedDir {
-		return "outside the trusted executable directories (" + strings.Join(trustedSingBoxExecutableDirs, ", ") + ")" + owner
-	}
-	if statErr != nil {
-		// The binary is not visible from here (a test vector, or a chroot). The
-		// path rules above still applied, and in the /proc collector the process
-		// was already proven to be root.
-		return ""
-	}
+	return clean, ""
+}
+
+// explainExecutableFile applies rule 3 to a file identity.
+func explainExecutableFile(id fileIdentity) string {
 	if !id.mode.IsRegular() {
 		return "not a regular file"
-	}
-	if id.mode.Perm()&0o022 != 0 {
-		return "group or world writable"
 	}
 	if id.uid != 0 {
 		return fmt.Sprintf("owned by uid %d, not root", id.uid)
 	}
+	if id.mode.Perm()&0o022 != 0 {
+		return fmt.Sprintf("group or world writable (mode %04o)", id.mode.Perm())
+	}
 	return ""
+}
+
+// explainAncestry applies rules 5 and 6: it walks every directory from /
+// down to dir and names the first one that is not a root-owned, non-writable
+// real directory. The walk starts at the root so the answer names the
+// outermost weak link, which is the one an operator has to fix first.
+func explainAncestry(dir string) string {
+	for _, ancestor := range ancestors(dir) {
+		id, err := lstatIdentity(ancestor)
+		if err != nil {
+			return fmt.Sprintf("cannot stat %s: %v", ancestor, statErr(err))
+		}
+		switch {
+		case id.mode&os.ModeSymlink != 0:
+			return fmt.Sprintf("directory %s is a symlink", ancestor)
+		case !id.mode.IsDir():
+			return fmt.Sprintf("%s is not a directory", ancestor)
+		case id.uid != 0:
+			return fmt.Sprintf("directory %s owned by uid %d, not root", ancestor, id.uid)
+		case id.mode.Perm()&0o022 != 0:
+			return fmt.Sprintf("directory %s is group or world writable (mode %04o)", ancestor, id.mode.Perm())
+		}
+	}
+	return ""
+}
+
+// ancestors lists dir and every directory above it, root first.
+func ancestors(dir string) []string {
+	var out []string
+	for {
+		out = append(out, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	slices.Reverse(out)
+	return out
+}
+
+// statErr unwraps a *PathError so a refusal reads "cannot stat /x: permission
+// denied" rather than repeating the path and the syscall name.
+func statErr(err error) error {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	return err
+}
+
+// digestKey identifies one executable inode at one point in time. A sing-box
+// binary is tens of megabytes and the liveness probe runs every cycle, so
+// the digest is computed once per (dev, ino, mtime) and reused until the
+// file changes.
+type digestKey struct {
+	dev, ino uint64
+	mtime    int64
+}
+
+// maxDigestCacheEntries bounds the cache. A node runs one sing-box, and an
+// upgrade adds one entry; the bound only matters if something churns
+// binaries, and then dropping the cache costs one extra hash.
+const maxDigestCacheEntries = 64
+
+var digestCache = struct {
+	sync.Mutex
+	entries map[digestKey]string
+}{entries: map[digestKey]string{}}
+
+// executableDigest returns the hex sha256 of the file behind path, which the
+// caller has already stat'd as id. It reads through the magic link so the
+// bytes hashed are the inode the process runs, never a replacement that
+// appeared on the path afterwards. A read failure yields "" rather than a
+// refusal: the digest is evidence for the control plane, not a trust rule.
+func executableDigest(path string, id fileIdentity) string {
+	key := digestKey{dev: id.dev, ino: id.ino, mtime: id.modTime.UnixNano()}
+	digestCache.Lock()
+	sum, ok := digestCache.entries[key]
+	digestCache.Unlock()
+	if ok {
+		return sum
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	// The process may have re-executed between the selector's stat and this
+	// open, in which case the bytes behind the descriptor are not the inode
+	// the key describes. Hash only what the key names.
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	if opened, err := identityOf(path, info); err != nil || opened.dev != id.dev || opened.ino != id.ino {
+		return ""
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	sum = hex.EncodeToString(h.Sum(nil))
+	digestCache.Lock()
+	if len(digestCache.entries) >= maxDigestCacheEntries {
+		clear(digestCache.entries)
+	}
+	digestCache.entries[key] = sum
+	digestCache.Unlock()
+	return sum
 }
 
 // RefusedProcess is a running process that presents as a sing-box `run` and
 // that the trust selector did not accept, with the rule it failed. It exists
 // so the liveness probe can say why it could not prove the service instead of
-// reporting a bare unknown: on a fleet whose manager installs sing-box under
-// /etc/sing-box/bin owned by an unprivileged uid, every node reads unknown
-// and nothing says why.
+// reporting a bare unknown: a node whose binary sits under a directory the
+// manager's uid owns reads unknown, and nothing says why.
 type RefusedProcess struct {
 	PID    int
 	Exe    string
@@ -1078,8 +1273,8 @@ const maxRefusedProcesses = 3
 
 // RefusedProcesses lists the sing-box candidates the selector refused. A
 // candidate is any process whose command line carries `run` and whose
-// executable, by argv[0] or by the kernel's exe link, is named sing-box. It
-// applies the same rules as TrustedProcesses and keeps the rejections.
+// executable, by the kernel's exe link, is named sing-box. It applies the
+// same rules as TrustedProcesses and keeps the rejections.
 func RefusedProcesses() []RefusedProcess {
 	matches, _ := filepath.Glob(filepath.Join(procRoot, "[0-9]*", "cmdline"))
 	var out []RefusedProcess
@@ -1088,41 +1283,30 @@ func RefusedProcesses() []RefusedProcess {
 			break
 		}
 		procDir := filepath.Dir(cmdlinePath)
-		raw, err := os.ReadFile(cmdlinePath)
-		if err != nil || len(raw) == 0 {
-			continue
-		}
-		parts := bytes.Split(bytes.TrimRight(raw, "\x00"), []byte{0})
-		args := make([]string, 0, len(parts))
-		for _, part := range parts {
-			if len(part) > 0 {
-				args = append(args, string(part))
-			}
-		}
+		args := readCmdline(cmdlinePath)
 		if len(args) == 0 || !containsArg(args, "run") {
 			continue
 		}
 		exe, err := os.Readlink(filepath.Join(procDir, "exe"))
 		if err != nil {
-			exe = args[0]
+			continue
 		}
-		if filepath.Base(exe) != singBoxExecutableName && filepath.Base(args[0]) != singBoxExecutableName {
+		clean, nameReason := cleanExecutablePath(exe, singBoxExecutableName)
+		if nameReason != "" {
 			continue
 		}
 		pid, err := strconv.Atoi(filepath.Base(procDir))
 		if err != nil {
 			continue
 		}
-		reason := ""
-		if !processRunsAsRoot(procDir) {
-			reason = "process does not run as root"
-		} else {
-			reason = explainSingBoxExecutable(exe)
+		reason := "process does not run as root"
+		if processRunsAsRoot(procDir) {
+			_, _, reason = explainProcessExecutable(procDir, exe)
 		}
 		if reason == "" {
 			continue
 		}
-		out = append(out, RefusedProcess{PID: pid, Exe: filepath.Clean(exe), Reason: reason})
+		out = append(out, RefusedProcess{PID: pid, Exe: clean, Reason: reason})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
 	return out
@@ -1139,8 +1323,9 @@ func resolveRuntimeLayout(processes [][]string, metaPath string) (string, string
 	dirs := map[string]struct{}{}
 	for _, args := range processes {
 		// Second layer behind the /proc checks in singBoxProcessArgs: only a
-		// process running a sing-box binary from a system executable directory
-		// may name the config directory this agent treats as authority.
+		// process running a sing-box binary whose file and whole ancestry are
+		// root-owned and writable by nobody else may name the config
+		// directory this agent treats as authority.
 		if len(args) == 0 || !trustedSingBoxExecutable(args[0]) {
 			continue
 		}
