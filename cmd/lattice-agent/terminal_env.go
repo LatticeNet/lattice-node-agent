@@ -2,24 +2,37 @@ package main
 
 import "strings"
 
-var terminalReservedEnvKeys = map[string]struct{}{
-	"TERM":                        {},
-	"LATTICE_TERMINAL_SESSION_ID": {},
-	"LATTICE_NODE_ID":             {},
+// terminalShellEnv builds the environment an operator's shell starts with.
+//
+// The agent's own environment carries whatever the unit file or the operator
+// put there: the node token, usage secrets, and anything a host happens to
+// export (cloud credentials, registry logins). A denylist keyed on the
+// LATTICE_ prefix caught the first group and passed the rest into an
+// interactive shell. The shell now starts from an allowlist of the variables a
+// login shell needs, plus the two the console reads back; everything else
+// stays with the agent.
+var terminalPassthroughEnvKeys = map[string]struct{}{
+	"PATH":      {},
+	"HOME":      {},
+	"USER":      {},
+	"LOGNAME":   {},
+	"SHELL":     {},
+	"LANG":      {},
+	"LANGUAGE":  {},
+	"TZ":        {},
+	"TMPDIR":    {},
+	"COLORTERM": {},
 }
 
 func terminalShellEnv(base []string, sessionID, nodeID string) []string {
-	env := make([]string, 0, len(base)+3)
+	env := make([]string, 0, len(terminalPassthroughEnvKeys)+3)
 	for _, entry := range base {
 		key, _, ok := strings.Cut(entry, "=")
 		if !ok {
 			continue
 		}
 		key = strings.ToUpper(strings.TrimSpace(key))
-		if _, reserved := terminalReservedEnvKeys[key]; reserved {
-			continue
-		}
-		if isTerminalSensitiveEnvKey(key) {
+		if !terminalEnvPassesThrough(key) {
 			continue
 		}
 		env = append(env, entry)
@@ -31,12 +44,11 @@ func terminalShellEnv(base []string, sessionID, nodeID string) []string {
 	)
 }
 
-func isTerminalSensitiveEnvKey(key string) bool {
-	if !strings.HasPrefix(key, "LATTICE_") {
-		return false
+func terminalEnvPassesThrough(key string) bool {
+	if _, ok := terminalPassthroughEnvKeys[key]; ok {
+		return true
 	}
-	return strings.Contains(key, "TOKEN") ||
-		strings.Contains(key, "SECRET") ||
-		strings.Contains(key, "PASSWORD") ||
-		strings.Contains(key, "PRIVATE_KEY")
+	// Locale categories (LC_ALL, LC_CTYPE, ...) shape how the shell prints and
+	// carry nothing secret.
+	return strings.HasPrefix(key, "LC_")
 }

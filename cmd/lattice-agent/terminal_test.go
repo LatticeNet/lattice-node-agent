@@ -57,3 +57,24 @@ func TestAgentHTTPErrorExposesStatusCode(t *testing.T) {
 		t.Fatalf("agentHTTPStatusCode = %d, %v; want 410, true", status, ok)
 	}
 }
+
+// A close input used to hang up the PTY and return nil, so the poll loop kept
+// waiting for the shell to notice; a child that ignored SIGHUP outlived the
+// session. The loop now ends on the operator's close and kills the group.
+func TestPollInputsEndsTheLoopOnOperatorClose(t *testing.T) {
+	oldClient := httpClient
+	defer func() { httpClient = oldClient }()
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return testResponse(http.StatusOK, `{"inputs":[{"seq":7,"kind":"close"}]}`), nil
+	})}
+	runner := terminalRunner{
+		cfg:     agentConfig{Server: "http://lattice.test", NodeID: "node-a", Token: "node-secret"},
+		session: model.TerminalSession{ID: "term-a"},
+	}
+	if err := runner.pollInputs(nil); !errors.Is(err, errTerminalClosedByOperator) {
+		t.Fatalf("pollInputs error = %v, want errTerminalClosedByOperator", err)
+	}
+	if runner.inputCursor != 7 {
+		t.Fatalf("input cursor = %d, want 7 so the close is not replayed", runner.inputCursor)
+	}
+}
