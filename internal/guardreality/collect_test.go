@@ -151,7 +151,7 @@ func TestParseSSListenersSkipsNonNumericPortsAndSorts(t *testing.T) {
 	}
 	want := []model.GuardListener{
 		{Protocol: "tcp", Port: 22, Address: "fe80::1", Process: "sshd"},
-		{Protocol: "udp", Port: 51820, Address: "*", Process: "wg"},
+		{Protocol: "udp", Port: 51820, Address: "::", Process: "wg"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("listeners:\n got %#v\nwant %#v", got, want)
@@ -337,5 +337,20 @@ func TestCollectStillFailsWithoutSS(t *testing.T) {
 	}
 	if _, err := Collect(context.Background(), Source{Runner: runner}, "node-a"); err == nil {
 		t.Fatal("collect without ss must fail")
+	}
+}
+
+// iproute2 on the fleet prints the IPv6 any-address as "*"; the server takes
+// an IP, so the parser hands it "::" and the snapshot is accepted.
+func TestParseSSListenersMapsWildcardToAnyAddress(t *testing.T) {
+	got, err := ParseSSListeners([]byte("tcp LISTEN 0 4096 *:31001 *:* users:((\"sing-box\",pid=7,fd=9))\ntcp LISTEN 0 4096 [fe80::1%eth0]:546 [::]:* users:((\"dhcp\",pid=8,fd=3))\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want two listeners, got %+v", got)
+	}
+	if got[0].Address != "fe80::1" || got[1].Address != "::" {
+		t.Fatalf("addresses not normalized: %+v", got)
 	}
 }
