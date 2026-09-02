@@ -153,18 +153,25 @@ func Collect(ctx context.Context, source Source, nodeID string) (model.GuardNode
 		return model.GuardNodeReality{}, fmt.Errorf("parse ip addr: %w", err)
 	}
 
-	rulesetOut, err := runStep(ctx, timeout, run, nftBinary, "-j", "list", "ruleset")
-	if err != nil {
-		return model.GuardNodeReality{}, err
-	}
-	managedSHA, foreignTables, err := ParseNFTRuleset(rulesetOut)
-	if err != nil {
-		return model.GuardNodeReality{}, fmt.Errorf("parse nft ruleset: %w", err)
-	}
-
-	versionOut, err := runStep(ctx, timeout, run, nftBinary, "--version")
-	if err != nil {
-		return model.GuardNodeReality{}, err
+	// Listeners and interfaces are the evidence SSH Guard and NetGuard read
+	// first; the nft ruleset is what a managed node adds on top. A box
+	// without nft (most of this fleet) used to make the whole snapshot fail
+	// and the node go silent, so the ruleset is best effort: absent nft
+	// reports as no managed table and no foreign tables, and the drift
+	// verdict reads unknown rather than the evidence reading stale.
+	var (
+		managedSHA    string
+		foreignTables []string
+		nftVersion    string
+	)
+	if rulesetOut, err := runStep(ctx, timeout, run, nftBinary, "-j", "list", "ruleset"); err == nil {
+		managedSHA, foreignTables, err = ParseNFTRuleset(rulesetOut)
+		if err != nil {
+			return model.GuardNodeReality{}, fmt.Errorf("parse nft ruleset: %w", err)
+		}
+		if versionOut, err := runStep(ctx, timeout, run, nftBinary, "--version"); err == nil {
+			nftVersion = ParseNFTVersion(versionOut)
+		}
 	}
 	at := time.Now().UTC()
 	if source.Now != nil {
@@ -176,7 +183,7 @@ func Collect(ctx context.Context, source Source, nodeID string) (model.GuardNode
 		Interfaces:    interfaces,
 		ManagedSHA:    managedSHA,
 		ForeignTables: foreignTables,
-		NFTVersion:    ParseNFTVersion(versionOut),
+		NFTVersion:    nftVersion,
 		CollectedAt:   at,
 	}
 	// The sshd step rides the same snapshot but never blocks it: a refusal

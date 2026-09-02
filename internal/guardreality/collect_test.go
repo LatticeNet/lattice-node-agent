@@ -300,3 +300,42 @@ func TestCollectAttachesSSHDFactsOrNote(t *testing.T) {
 		t.Fatalf("a refused sshd step must keep the rest of the snapshot: %+v", got)
 	}
 }
+
+// A node without nft used to produce no snapshot at all; it now reports the
+// listeners and interfaces it can prove and leaves the ruleset facts empty.
+func TestCollectReportsListenersWhenNFTIsAbsent(t *testing.T) {
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "ss":
+			return []byte("tcp   LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))\n"), nil
+		case "ip":
+			return []byte(`[{"ifname":"eth0","operstate":"UP","addr_info":[{"family":"inet","local":"203.0.113.7","prefixlen":24}]}]`), nil
+		case "nft":
+			return nil, errors.New("exec: \"nft\": executable file not found in $PATH")
+		}
+		return nil, errors.New("unexpected command " + name)
+	}
+	got, err := Collect(context.Background(), Source{Runner: runner}, "node-a")
+	if err != nil {
+		t.Fatalf("collect without nft must still report: %v", err)
+	}
+	if len(got.Listeners) != 1 || got.Listeners[0].Port != 22 {
+		t.Fatalf("listeners not reported: %+v", got.Listeners)
+	}
+	if len(got.Interfaces) != 1 {
+		t.Fatalf("interfaces not reported: %+v", got.Interfaces)
+	}
+	if got.ManagedSHA != "" || len(got.ForeignTables) != 0 || got.NFTVersion != "" {
+		t.Fatalf("nft facts must be empty without nft, got sha=%q tables=%v version=%q", got.ManagedSHA, got.ForeignTables, got.NFTVersion)
+	}
+}
+
+// Without ss there is nothing to say about the node; that stays an error.
+func TestCollectStillFailsWithoutSS(t *testing.T) {
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		return nil, errors.New("exec: \"ss\": executable file not found in $PATH")
+	}
+	if _, err := Collect(context.Background(), Source{Runner: runner}, "node-a"); err == nil {
+		t.Fatal("collect without ss must fail")
+	}
+}

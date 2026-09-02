@@ -41,7 +41,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.9-alpha.3"
+var version = "0.3.9-alpha.4"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -208,7 +208,11 @@ func main() {
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
 	flag.DurationVar(&cfg.Interval, "interval", 10*time.Second, "metrics interval")
-	flag.BoolVar(&cfg.ReportGuardReality, "report-guard-reality", os.Getenv("LATTICE_REPORT_GUARD_REALITY") == "1", "report read-only NetGuard reality each interval")
+	// On by default. 0.3.5 shipped this as opt-in and no unit on the fleet
+	// set it, so every node stopped reporting the day it rolled out and the
+	// console showed week-old firewall evidence without saying so.
+	// LATTICE_REPORT_GUARD_REALITY=0 opts a node out.
+	flag.BoolVar(&cfg.ReportGuardReality, "report-guard-reality", os.Getenv("LATTICE_REPORT_GUARD_REALITY") != "0", "report read-only NetGuard reality each interval (LATTICE_REPORT_GUARD_REALITY=0 disables)")
 	flag.BoolVar(&cfg.AllowExec, "allow-exec", os.Getenv("LATTICE_AGENT_ALLOW_EXEC") == "1", "allow bounded task execution")
 	// -allow-root-exec opts in to running operator scripts while the agent is
 	// uid 0. Without it, a root agent refuses tasks rather than executing
