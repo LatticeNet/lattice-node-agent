@@ -26,7 +26,7 @@ func TestCollectRunningWithBoundPorts(t *testing.T) {
 	rt, ports := Collect(context.Background(), Source{
 		Now: fixedNow,
 		Processes: func() []singboxdiscover.TrustedProcess {
-			return []singboxdiscover.TrustedProcess{{PID: 4242, StartedAt: fixedNow().Add(-time.Hour)}}
+			return []singboxdiscover.TrustedProcess{{PID: 4242, StartedAt: fixedNow().Add(-time.Hour), ExeSHA256: "3f8a0c2d5b9e1f4a6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d"}}
 		},
 		Runner: runner(map[string][]byte{
 			"systemctl": []byte("ActiveState=active\nSubState=running\nNRestarts=3\n"),
@@ -39,6 +39,9 @@ func TestCollectRunningWithBoundPorts(t *testing.T) {
 	})
 	if !rt.Running || rt.PID != 4242 || rt.ActiveState != "active" || rt.SubState != "running" || rt.RestartCount != 3 {
 		t.Fatalf("runtime wrong: %+v", rt)
+	}
+	if rt.ExeSHA256 != "3f8a0c2d5b9e1f4a6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d" {
+		t.Fatalf("executable digest not carried: %+v", rt)
 	}
 	if rt.ProbeError != "" {
 		t.Fatalf("unexpected probe error: %q", rt.ProbeError)
@@ -122,7 +125,7 @@ func TestCollectNamesRefusedCandidatesWhenNothingTrustedRuns(t *testing.T) {
 		Now:       fixedNow,
 		Processes: func() []singboxdiscover.TrustedProcess { return nil },
 		Refused: func() []singboxdiscover.RefusedProcess {
-			return []singboxdiscover.RefusedProcess{{PID: 3917185, Exe: "/etc/sing-box/bin/sing-box", Reason: "outside the trusted executable directories (/usr/local/bin); owned by uid 1001, not root"}}
+			return []singboxdiscover.RefusedProcess{{PID: 3917185, Exe: "/etc/sing-box/bin/sing-box", Reason: "directory /etc/sing-box/bin owned by uid 1001, not root"}}
 		},
 		Runner: runner(map[string][]byte{
 			"systemctl": []byte("ActiveState=active\nSubState=running\nNRestarts=0\n"),
@@ -135,7 +138,7 @@ func TestCollectNamesRefusedCandidatesWhenNothingTrustedRuns(t *testing.T) {
 	if rt.ActiveState != "active" {
 		t.Fatalf("systemd answer must survive: %+v", rt)
 	}
-	want := "refused sing-box candidate /etc/sing-box/bin/sing-box (pid 3917185): outside the trusted executable directories (/usr/local/bin); owned by uid 1001, not root"
+	want := "refused sing-box candidate /etc/sing-box/bin/sing-box (pid 3917185): directory /etc/sing-box/bin owned by uid 1001, not root"
 	if rt.ProbeError != want {
 		t.Fatalf("probe error = %q, want %q", rt.ProbeError, want)
 	}
