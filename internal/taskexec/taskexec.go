@@ -299,14 +299,31 @@ func (r Runner) effectiveUID() int {
 	return os.Geteuid()
 }
 
-func (r Runner) Run(task model.Task) model.TaskResult { return r.run(task, false) }
+func (r Runner) Run(task model.Task) model.TaskResult {
+	return r.run(context.Background(), task, false)
+}
+
+// RunContext is Run with an outer lifetime. Cancelling ctx before the task
+// finishes kills the task's whole process group and returns a failed result;
+// the agent uses it to stop a task that is still running at shutdown. The
+// task's own timeout still applies underneath ctx.
+func (r Runner) RunContext(ctx context.Context, task model.Task) model.TaskResult {
+	return r.run(ctx, task, false)
+}
 
 // RunLinechain runs an already validated E3 lease with the private host-local
 // linechain authority in its environment. Callers must select this path from
 // durable protocol metadata, never from script contents.
-func (r Runner) RunLinechain(task model.Task) model.TaskResult { return r.run(task, true) }
+func (r Runner) RunLinechain(task model.Task) model.TaskResult {
+	return r.run(context.Background(), task, true)
+}
 
-func (r Runner) run(task model.Task, trustedLinechain bool) model.TaskResult {
+// RunLinechainContext is RunLinechain with an outer lifetime; see RunContext.
+func (r Runner) RunLinechainContext(ctx context.Context, task model.Task) model.TaskResult {
+	return r.run(ctx, task, true)
+}
+
+func (r Runner) run(parent context.Context, task model.Task, trustedLinechain bool) model.TaskResult {
 	start := time.Now().UTC()
 	result := model.TaskResult{
 		TaskID:    task.ID,
@@ -355,7 +372,7 @@ func (r Runner) run(task model.Task, trustedLinechain bool) model.TaskResult {
 	if limit <= 0 || limit > 256*1024 {
 		limit = 64 * 1024
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	dir, err := createTaskWorkdir(r.WorkdirRoot)
@@ -451,7 +468,13 @@ func (r Runner) run(task model.Task, trustedLinechain bool) model.TaskResult {
 	result.Stderr = stderr.String()
 	if timedOut {
 		result.ExitCode = -1
-		result.Error = ctx.Err().Error()
+		if parent.Err() != nil {
+			// The caller cut the run short (agent shutdown), not the task's own
+			// deadline. Say so; "context canceled" alone reads as a bug.
+			result.Error = "task interrupted before completion: " + parent.Err().Error()
+		} else {
+			result.Error = ctx.Err().Error()
+		}
 	} else {
 		result.ExitCode = exitCode(err)
 		if err != nil {
