@@ -2396,20 +2396,45 @@ func watchSSHLogins(ctx context.Context, cfg agentConfig) {
 	}
 }
 
+// journalSSHArgs is the journalctl invocation that follows accepted-login
+// lines. OpenSSH 9.8 (Debian 13 / trixie) moved the per-connection work into
+// the sshd-session helper, which logs under its own _COMM, so a filter on
+// _COMM=sshd alone silently drops every login on those hosts. journalctl treats
+// "+" as a logical OR between match groups, so both program names are followed.
+// "-o cat" strips the program tag from the output; sshwatch.Parse handles the
+// bare message either way.
+var journalSSHArgs = []string{"-f", "-n", "0", "-o", "cat", "_COMM=sshd", "+", "_COMM=sshd-session"}
+
+// authLogPaths is the file fallback used when journalctl is absent, in order of
+// preference.
+var authLogPaths = []string{"/var/log/auth.log", "/var/log/secure"}
+
 func sshLogCommand(ctx context.Context) *exec.Cmd {
-	if path, err := exec.LookPath("journalctl"); err == nil {
-		return exec.CommandContext(ctx, path, "-f", "-n", "0", "-o", "cat", "_COMM=sshd")
-	}
-	tail, err := exec.LookPath("tail")
-	if err != nil {
+	name, args := sshLogSource(exec.LookPath, os.Stat)
+	if name == "" {
 		return nil
 	}
-	for _, p := range []string{"/var/log/auth.log", "/var/log/secure"} {
-		if _, err := os.Stat(p); err == nil {
-			return exec.CommandContext(ctx, tail, "-n", "0", "-F", p)
+	return exec.CommandContext(ctx, name, args...)
+}
+
+// sshLogSource picks the login log source: journalctl when present, otherwise
+// tail -F over the first auth log file that exists. It returns an empty name
+// when neither is available. lookPath and stat are injected so the choice is
+// testable without the host's binaries or log files.
+func sshLogSource(lookPath func(string) (string, error), stat func(string) (os.FileInfo, error)) (name string, args []string) {
+	if path, err := lookPath("journalctl"); err == nil {
+		return path, append([]string(nil), journalSSHArgs...)
+	}
+	tail, err := lookPath("tail")
+	if err != nil {
+		return "", nil
+	}
+	for _, p := range authLogPaths {
+		if _, err := stat(p); err == nil {
+			return tail, []string{"-n", "0", "-F", p}
 		}
 	}
-	return nil
+	return "", nil
 }
 
 func reportSSHLogin(cfg agentConfig, ev sshwatch.LoginEvent) {
