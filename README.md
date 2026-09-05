@@ -434,6 +434,14 @@ node id.
   them, and are flushed before the agent fetches any new task.
 - Leased task payloads contain only execution fields; control-plane actor/token
   metadata is not sent to agents.
+- A server-managed agent update runs as an ordinary task. Its script replaces
+  the binary and schedules the service restart through a transient systemd
+  timer that fires 3 s after the script exits, so the agent being replaced
+  posts the task result first. A stop that lands while that upload is still in
+  flight waits for the upload (`taskShutdownGrace`) rather than dropping it,
+  and the control plane also confirms the update from the version the new
+  agent reports in its first hello, so a lost result does not leave the
+  approval unresolved.
 
 ## Development
 
