@@ -74,9 +74,22 @@ type fakeTaskServer struct {
 	fetches int
 	metrics int
 	results []model.TaskResult
+	// posting, when set, receives once per result upload as it begins;
+	// holdResults, when set, parks every result upload until it is closed.
+	// Both are fixed before the worker starts, so they need no lock.
+	posting     chan struct{}
+	holdResults chan struct{}
 }
 
 func (s *fakeTaskServer) roundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Path == "/api/agent/task-result" {
+		if s.posting != nil {
+			s.posting <- struct{}{}
+		}
+		if s.holdResults != nil {
+			<-s.holdResults
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch r.URL.Path {
@@ -113,6 +126,14 @@ func (s *fakeTaskServer) counts() (fetches, metrics int, results []model.TaskRes
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.fetches, s.metrics, append([]model.TaskResult(nil), s.results...)
+}
+
+// genericTask is a one-shot lease with no durable protocol: its result is
+// posted straight from the worker, which is how an agent update task runs.
+func genericTask(id string) leasedAgentTask {
+	return leasedAgentTask{
+		Task: model.Task{ID: id, LeaseID: "lease-" + id, Interpreter: "sh", Script: "echo " + id, TimeoutSec: 600, OutputLimit: 1024},
+	}
 }
 
 func durableTask(id string) leasedAgentTask {
@@ -381,5 +402,59 @@ func TestTaskWorkerShutdownIdleReturnsImmediately(t *testing.T) {
 	stopWorker(time.Minute, time.Minute)
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("idle shutdown took %s", elapsed)
+	}
+}
+
+// The contract an agent update relies on. The server's update script replaces
+// the binary and hands the restart to a transient systemd timer that fires
+// after the script has exited, so the result post and the stop signal race by
+// design. A stop that lands while the successful result is still uploading
+// must let the upload finish rather than drop it: the task is not running any
+// more, so the grace that would kill a running task has nothing to kill, and
+// the worker's only remaining work is the post the control plane is waiting
+// for.
+func TestTaskWorkerShutdownFinishesResultUploadInFlight(t *testing.T) {
+	server := &fakeTaskServer{
+		batches:     [][]leasedAgentTask{{genericTask("task-update")}},
+		posting:     make(chan struct{}, 1),
+		holdResults: make(chan struct{}),
+	}
+	runner := newBlockingTaskRunner()
+	worker, cfg, stopWorker := startWorker(t, server, runner)
+
+	if err := worker.poll(cfg); err != nil {
+		t.Fatal(err)
+	}
+	awaitStart(t, runner, "task-update")
+	runner.release <- struct{}{}
+	select {
+	case <-server.posting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("result upload did not begin after the task finished")
+	}
+
+	// The stop arrives mid-upload; the server answers 150 ms later.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		close(server.holdResults)
+	}()
+	started := time.Now()
+	stopWorker(3*time.Second, 5*time.Second)
+	elapsed := time.Since(started)
+	if elapsed < 100*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("shutdown took %s; it should return once the upload completes, neither before nor at the grace deadline", elapsed)
+	}
+	select {
+	case <-worker.done:
+	default:
+		t.Fatal("worker goroutine still running after shutdown")
+	}
+	_, _, _, interrupted := runner.snapshot()
+	if interrupted != 0 {
+		t.Fatalf("interrupted=%d, want 0: the task had already finished", interrupted)
+	}
+	_, _, results := server.counts()
+	if len(results) != 1 || results[0].TaskID != "task-update" || results[0].ExitCode != 0 || results[0].Error != "" {
+		t.Fatalf("results after shutdown = %+v, want the one successful task-update result", results)
 	}
 }
