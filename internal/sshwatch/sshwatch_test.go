@@ -26,6 +26,15 @@ func TestParse(t *testing.T) {
 		// A genuine accepted-login line with the standard syslog sshd[pid] prefix
 		// must still match and parse correctly.
 		{`Jun 11 04:00:01 host sshd[123]: Accepted publickey for carol from 198.51.100.7 port 4242 ssh2: ED25519 SHA256:xyz`, true, "carol", "198.51.100.7", "publickey"},
+		// OpenSSH 9.8 (Debian 13 / trixie) logs the accepted line from the
+		// sshd-session helper, under its own program tag, in both the BSD and
+		// the ISO-8601 syslog framings. Both must parse like plain sshd.
+		{`Sep  4 03:14:07 gomami-hkg sshd-session[4321]: Accepted publickey for root from 203.0.113.9 port 51514 ssh2: ED25519 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAA`, true, "root", "203.0.113.9", "publickey"},
+		{`2026-09-04T03:14:07.123456+00:00 gomami-jpn sshd-session[4321]: Accepted publickey for root from 2001:db8::9 port 51514 ssh2: ED25519 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAA`, true, "root", "2001:db8::9", "publickey"},
+		// The pre-9.8 tag keeps working alongside it.
+		{`Sep  4 03:14:07 dmit-1 sshd[77]: Accepted publickey for root from 203.0.113.10 port 4242 ssh2: ED25519 SHA256:xyz`, true, "root", "203.0.113.10", "publickey"},
+		// Other program tags never produce a login, even with the same text.
+		{`Sep  4 03:14:07 host sudo[5]: Accepted publickey for root from 203.0.113.9 port 1 ssh2`, false, "", "", ""},
 	}
 	for _, c := range cases {
 		ev, ok := Parse(c.line)

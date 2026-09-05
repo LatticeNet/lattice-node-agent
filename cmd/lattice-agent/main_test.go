@@ -1770,3 +1770,58 @@ func requireErrorNotContains(t *testing.T, err error, unwanted string) {
 		t.Fatalf("expected error not to contain %q, got %q", unwanted, err.Error())
 	}
 }
+
+// sshLogSource must follow both the classic sshd tag and the sshd-session
+// helper OpenSSH 9.8 introduced, otherwise Debian 13 hosts log every accepted
+// login under a _COMM the filter never sees.
+func TestSSHLogSourceJournalMatchesSSHDAndSession(t *testing.T) {
+	lookPath := func(name string) (string, error) {
+		if name == "journalctl" {
+			return "/usr/bin/journalctl", nil
+		}
+		return "", errors.New("not found")
+	}
+	stat := func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	name, args := sshLogSource(lookPath, stat)
+	if name != "/usr/bin/journalctl" {
+		t.Fatalf("name = %q, want journalctl", name)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.HasPrefix(joined, "-f -n 0 -o cat ") {
+		t.Fatalf("args = %q, want follow/no-backlog/cat prefix", joined)
+	}
+	if !strings.Contains(joined, " _COMM=sshd ") {
+		t.Fatalf("args = %q, want _COMM=sshd match", joined)
+	}
+	if !strings.Contains(joined, " + _COMM=sshd-session") {
+		t.Fatalf("args = %q, want OR-joined _COMM=sshd-session match", joined)
+	}
+	// Mutating the returned slice must not change the next invocation.
+	args[0] = "mutated"
+	if _, again := sshLogSource(lookPath, stat); again[0] != "-f" {
+		t.Fatalf("journal args shared across calls: %q", again)
+	}
+}
+
+func TestSSHLogSourceFallsBackToAuthLog(t *testing.T) {
+	lookPath := func(name string) (string, error) {
+		if name == "tail" {
+			return "/usr/bin/tail", nil
+		}
+		return "", errors.New("not found")
+	}
+	stat := func(p string) (os.FileInfo, error) {
+		if p == "/var/log/secure" {
+			return nil, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	name, args := sshLogSource(lookPath, stat)
+	if name != "/usr/bin/tail" || !reflect.DeepEqual(args, []string{"-n", "0", "-F", "/var/log/secure"}) {
+		t.Fatalf("got %q %q, want tail -n 0 -F /var/log/secure", name, args)
+	}
+	none := func(string) (string, error) { return "", errors.New("not found") }
+	if name, _ := sshLogSource(none, stat); name != "" {
+		t.Fatalf("no journalctl and no tail: name = %q, want empty", name)
+	}
+}
