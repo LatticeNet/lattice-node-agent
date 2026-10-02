@@ -411,6 +411,62 @@ targets a different node id than the token stored in the existing env file, the
 installer refuses to run rather than cross-wiring one node's token to another
 node id.
 
+## Keepalive and supervision
+
+The heartbeat (`POST /api/agent/metrics`) runs on its own goroutine every
+interval with a 10 s deadline, apart from the work loop that fetches config
+and posts usage, inventory, task polls, monitors, log sources, trace, debug
+lines and guard reality. A slow control plane slows those reports, not the
+liveness signal. Each beat carries `loop_health`: process start, the last
+cycle's start, end and duration, the step in progress and since when, per step
+the last success, the last error (one bounded line) and the consecutive error
+count, how long a task batch has been in flight, the monitor result queue
+depth and drop count, whether the watchdog is armed, and, while durable
+linechain recovery refuses to proceed, its reason and start. While recovery is
+blocked the beat does not advertise `durable-task-result-v1`. When recovery
+blocks startup, the heartbeat starts before hello so the node reads online with
+the reason instead of offline.
+
+On systemd the installer writes
+`/etc/systemd/system/lattice-agent.service.d/10-lattice-keepalive.conf` when
+the installed binary lists `sd-notify-v1` in `-compat-json`:
+
+```ini
+[Service]
+NotifyAccess=main
+RuntimeDirectory=lattice-agent
+RuntimeDirectoryMode=0700
+```
+
+With that notify socket the agent sends `READY=1` once its local state is open,
+arms a 120 s watchdog for itself with `WATCHDOG_USEC=` (a unit that sets
+`WatchdogSec` decides the timeout instead) and sends `WATCHDOG=1` at half the
+timeout only while the work loop and the heartbeat have both moved within five
+minutes, or three intervals when the interval is longer. Every request has a
+timeout, so an unreachable control plane never stops the keepalive; a step
+that never returns does, and systemd restarts the agent under
+`Restart=always`. The unit itself stays `Type=simple` without `WatchdogSec`, so
+an older binary installed under the same drop-in runs as before.
+
+After its first successful hello the agent writes its version to
+`$RUNTIME_DIRECTORY/healthy` (`/run/lattice-agent/healthy`), the
+`health-marker-v1` contract. A server-managed update whose plan names the
+update guard arms a transient timer that restores the previous binary and
+restarts the service when the new agent has not written its version there
+within 300 s; the server writes the same drop-in for a binary that advertises
+`sd-notify-v1`.
+
+On openrc the installer runs the agent under `supervise-daemon`
+(`respawn_delay=10`, unlimited respawns) where OpenRC provides it, so a crashed
+agent comes back as it does under systemd and launchd.
+
+Monitor results are queued and sent each interval in batches of up to 200 on
+`POST /api/agent/monitor-results`. A server without that route answers 404 and
+the agent posts one result per request on `/api/agent/monitor-result` for 30
+minutes before it tries the batch route again. The queue holds up to 2000
+results through a control plane outage; past that the oldest are dropped and
+counted in `loop_health`.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.
