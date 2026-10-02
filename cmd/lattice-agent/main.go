@@ -505,6 +505,8 @@ func main() {
 	worker := newTaskWorker(runner, taskResults, linechainManager)
 	worker.health = health
 	monitors := newMonitorManager(cfg)
+	go monitors.flushLoop(context.Background())
+	beat.monitorStats = monitors.results.stats
 	// The heartbeat beats on its own from here on, so the work loop below no
 	// longer carries it.
 	beat.start(context.Background())
@@ -655,6 +657,8 @@ type monitorManager struct {
 	cfg    agentConfig
 	mu     sync.Mutex
 	active map[string]monitorEntry
+	// results buffers probe outcomes until flushLoop sends them.
+	results *monitorResultQueue
 }
 
 type monitorEntry struct {
@@ -663,7 +667,7 @@ type monitorEntry struct {
 }
 
 func newMonitorManager(cfg agentConfig) *monitorManager {
-	return &monitorManager{cfg: cfg, active: map[string]monitorEntry{}}
+	return &monitorManager{cfg: cfg, active: map[string]monitorEntry{}, results: newMonitorResultQueue()}
 }
 
 func (mm *monitorManager) setConfig(cfg agentConfig) {
@@ -706,7 +710,7 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 	if interval < time.Second {
 		interval = 30 * time.Second
 	}
-	probeAndReport(mm.snapshotConfig(), m)
+	mm.probe(m)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -714,7 +718,7 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			probeAndReport(mm.snapshotConfig(), m)
+			mm.probe(m)
 		}
 	}
 }
@@ -724,16 +728,14 @@ func monitorChanged(a, b model.Monitor) bool {
 		a.IntervalSec != b.IntervalSec || a.TimeoutSec != b.TimeoutSec
 }
 
-func probeAndReport(cfg agentConfig, m model.Monitor) {
+// probe runs one probe and queues its result; flushLoop sends it, in a batch
+// when the server has the batch route.
+func (mm *monitorManager) probe(m model.Monitor) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSec+2)*time.Second)
 	defer cancel()
 	res := prober.Probe(ctx, m)
-	debugf(cfg, "monitor probe complete: monitor=%s success=%v latency_ms=%.1f error=%t", m.ID, res.Success, res.LatencyMs, res.Error != "")
-	if err := postAgentJSON(cfg, "/api/agent/monitor-result", map[string]any{
-		"result": res,
-	}, nil); err != nil {
-		log.Printf("monitor %s report error: %v", m.ID, err)
-	}
+	debugf(mm.snapshotConfig(), "monitor probe complete: monitor=%s success=%v latency_ms=%.1f error=%t", m.ID, res.Success, res.LatencyMs, res.Error != "")
+	mm.results.push(res)
 }
 
 func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
