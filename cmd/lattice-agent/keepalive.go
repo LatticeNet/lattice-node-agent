@@ -9,7 +9,8 @@ import (
 )
 
 // Keepalive: the heartbeat runs on its own goroutine and carries the work
-// loop's own account of its progress (loop health).
+// loop's own account of its progress (loop health). The systemd watchdog in
+// supervise.go judges the same progress.
 //
 // Before this, the heartbeat was the metrics POST inside the serial work
 // loop. Four 30 s timeouts ahead of it already exceeded the server's 90 s
@@ -64,6 +65,7 @@ type loopHealthPayload struct {
 	TaskBusySince         time.Time                `json:"task_busy_since,omitzero"`
 	MonitorResultsQueued  int                      `json:"monitor_results_queued,omitempty"`
 	MonitorResultsDropped uint64                   `json:"monitor_results_dropped,omitempty"`
+	Watchdog              bool                     `json:"watchdog,omitempty"`
 }
 
 // loopHealth is the agent's own record of whether its loops are moving. Only
@@ -85,6 +87,7 @@ type loopHealth struct {
 	linechainBlocked      string
 	linechainBlockedSince time.Time
 	taskBusySince         time.Time
+	watchdog              bool
 }
 
 func newLoopHealth(now func() time.Time) *loopHealth {
@@ -219,6 +222,7 @@ func (h *loopHealth) snapshot() loopHealthPayload {
 		LinechainBlocked:      h.linechainBlocked,
 		LinechainBlockedSince: h.linechainBlockedSince,
 		TaskBusySince:         h.taskBusySince,
+		Watchdog:              h.watchdog,
 	}
 	if len(h.steps) > 0 {
 		out.Steps = make(map[string]loopStepState, len(h.steps))

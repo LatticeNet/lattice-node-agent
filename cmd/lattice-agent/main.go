@@ -53,6 +53,10 @@ type agentCompatibility struct {
 	ServerMin    string `json:"server_min"`
 	DashboardMin string `json:"dashboard_min"`
 	Channel      string `json:"channel"`
+	// Features lists node-side supervision contracts this binary keeps. An
+	// installer or agent update reads it from -compat-json before writing a
+	// unit drop-in that only works with a binary that keeps the contract.
+	Features []string `json:"features,omitempty"`
 }
 
 func compatibilityPayload() agentCompatibility {
@@ -60,6 +64,7 @@ func compatibilityPayload() agentCompatibility {
 		ServerMin:    compatServerMin,
 		DashboardMin: compatDashboardMin,
 		Channel:      compatChannel,
+		Features:     []string{sdNotifyCapability, healthMarkerCapability},
 	}
 }
 
@@ -395,7 +400,17 @@ func main() {
 	} else {
 		cfg.LinechainReady = true
 	}
+	// Local state is open: tell systemd the agent has started and arm the
+	// watchdog, which judges local progress only. Both need a unit that
+	// grants a notify socket; without one they do nothing.
 	health := newLoopHealth(nil)
+	if err := sdNotify("READY=1"); err == nil {
+		log.Printf("lattice-agent notified systemd: ready")
+	}
+	if wd := armWatchdog(sdNotify); wd > 0 {
+		log.Printf("lattice-agent watchdog armed: timeout=%s stall_bound=%s", wd, loopStallBound(cfg.Interval))
+		go runWatchdog(context.Background(), health, wd, loopStallBound(cfg.Interval), sdNotify)
+	}
 	// The heartbeat normally starts right after hello, as the first metrics
 	// report always has. When durable recovery blocks startup it starts
 	// before hello instead, so the node reads "online, recovery blocked" with
@@ -454,6 +469,9 @@ func main() {
 		}, nil)
 	}); err != nil {
 		log.Fatalf("hello failed: %v", err)
+	}
+	if err := writeHealthMarker(version); err != nil {
+		log.Printf("warning: health marker not written, an update guard will restore the previous binary: %v", err)
 	}
 	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 		debugf(cfg, "agent config fetch failed: %v", err)
@@ -612,6 +630,7 @@ func main() {
 		}
 	}
 	log.Printf("lattice-agent stopping: shutdown signal received")
+	_ = sdNotify("STOPPING=1")
 	worker.shutdown(taskShutdownGrace, taskShutdownReportGrace)
 }
 
