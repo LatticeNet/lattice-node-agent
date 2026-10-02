@@ -395,7 +395,7 @@ if [ "$action" = "uninstall" ]; then
   log "stopping service ..."
   svc_stop
   case "$(svc_kind)" in
-    systemd) systemctl disable "$service_name" 2>/dev/null || true; rm -f "$unit_path"; systemctl daemon-reload 2>/dev/null || true ;;
+    systemd) systemctl disable "$service_name" 2>/dev/null || true; rm -f "$unit_path" "/etc/systemd/system/${service_name}.service.d/10-lattice-keepalive.conf"; systemctl daemon-reload 2>/dev/null || true ;;
     openrc)  rc-update del "$service_name" 2>/dev/null || true; rm -f "$openrc_path" ;;
     launchd) rm -f "$plist_path" ;;
   esac
@@ -541,17 +541,50 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+    # Keepalive drop-in for a binary that advertises sd-notify-v1. It grants
+    # the agent a notify socket; the agent then arms a 120 s watchdog itself
+    # (WATCHDOG_USEC=) and pets it only while its own loops make progress, so
+    # an unreachable control plane never restarts it and a wedged loop does.
+    # The runtime directory holds the health marker an agent update's
+    # dead-man timer reads. The unit stays Type=simple without WatchdogSec,
+    # so an older binary installed under this drop-in later runs as before.
+    # Agent updates write the same file.
+    keepalive_dropin_dir="/etc/systemd/system/${service_name}.service.d"
+    keepalive_dropin="$keepalive_dropin_dir/10-lattice-keepalive.conf"
+    if "$bin_path" -compat-json 2>/dev/null | grep -Fq '"sd-notify-v1"'; then
+      mkdir -p "$keepalive_dropin_dir"
+      cat >"$keepalive_dropin" <<EOF
+# Written by the Lattice agent installer or an agent update.
+[Service]
+NotifyAccess=main
+RuntimeDirectory=$service_name
+RuntimeDirectoryMode=0700
+EOF
+      ok "keepalive drop-in -> $keepalive_dropin"
+    else
+      rm -f "$keepalive_dropin"
+    fi
     systemctl daemon-reload
     systemctl enable --now "$service_name"
     ok "systemd service enabled (boot autostart) + started"
     systemctl --no-pager --lines=15 status "$service_name" || true
     ;;
   openrc)
+    # supervise-daemon restarts a crashed agent, as systemd's Restart=always
+    # and launchd's KeepAlive do; command_background alone left it down.
+    # OpenRC older than 0.21 has no supervise-daemon and keeps the old form.
+    if have supervise-daemon; then
+      openrc_supervision='supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=0'
+    else
+      openrc_supervision='command_background=true'
+    fi
     cat >"$openrc_path" <<EOF
 #!/sbin/openrc-run
 name="lattice-agent"
 command="$bin_path"
-command_background=true
+$openrc_supervision
 pidfile="/run/${service_name}.pid"
 output_log="$state_dir/agent.log"
 error_log="$state_dir/agent.log"
