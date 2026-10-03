@@ -75,8 +75,10 @@ type loopHealth struct {
 	mu  sync.Mutex
 	now func() time.Time
 
-	startedAt             time.Time
-	workProgress          time.Time
+	startedAt    time.Time
+	workProgress time.Time
+	// beatProgress stays zero until the heartbeat starts: a heartbeat that
+	// has not started cannot be stalled.
 	beatProgress          time.Time
 	cycleStarted          time.Time
 	cycleCompleted        time.Time
@@ -95,7 +97,7 @@ func newLoopHealth(now func() time.Time) *loopHealth {
 		now = time.Now
 	}
 	t := now().UTC()
-	return &loopHealth{now: now, startedAt: t, workProgress: t, beatProgress: t, steps: map[string]*loopStepState{}}
+	return &loopHealth{now: now, startedAt: t, workProgress: t, steps: map[string]*loopStepState{}}
 }
 
 func (h *loopHealth) clock() time.Time { return h.now().UTC() }
@@ -311,9 +313,14 @@ func (b *heartbeat) once(ctx context.Context) error {
 	return b.post(beatCtx, cfg, payload)
 }
 
-// start runs the heartbeat goroutine once; later calls do nothing.
+// start runs the heartbeat goroutine once; later calls do nothing. It stamps
+// the heartbeat's progress first, so from here on the watchdog judges it,
+// and a first beat that never returns reads as a stall.
 func (b *heartbeat) start(ctx context.Context) {
-	b.startOnce.Do(func() { go b.run(ctx) })
+	b.startOnce.Do(func() {
+		b.health.beat()
+		go b.run(ctx)
+	})
 }
 
 // run beats at once and then every interval until ctx ends.

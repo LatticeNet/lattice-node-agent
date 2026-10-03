@@ -400,38 +400,28 @@ func main() {
 	} else {
 		cfg.LinechainReady = true
 	}
-	// Local state is open: tell systemd the agent has started and arm the
-	// watchdog, which judges local progress only. Both need a unit that
-	// grants a notify socket; without one they do nothing.
+	// Local state is open: tell systemd the agent has started. That needs a
+	// unit that grants a notify socket; without one it does nothing.
 	health := newLoopHealth(nil)
 	if err := sdNotify("READY=1"); err == nil {
 		log.Printf("lattice-agent notified systemd: ready")
-	}
-	if wd := armWatchdog(sdNotify); wd > 0 {
-		log.Printf("lattice-agent watchdog armed: timeout=%s stall_bound=%s", wd, loopStallBound(cfg.Interval))
-		go runWatchdog(context.Background(), health, wd, loopStallBound(cfg.Interval), sdNotify)
 	}
 	// The heartbeat normally starts right after hello, as the first metrics
 	// report always has. When durable recovery blocks startup it starts
 	// before hello instead, so the node reads "online, recovery blocked" with
 	// the reason rather than "offline". IPs are resolved first so that early
-	// beat does not report empty addresses.
+	// beat does not report empty addresses. The watchdog, which judges local
+	// progress only, is armed once recovery has finished.
 	refreshIPs(&cfg)
 	beat := newHeartbeat(cfg, health)
-	for {
-		err := health.run(stepLinechainRecovery, func() error {
-			return requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID)
-		})
-		if err == nil {
-			health.clearLinechainBlocked()
-			break
+	recoverThenSupervise(health, beat, func() error {
+		return requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID)
+	}, func() { time.Sleep(cfg.Interval) }, func() {
+		if wd := armWatchdog(sdNotify); wd > 0 {
+			log.Printf("lattice-agent watchdog armed: timeout=%s stall_bound=%s", wd, loopStallBound(cfg.Interval))
+			go runWatchdog(context.Background(), health, wd, loopStallBound(cfg.Interval), sdNotify)
 		}
-		health.setLinechainBlocked(err)
-		beat.start(context.Background())
-		log.Printf("linechain recovery blocked readiness: %v", err)
-		health.waiting()
-		time.Sleep(cfg.Interval)
-	}
+	})
 	agentBinary, err := os.Executable()
 	if err != nil {
 		log.Fatalf("resolve lattice-agent executable failed: %v", err)

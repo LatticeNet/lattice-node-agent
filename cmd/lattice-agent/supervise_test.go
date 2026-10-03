@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -60,6 +61,100 @@ func TestLoopHealthStalledJudgesLocalProgressOnly(t *testing.T) {
 	if stalled, why := h.stalled(bound); !stalled || !strings.Contains(why, "heartbeat") {
 		t.Fatalf("stalled heartbeat: stalled=%v why=%q", stalled, why)
 	}
+}
+
+// A durable recovery that outlasts the stall bound is healthy work, not a
+// wedge. The watchdog is armed only after it, and the heartbeat, which has
+// not started yet, is not judged; from its start on it is.
+func TestLongStartupRecoveryDoesNotTripTheWatchdog(t *testing.T) {
+	clock := newFakeClock()
+	h := newLoopHealth(clock.now)
+	var beats atomic.Int32
+	beat := newHeartbeat(agentConfig{Interval: time.Hour}, h)
+	beat.post = func(context.Context, agentConfig, map[string]any) error {
+		beats.Add(1)
+		return nil
+	}
+	recovered, armed := false, false
+	recoverThenSupervise(h, beat, func() error {
+		if armed {
+			t.Error("watchdog armed while recovery was still running")
+		}
+		clock.advance(2 * loopStallFloor)
+		recovered = true
+		return nil
+	}, func() {
+		t.Fatal("recovery succeeded, so there is nothing to wait for")
+	}, func() {
+		armed = true
+		if !recovered {
+			t.Error("watchdog armed before recovery finished")
+		}
+		if stalled, why := h.stalled(loopStallFloor); stalled {
+			t.Errorf("a recovery that took %s reads as a stall at arming: %s", 2*loopStallFloor, why)
+		}
+	})
+	if !armed {
+		t.Fatal("watchdog never armed")
+	}
+	if beats.Load() != 0 {
+		t.Fatalf("heartbeat started before hello on an unblocked recovery: %d beats", beats.Load())
+	}
+
+	// Hello and setup take seconds, then the heartbeat starts.
+	clock.advance(30 * time.Second)
+	_ = h.run(stepHello, func() error { return nil })
+	if stalled, why := h.stalled(loopStallFloor); stalled {
+		t.Fatalf("stalled before the heartbeat started: %s", why)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	beat.start(ctx)
+	waitFor(t, "first beat", func() bool { return beats.Load() >= 1 })
+	clock.advance(loopStallFloor + time.Second)
+	h.waiting()
+	if stalled, why := h.stalled(loopStallFloor); !stalled || !strings.Contains(why, "heartbeat") {
+		t.Fatalf("a started heartbeat that stops must read as a stall: stalled=%v why=%q", stalled, why)
+	}
+}
+
+// A blocked recovery starts the heartbeat at once, so the node reads online
+// with the reason, and arms the watchdog only after recovery clears.
+func TestBlockedStartupRecoveryBeatsBeforeTheWatchdogArms(t *testing.T) {
+	clock := newFakeClock()
+	h := newLoopHealth(clock.now)
+	var beats atomic.Int32
+	beat := newHeartbeat(agentConfig{Interval: time.Hour}, h)
+	beat.post = func(context.Context, agentConfig, map[string]any) error {
+		beats.Add(1)
+		return nil
+	}
+	failures, waits, arms := 2, 0, 0
+	recoverThenSupervise(h, beat, func() error {
+		if arms > 0 {
+			t.Error("watchdog armed while recovery was blocked")
+		}
+		if failures > 0 {
+			failures--
+			return errors.New("linechain recovery journal is outside captured authority")
+		}
+		return nil
+	}, func() {
+		waits++
+		if !h.linechainIsBlocked() {
+			t.Error("waiting on a blocked recovery that loop health does not record")
+		}
+		clock.advance(10 * time.Second)
+	}, func() {
+		arms++
+	})
+	if waits != 2 || arms != 1 {
+		t.Fatalf("waits=%d arms=%d, want 2 and 1", waits, arms)
+	}
+	if h.linechainIsBlocked() {
+		t.Fatal("recovery cleared but loop health still says blocked")
+	}
+	waitFor(t, "heartbeat started by the blocked recovery", func() bool { return beats.Load() >= 1 })
 }
 
 func TestRunWatchdogPetsOnlyWhileLoopsMove(t *testing.T) {

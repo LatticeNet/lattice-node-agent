@@ -51,7 +51,8 @@ func (h *loopHealth) setWatchdog(on bool) {
 }
 
 // stalled reports which loop, if any, has gone longer than bound without
-// progress. Only a wedged step or a wedged heartbeat can trip it.
+// progress. Only a wedged step or a wedged heartbeat can trip it; a heartbeat
+// that has not started yet is not judged.
 func (h *loopHealth) stalled(bound time.Duration) (bool, string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -62,6 +63,9 @@ func (h *loopHealth) stalled(bound time.Duration) (bool, string) {
 			where = "in step " + h.step
 		}
 		return true, fmt.Sprintf("work loop has not moved for %s (%s)", d.Truncate(time.Second), where)
+	}
+	if h.beatProgress.IsZero() {
+		return false, ""
 	}
 	if d := t.Sub(h.beatProgress); d > bound {
 		return true, fmt.Sprintf("heartbeat has not moved for %s", d.Truncate(time.Second))
@@ -76,6 +80,34 @@ func loopStallBound(interval time.Duration) time.Duration {
 		return b
 	}
 	return loopStallFloor
+}
+
+// recoverThenSupervise runs durable linechain recovery until it succeeds and
+// only then calls arm, which arms the watchdog. Recovery restarts sing-box
+// once per interrupted journal and has no deadline of its own, so on a node
+// with several journals or a slow sing-box restart a healthy recovery can
+// outlast the stall bound. Armed before it, the watchdog would read that as a
+// wedged step and systemd would kill the agent mid-recovery, on every start.
+// While recovery is blocked the heartbeat starts early, so the node reads
+// "online, recovery blocked" with the reason rather than "offline".
+//
+// The recovery at the top of each work loop cycle stays under the watchdog:
+// it runs only while no task is in flight and each task poll recovers first,
+// so it meets at most the journal of the task that just ended.
+func recoverThenSupervise(health *loopHealth, beat *heartbeat, recover func() error, wait func(), arm func()) {
+	for {
+		err := health.run(stepLinechainRecovery, recover)
+		if err == nil {
+			health.clearLinechainBlocked()
+			break
+		}
+		health.setLinechainBlocked(err)
+		beat.start(context.Background())
+		log.Printf("linechain recovery blocked readiness: %v", err)
+		health.waiting()
+		wait()
+	}
+	arm()
 }
 
 var errNoNotifySocket = errors.New("NOTIFY_SOCKET not set")

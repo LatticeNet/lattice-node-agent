@@ -438,15 +438,19 @@ RuntimeDirectory=lattice-agent
 RuntimeDirectoryMode=0700
 ```
 
-With that notify socket the agent sends `READY=1` once its local state is open,
-arms a 120 s watchdog for itself with `WATCHDOG_USEC=` (a unit that sets
-`WatchdogSec` decides the timeout instead) and sends `WATCHDOG=1` at half the
-timeout only while the work loop and the heartbeat have both moved within five
-minutes, or three intervals when the interval is longer. Every request has a
-timeout, so an unreachable control plane never stops the keepalive; a step
-that never returns does, and systemd restarts the agent under
-`Restart=always`. The unit itself stays `Type=simple` without `WatchdogSec`, so
-an older binary installed under the same drop-in runs as before.
+With that notify socket the agent sends `READY=1` once its local state is open.
+Once durable linechain recovery at startup has finished, it arms a 120 s
+watchdog for itself with `WATCHDOG_USEC=` (a unit that sets `WatchdogSec`
+decides the timeout instead) and sends `WATCHDOG=1` at half the timeout only
+while the work loop and the heartbeat have both moved within five minutes, or
+three intervals when the interval is longer. Startup recovery restarts
+sing-box once per interrupted journal and has no deadline of its own, so it
+runs before the watchdog rather than under it; the heartbeat is judged from
+the moment it starts. Every request has a timeout, so an unreachable control
+plane never stops the keepalive; a step that never returns does, and systemd
+restarts the agent under `Restart=always`. The unit itself stays `Type=simple`
+without `WatchdogSec`, so an older binary installed under the same drop-in
+runs as before.
 
 After its first successful hello the agent writes its version to
 `$RUNTIME_DIRECTORY/healthy` (`/run/lattice-agent/healthy`), the

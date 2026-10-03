@@ -19,10 +19,11 @@ Keepalive:
   recovery keeps the node visible and withholds `durable-task-result-v1`
   until it clears. Older servers ignore the new field.
 - When the unit grants a notify socket (`NotifyAccess=main`), the agent sends
-  `READY=1`, arms a 120 s systemd watchdog for itself with `WATCHDOG_USEC=` and
-  pets it only while its own loops make local progress. An unreachable
-  control plane never stops the keepalive; a wedged step does, and systemd
-  restarts the agent.
+  `READY=1`, arms a 120 s systemd watchdog for itself with `WATCHDOG_USEC=`
+  once startup recovery has finished, and pets it only while its own loops
+  make local progress. An unreachable control plane never stops the
+  keepalive; a wedged step does, and systemd restarts the agent. A long
+  startup recovery is not a stall.
 - After its first successful hello the agent writes its version to
   `$RUNTIME_DIRECTORY/healthy`, which a server-managed update's guard reads
   before it keeps a new binary.
