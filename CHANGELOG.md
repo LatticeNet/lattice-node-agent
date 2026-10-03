@@ -32,6 +32,18 @@ Control-plane witness:
   `control-plane-witness-v1`, on every beat whether or not linechain recovery
   is ready.
 
+sb script capabilities (merged into integration after alpha.1, 6812194 and
+4d11bfe):
+
+- With `-singbox-discover` the agent runs `sb --json caps` at startup and at
+  most every 10 minutes (5 s timeout) and appends each reported cap as
+  `sb:<cap>` to the hello and metrics capabilities. Only the seven names the
+  lr00rl/sing-box v1.24.3-alpha.8 script reports pass an allowlist; an
+  alpha.7 or older script, a timeout, or malformed output means no sb caps.
+- A bounded sb call (`sb --json list` and `sb --json caps`) returns one
+  second after its deadline even when a child the script started still holds
+  its output pipe, so such a child can no longer hold hello or the work loop.
+
 Compatibility: no new server or dashboard floor. The witness plan needs a
 server that knows the `controlplane-witness` plan kind
 (lattice-server `feat/witness-plan-and-fallback-channel`).
