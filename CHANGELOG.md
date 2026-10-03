@@ -5,7 +5,25 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## 0.3.10-alpha.1 (unreleased)
+## 0.3.10-alpha.2 (unreleased)
+
+Prerelease. Changes since v0.3.10-alpha.1.
+
+- With `-singbox-discover`, the agent asks the node's `sb` script what it can
+  do (`sb --json caps`) at startup and at most every 10 minutes, with a 5 s
+  timeout, and reports each capability as `sb:<cap>` in the hello and the
+  heartbeat. Only the names script v1.24.3-alpha.8 lists pass
+  (`user-del-by-name`, `user-park`, `user-parked-list`,
+  `user-open-proxy-guard`, `user-match-counts`, `user-socks-add`,
+  `user-lock`). An older script, a failure, a timeout or unexpected output
+  reports none and leaves the heartbeat unchanged. lattice-server uses
+  `sb:user-del-by-name` to remove a deleted VPN user from an adopted line by
+  name.
+- A timed-out `sb` call no longer waits for a child process that still holds
+  its output: the runner gives up one second after the deadline. This also
+  covers `sb --json list`.
+
+## 0.3.10-alpha.1 (2026-10-02)
 
 Prerelease. Changes since v0.3.9, the current stable release.
 
