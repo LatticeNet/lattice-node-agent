@@ -1631,8 +1631,15 @@ func singBoxRuntimeMetadata(value map[string]any) map[string]string {
 	return out
 }
 
+// commandWaitDelay bounds how long a killed sb call may hold the agent after
+// its deadline. The context kills only sb itself; a child it started (jq, a
+// sleep, a flock wait) can keep stdout open, and without this Run waits for
+// that child however long it lives.
+const commandWaitDelay = time.Second
+
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = commandWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
