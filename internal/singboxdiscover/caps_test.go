@@ -145,6 +145,9 @@ func TestCapsAgainstRealScripts(t *testing.T) {
 	alpha8 := write("sb-alpha8", "[ \"$1 $2\" = '--json caps' ] || exit 2\ncat <<'EOF'\n"+alpha8Caps+"EOF\n")
 	alpha7 := write("sb-alpha7", "cat <<'EOF'\n"+alpha7Caps+"EOF\nexit 1\n")
 	hung := write("sb-hung", "exec sleep 30\n")
+	// The shell stays the parent and its sleep child keeps stdout open after
+	// the shell is killed at the deadline.
+	hungChild := write("sb-hung-child", "sleep 30\n")
 
 	got, err := Caps(context.Background(), Source{Binary: alpha8, Timeout: 5 * time.Second})
 	if err != nil || len(got) != 7 {
@@ -153,11 +156,13 @@ func TestCapsAgainstRealScripts(t *testing.T) {
 	if got, err := Caps(context.Background(), Source{Binary: alpha7, Timeout: 5 * time.Second}); err == nil {
 		t.Fatalf("alpha.7 caps = %v, want an error", got)
 	}
-	start := time.Now()
-	if got, err := Caps(context.Background(), Source{Binary: hung, Timeout: 100 * time.Millisecond}); err == nil {
-		t.Fatalf("hung caps = %v, want an error", got)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("hung script held the probe for %s", elapsed)
+	for _, script := range []string{hung, hungChild} {
+		start := time.Now()
+		if got, err := Caps(context.Background(), Source{Binary: script, Timeout: 100 * time.Millisecond}); err == nil {
+			t.Fatalf("%s caps = %v, want an error", filepath.Base(script), got)
+		}
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond+commandWaitDelay+2*time.Second {
+			t.Fatalf("%s held the probe for %s", filepath.Base(script), elapsed)
+		}
 	}
 }
