@@ -468,8 +468,12 @@ Monitor results are queued and sent each interval in batches of up to 200 on
 `POST /api/agent/monitor-results`. A server without that route answers 404 and
 the agent posts one result per request on `/api/agent/monitor-result` for 30
 minutes before it tries the batch route again. The queue holds up to 2000
-results through a control plane outage; past that the oldest are dropped and
-counted in `loop_health`.
+results through a control plane outage; past that the oldest are dropped. The
+queue lives in memory: a clean stop (an update, an update guard's restore, an
+operator restart) sends it once more within 5 s, while a crash or a watchdog
+kill loses it. Every result the server never stored (overflow, a batch or a
+single result the server refused, or one a batch answer lists as dropped) is
+logged and counted in `loop_health.monitor_results_dropped`.
 
 ## Execution Limits
 

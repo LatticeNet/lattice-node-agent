@@ -257,3 +257,115 @@ func TestMonitorResultsBatchRequestShape(t *testing.T) {
 		t.Fatalf("accepted, duplicate and dropped results must all settle; queued = %d", queued)
 	}
 }
+
+// Every result the server never stores is counted, whatever the reason, so
+// the count on the heartbeat is the whole loss and not only overflow.
+func TestMonitorResultsCountEveryResultTheServerNeverStored(t *testing.T) {
+	q, srv := queueWith(2)
+	srv.answer = func(string, int) error { return statusErr(http.StatusBadRequest) }
+	if err := q.flush(context.Background(), agentConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, dropped := q.stats(); dropped != 2 {
+		t.Fatalf("dropped after a refused batch of 2 = %d", dropped)
+	}
+
+	q, srv = queueWith(3)
+	q.disableBatch()
+	calls := 0
+	srv.answer = func(string, int) error {
+		calls++
+		if calls == 2 {
+			return statusErr(http.StatusUnprocessableEntity)
+		}
+		return nil
+	}
+	if err := q.flush(context.Background(), agentConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, dropped := q.stats(); dropped != 1 {
+		t.Fatalf("dropped after one refused single = %d", dropped)
+	}
+
+	q, _ = queueWith(4)
+	q.post = func(_ context.Context, _ agentConfig, _ string, _ map[string]any, out any) error {
+		a := out.(*monitorResultsAnswer)
+		a.OK, a.Accepted = true, 2
+		a.Dropped = []monitorResultDrop{
+			{Index: 1, MonitorID: "m-1", Reason: "monitor_not_assigned"},
+			{Index: 3, MonitorID: "m-3", Reason: "too_old"},
+		}
+		return nil
+	}
+	if err := q.flush(context.Background(), agentConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	queued, dropped := q.stats()
+	if queued != 0 || dropped != 2 {
+		t.Fatalf("after a batch answer listing two drops: queued=%d dropped=%d", queued, dropped)
+	}
+	if fresh, total := q.droppedSinceLog(); fresh != 2 || total != 2 {
+		t.Fatalf("first drop report = %d of %d", fresh, total)
+	}
+	if fresh, _ := q.droppedSinceLog(); fresh != 0 {
+		t.Fatalf("drops reported twice: %d", fresh)
+	}
+}
+
+// A clean stop sends what is still queued, and gives up within its grace
+// when the control plane does not answer.
+func TestMonitorDrainSendsTheQueueOnStop(t *testing.T) {
+	mm := newMonitorManager(agentConfig{Interval: time.Hour})
+	srv := &fakeMonitorServer{}
+	mm.results.post = srv.post
+	for i := 0; i < 3; i++ {
+		mm.results.push(model.MonitorResult{MonitorID: fmt.Sprintf("m-%d", i), Success: true})
+	}
+	mm.drain(time.Second)
+	if queued, _ := mm.results.stats(); queued != 0 || len(srv.posts) != 1 || len(srv.posts[0].results) != 3 {
+		t.Fatalf("drain left %d queued after %d posts", queued, len(srv.posts))
+	}
+
+	mm.results.push(model.MonitorResult{MonitorID: "late", Success: true})
+	mm.results.post = func(ctx context.Context, _ agentConfig, _ string, _ map[string]any, _ any) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	start := time.Now()
+	mm.drain(50 * time.Millisecond)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("drain against a silent control plane took %s", took)
+	}
+	if queued, _ := mm.results.stats(); queued != 1 {
+		t.Fatalf("an unsent result must stay counted as queued: %d", queued)
+	}
+}
+
+// Stopping the flush loop cuts the flush in flight short, so drain does not
+// wait out its 20 s timeout behind it.
+func TestMonitorFlushLoopStopsItsFlushInFlight(t *testing.T) {
+	mm := newMonitorManager(agentConfig{Interval: 5 * time.Millisecond})
+	entered := make(chan struct{}, 1)
+	mm.results.post = func(ctx context.Context, _ agentConfig, _ string, _ map[string]any, _ any) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	mm.results.push(model.MonitorResult{MonitorID: "m-0", Success: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		mm.flushLoop(ctx)
+		close(done)
+	}()
+	<-entered
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush loop kept its flush in flight after stop")
+	}
+}

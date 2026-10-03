@@ -21,16 +21,26 @@ import (
 //
 // The queue is the outage buffer: while the control plane is unreachable
 // probe results keep accumulating, oldest first, up to monitorResultQueueMax.
-// Past that the oldest are dropped and counted; the server refuses results
-// stamped more than 24 hours before they arrive in any case.
+// Past that the oldest are dropped; the server refuses results stamped more
+// than 24 hours before they arrive in any case. The queue lives in memory: a
+// clean stop sends it once more (drain), a crash or a watchdog kill loses it.
+//
+// Every result the server never stored is counted in dropped, which rides on
+// each heartbeat as loop_health.monitor_results_dropped, and logged: overflow,
+// a batch the server refused whole, a single result it refused, and results a
+// batch answer listed as dropped.
 const (
 	monitorResultQueueMax     = 2000
 	monitorResultBatchMax     = 200
 	monitorResultFlushBatches = 5
 	monitorResultFlushTimeout = 20 * time.Second
 	monitorBatchReprobe       = 30 * time.Minute
-	monitorResultsBatchPath   = "/api/agent/monitor-results"
-	monitorResultSinglePath   = "/api/agent/monitor-result"
+	// monitorResultShutdownGrace bounds the last flush on a clean stop. With
+	// the task shutdown budget (55 s) it stays under systemd's default 90 s
+	// TimeoutStopSec.
+	monitorResultShutdownGrace = 5 * time.Second
+	monitorResultsBatchPath    = "/api/agent/monitor-results"
+	monitorResultSinglePath    = "/api/agent/monitor-result"
 )
 
 type queuedMonitorResult struct {
@@ -39,14 +49,16 @@ type queuedMonitorResult struct {
 }
 
 type monitorResultsAnswer struct {
-	OK         bool `json:"ok"`
-	Accepted   int  `json:"accepted"`
-	Duplicates int  `json:"duplicates"`
-	Dropped    []struct {
-		Index     int    `json:"index"`
-		MonitorID string `json:"monitor_id"`
-		Reason    string `json:"reason"`
-	} `json:"dropped"`
+	OK         bool                `json:"ok"`
+	Accepted   int                 `json:"accepted"`
+	Duplicates int                 `json:"duplicates"`
+	Dropped    []monitorResultDrop `json:"dropped"`
+}
+
+type monitorResultDrop struct {
+	Index     int    `json:"index"`
+	MonitorID string `json:"monitor_id"`
+	Reason    string `json:"reason"`
 }
 
 type monitorResultQueue struct {
@@ -55,6 +67,8 @@ type monitorResultQueue struct {
 	items   []queuedMonitorResult
 	nextSeq uint64
 	dropped uint64
+	// droppedLogged is the part of dropped already in the journal.
+	droppedLogged uint64
 	// batchOffUntil is when the batch route is tried again after a 404.
 	batchOffUntil time.Time
 	// flushMu keeps one flush in flight, so two cannot send the same head.
@@ -75,6 +89,23 @@ func (q *monitorResultQueue) push(r model.MonitorResult) {
 		q.items = append(q.items[:0:0], q.items[over:]...)
 		q.dropped += uint64(over)
 	}
+}
+
+// countDropped records n results the server will never store.
+func (q *monitorResultQueue) countDropped(n int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.dropped += uint64(n)
+}
+
+// droppedSinceLog returns how many results were dropped since the last call,
+// and the total.
+func (q *monitorResultQueue) droppedSinceLog() (fresh, total uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	fresh = q.dropped - q.droppedLogged
+	q.droppedLogged = q.dropped
+	return fresh, q.dropped
 }
 
 func (q *monitorResultQueue) stats() (queued int, dropped uint64) {
@@ -161,12 +192,18 @@ func (q *monitorResultQueue) sendBatch(ctx context.Context, cfg agentConfig, bat
 			// Sending the same bytes again cannot succeed, so it is dropped
 			// rather than left to block every later result.
 			q.settle(batch[len(batch)-1].seq)
+			q.countDropped(len(batch))
 			log.Printf("monitor results: server refused a batch of %d, dropped: %v", len(batch), err)
 			return nil
 		}
 		return err
 	}
 	q.settle(batch[len(batch)-1].seq)
+	if n := len(answer.Dropped); n > 0 {
+		q.countDropped(n)
+		first := answer.Dropped[0]
+		log.Printf("monitor results: server dropped %d of %d (first: monitor=%s reason=%s)", n, len(batch), first.MonitorID, first.Reason)
+	}
 	for _, d := range answer.Dropped {
 		debugf(cfg, "monitor result dropped by server: index=%d monitor=%s reason=%s", d.Index, d.MonitorID, d.Reason)
 	}
@@ -185,6 +222,7 @@ func (q *monitorResultQueue) sendSingles(ctx context.Context, cfg agentConfig, b
 			if !ok || code >= 500 || code == http.StatusUnauthorized || code == http.StatusTooManyRequests {
 				return err
 			}
+			q.countDropped(1)
 			log.Printf("monitor %s report refused, dropped: %v", item.result.MonitorID, err)
 		}
 		q.settle(item.seq)
@@ -192,7 +230,8 @@ func (q *monitorResultQueue) sendSingles(ctx context.Context, cfg agentConfig, b
 	return nil
 }
 
-// flushLoop sends queued results every agent interval until ctx ends.
+// flushLoop sends queued results every agent interval until ctx ends. A
+// cancelled ctx also cuts the flush in flight short, so drain can run at once.
 func (mm *monitorManager) flushLoop(ctx context.Context) {
 	interval := mm.snapshotConfig().Interval
 	if interval <= 0 {
@@ -208,10 +247,33 @@ func (mm *monitorManager) flushLoop(ctx context.Context) {
 		}
 		cfg := mm.snapshotConfig()
 		flushCtx, cancel := context.WithTimeout(ctx, monitorResultFlushTimeout)
-		if err := mm.results.flush(flushCtx, cfg); err != nil {
+		if err := mm.results.flush(flushCtx, cfg); err != nil && ctx.Err() == nil {
 			queued, _ := mm.results.stats()
 			log.Printf("monitor results report error (%d queued): %v", queued, err)
 		}
 		cancel()
+		mm.results.logDrops()
+	}
+}
+
+// logDrops writes newly dropped results to the journal, once per flush
+// rather than once per result.
+func (q *monitorResultQueue) logDrops() {
+	if fresh, total := q.droppedSinceLog(); fresh > 0 {
+		log.Printf("monitor results: %d dropped since the last report, %d since start", fresh, total)
+	}
+}
+
+// drain sends what is still queued once more on a clean stop, so a restart
+// (an update, an update guard's restore, an operator restart) does not lose
+// the last interval's results. The flush loop must be stopped first. What
+// cannot go out within grace is lost with the process, and logged.
+func (mm *monitorManager) drain(grace time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	err := mm.results.flush(ctx, mm.snapshotConfig())
+	mm.results.logDrops()
+	if queued, _ := mm.results.stats(); queued > 0 {
+		log.Printf("shutdown: %d monitor result(s) not reported, lost with this process: %v", queued, err)
 	}
 }

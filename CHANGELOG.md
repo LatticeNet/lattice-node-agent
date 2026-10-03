@@ -41,7 +41,9 @@ Monitors:
 - Probe results are queued (up to 2000 through an outage) and sent in batches
   of up to 200 on `POST /api/agent/monitor-results`. A server without the
   route answers 404 and the agent posts one result per request, retrying the
-  batch route every 30 minutes.
+  batch route every 30 minutes. The queue is in memory: a clean stop sends it
+  once more, a crash loses it. Every result the server never stored is logged
+  and counted in `loop_health.monitor_results_dropped`.
 
 Fixes carried from `main` (merged into integration after v0.3.9):
 

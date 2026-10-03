@@ -495,7 +495,9 @@ func main() {
 	worker := newTaskWorker(runner, taskResults, linechainManager)
 	worker.health = health
 	monitors := newMonitorManager(cfg)
-	go monitors.flushLoop(context.Background())
+	monitorFlushCtx, stopMonitorFlush := context.WithCancel(context.Background())
+	defer stopMonitorFlush()
+	go monitors.flushLoop(monitorFlushCtx)
 	beat.monitorStats = monitors.results.stats
 	// The heartbeat beats on its own from here on, so the work loop below no
 	// longer carries it.
@@ -624,6 +626,8 @@ func main() {
 	log.Printf("lattice-agent stopping: shutdown signal received")
 	_ = sdNotify("STOPPING=1")
 	worker.shutdown(taskShutdownGrace, taskShutdownReportGrace)
+	stopMonitorFlush()
+	monitors.drain(monitorResultShutdownGrace)
 }
 
 var guardManagedSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
