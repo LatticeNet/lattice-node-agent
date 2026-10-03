@@ -265,9 +265,12 @@ type heartbeat struct {
 	// monitorStats reports the monitor result queue for loop health; nil
 	// leaves the fields out.
 	monitorStats func() (queued int, dropped uint64)
-	timeout      time.Duration
-	post         func(ctx context.Context, cfg agentConfig, payload map[string]any) error
-	startOnce    sync.Once
+	// witnessStatus returns the witness status file to relay, or nil when
+	// this node runs no witness.
+	witnessStatus func() *witnessRelay
+	timeout       time.Duration
+	post          func(ctx context.Context, cfg agentConfig, payload map[string]any) error
+	startOnce     sync.Once
 }
 
 func newHeartbeat(cfg agentConfig, health *loopHealth) *heartbeat {
@@ -275,6 +278,9 @@ func newHeartbeat(cfg agentConfig, health *loopHealth) *heartbeat {
 		cfg:     cfg,
 		health:  health,
 		timeout: heartbeatTimeout,
+		witnessStatus: func() *witnessRelay {
+			return readWitnessStatus(witnessStatusPath(), time.Now())
+		},
 		post: func(ctx context.Context, cfg agentConfig, payload map[string]any) error {
 			return postAgentJSONContext(ctx, cfg, "/api/agent/metrics", payload, nil)
 		},
@@ -308,6 +314,11 @@ func (b *heartbeat) once(ctx context.Context) error {
 		lh.MonitorResultsQueued, lh.MonitorResultsDropped = b.monitorStats()
 	}
 	payload["loop_health"] = lh
+	if b.witnessStatus != nil {
+		if ws := b.witnessStatus(); ws != nil {
+			payload["witness"] = ws
+		}
+	}
 	beatCtx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 	return b.post(beatCtx, cfg, payload)

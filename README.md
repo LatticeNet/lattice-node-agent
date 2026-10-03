@@ -485,6 +485,76 @@ kill loses it. Every result the server never stored (overflow, a batch or a
 single result the server refused, or one a batch answer lists as dropped) is
 logged and counted in `loop_health.monitor_results_dropped`.
 
+## Control-plane witness
+
+Lattice cannot report its own outage, so one node watches it from outside:
+`lattice-agent -witness /etc/lattice-witness/witness.json` runs as its own
+process under `lattice-witness.service`. Both the unit and the config are
+written by an approved control-plane plan (`controlplane-witness`), never by
+hand, and the binary the unit runs is a copy of the agent taken when the plan
+applied (`/usr/local/lib/lattice-witness/lattice-agent`), so an agent update
+or an update guard's restore never changes the safety net.
+
+It is a separate process because the agent exits when its first hello fails:
+after a reboot or a restart during an outage, an in-process witness would be
+gone exactly when it is needed. The witness holds no node token, carries no
+fleet data, and talks to three things only: the control plane's public
+readiness URL (`<public URL>/readyz`, reached the way any client reaches it,
+never the agent's private path), one to three reference URLs, and the
+bark-server on the node's own loopback interface. The Bark device key is read
+from a root-only file the config names (mode 0600, owned by the witness's
+user, the shape of a Bark key), at start and at every push; the config holds
+only its path.
+
+Every interval (30 s by default) it asks the readiness URL; only HTTP 200
+counts. When that fails it asks the references, and any HTTP answer from one
+of them proves the node's own network. Then:
+
+- The control plane keeps failing with the network up for the hold window
+  (3 minutes and at least two checks by default): one push, at the configured
+  Bark level (`critical` by default), naming the node, the host, when the
+  failures began and the last classified reason. It is titled "not ready"
+  when the last check got an HTTP answer other than 200 (a 503 from
+  `/readyz` when its store or audit check fails, or a status from a proxy in
+  front of the server), and "unreachable" when nothing answered.
+- The control plane and every reference fail together: the node's own network
+  is down, the check is not counted as a failure, does not end the run, and
+  nothing is pushed. The hold keeps running on the clock from the run's first
+  failure; the first failed check after the network returns only confirms,
+  and the next one may push.
+- The control plane answers again without a break for the recovery window
+  (1 minute and at least two checks): one recovery push at level `active`. A
+  control plane that flaps during recovery sends nothing more; one that
+  recovers before the alert was delivered sends nothing at all.
+- A push the bark-server did not accept is owed again at every check until it
+  is delivered; it is logged once, not at every check.
+
+The state file (`/var/lib/lattice-witness/status.json`, 0644, no secret) is
+written atomically after every check. A witness restarted in the middle of an
+outage reads it back, so it neither pushes twice nor forgets the recovery; a
+witness that was itself stopped for longer than the hold window (or three
+intervals) starts counting again. The main agent attaches that file to its
+heartbeat as `witness`, re-encoded from its typed form, so the console can
+show the last check and the last push; it reads the file and nothing else and
+never starts, stops or configures the witness. `LATTICE_WITNESS_STATUS_FILE`
+moves where it looks. The relay adds `relayed_at`, this node's clock when the
+agent read the file. A witness whose service stopped or wedged leaves its
+last status on disk and the agent keeps relaying it, so the server compares
+`relayed_at` with the last check, on the same clock, against the interval and
+shows such a witness as stopped rather than watching.
+
+The witness has no mute and no quiet hours. Once it is applied, any stop of
+the control plane longer than the hold (a server switch, the stop for a
+backup) pages at the configured level. Before a planned stop, either expect
+that page or first apply a witness plan with a hold longer than the stop;
+only a remove plan silences the witness.
+
+`lattice-agent -witness <config> -witness-check` validates the config and the
+key file and prints a summary with the config's SHA-256, never the key. The
+apply script runs it before it enables the unit. Binaries with witness mode
+list `control-plane-witness-v1` in hello capabilities and in `-compat-json`
+features; the server plans a witness only for a node that advertises it.
+
 ## Execution Limits
 
 - Interpreter allowlist: `sh`, `bash`, `python3`, `node`.
