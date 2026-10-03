@@ -181,6 +181,11 @@ type agentConfig struct {
 	TaskOutboxDir             string
 	LinechainTxnDir           string
 	LinechainReady            bool
+
+	// SingBoxScriptCaps is what the node's sb script reports it can do, as
+	// "sb:<cap>" names from a fixed allowlist (sbcaps.go). Empty without
+	// -singbox-discover or with a script that has no caps verb.
+	SingBoxScriptCaps []string
 }
 
 type agentRuntimePayload struct {
@@ -441,12 +446,14 @@ func main() {
 		log.Printf("warning: allowlisted interpreters not found on PATH: %s (tasks using them will fail until installed)", strings.Join(missing, ", "))
 	}
 	refreshIPs(&cfg)
+	sbCaps := newSingBoxCapsProbe()
+	sbCaps.refresh(&cfg)
 	beat.setConfig(cfg)
 	if err := health.run(stepHello, func() error {
 		return postAgentJSON(cfg, "/api/agent/hello", map[string]any{
 			"version":              version,
 			"compatibility":        compatibilityPayload(),
-			"capabilities":         capabilitiesFor(cfg.LinechainReady),
+			"capabilities":         payloadCapabilities(cfg),
 			"public_ip":            cfg.PublicIP,
 			"public_ipv6":          cfg.PublicIPv6,
 			"internal_ip":          cfg.InternalIP,
@@ -556,6 +563,7 @@ func main() {
 			refreshIPs(&cfg)
 			return nil
 		})
+		sbCaps.refresh(&cfg)
 		beat.setConfig(cfg)
 		statsDiscovery.refresh(&cfg)
 		_ = health.run(stepUsage, func() error {
@@ -882,7 +890,7 @@ func metricsPayload(cfg agentConfig) map[string]any {
 	return map[string]any{
 		"version":       version,
 		"compatibility": compatibilityPayload(),
-		"capabilities":  capabilitiesFor(cfg.LinechainReady),
+		"capabilities":  payloadCapabilities(cfg),
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,
