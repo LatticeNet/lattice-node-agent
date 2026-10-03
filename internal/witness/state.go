@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -131,13 +132,23 @@ func (s *State) observe(cfg Config, now time.Time, res CheckResult) *Push {
 	s.OKSince, s.ConsecutiveOK = time.Time{}, 0
 	if !res.NetworkUp {
 		// Nothing answers, so this check says nothing about the control
-		// plane. It neither counts toward the hold nor ends the run.
+		// plane: it is not counted as a failure and does not end the run.
+		// The hold is measured on the clock from the run's first failure, so
+		// a run that began before the network dropped can be past its hold
+		// when the network comes back.
 		if s.NetworkDownSince.IsZero() {
 			s.NetworkDownSince = now
 		}
 		s.Phase = PhaseNetworkDown
 		return nil
 	}
+	// The first failed check after this node's own network came back does
+	// not push on its own, however old the run: routes and DNS may still be
+	// settling while a reference already answers. The next failed check, one
+	// interval later, does. Restarting the whole run was rejected: on a node
+	// whose network drops now and then it would keep a real outage from ever
+	// reaching the hold.
+	backFromNetworkDown := !s.NetworkDownSince.IsZero()
 	s.NetworkDownSince = time.Time{}
 	if s.ConsecutiveFailures == 0 {
 		s.FailingSince = now
@@ -148,7 +159,7 @@ func (s *State) observe(cfg Config, now time.Time, res CheckResult) *Push {
 		return nil
 	}
 	s.Phase = PhaseFailing
-	if s.ConsecutiveFailures >= 2 && now.Sub(s.FailingSince) >= cfg.Hold() {
+	if s.ConsecutiveFailures >= 2 && now.Sub(s.FailingSince) >= cfg.Hold() && !backFromNetworkDown {
 		return downPush(cfg, s, now)
 	}
 	return nil
@@ -181,9 +192,17 @@ func (s *State) pushed(p *Push, now time.Time, errKind string) {
 
 func downPush(cfg Config, s *State, now time.Time) *Push {
 	host := hostOf(cfg.HealthURL)
-	body := fmt.Sprintf("Seen from %s: %s has not answered since %s (%d checks over %s; last: %s). This node's own network is up. Sent by the Lattice witness on %s through its local Bark server, because Lattice itself cannot send anything now.",
-		cfg.NodeName, host, clock(s.FailingSince), s.ConsecutiveFailures, roughDuration(now.Sub(s.FailingSince)), orUnknown(s.LastCheckDetail), cfg.NodeName)
-	return &Push{Kind: PushDown, Title: "Lattice control plane unreachable", Body: body, Level: cfg.Level()}
+	title, failed := "Lattice control plane unreachable", "has not answered since"
+	if strings.HasPrefix(s.LastCheckDetail, "http ") {
+		// Something on the public path answers, just not with 200: the
+		// server says it is not ready (its store or audit check failed), or a
+		// proxy or CDN in front of it answers in its place. "Unreachable"
+		// would send the operator after the network.
+		title, failed = "Lattice control plane not ready", "has answered without reporting ready since"
+	}
+	body := fmt.Sprintf("Seen from %s: %s %s %s (%d checks over %s; last: %s). This node's own network is up. Sent by the Lattice witness on %s through its local Bark server, because Lattice itself cannot send anything now.",
+		cfg.NodeName, host, failed, clock(s.FailingSince), s.ConsecutiveFailures, roughDuration(now.Sub(s.FailingSince)), orUnknown(s.LastCheckDetail), cfg.NodeName)
+	return &Push{Kind: PushDown, Title: title, Body: body, Level: cfg.Level()}
 }
 
 func recoveryPush(cfg Config, s *State, now time.Time) *Push {
@@ -192,9 +211,11 @@ func recoveryPush(cfg Config, s *State, now time.Time) *Push {
 	if since.IsZero() {
 		since = s.AlertedAt
 	}
-	body := fmt.Sprintf("Seen from %s: %s answers again since %s, after about %s unreachable. Sent by the Lattice witness on %s.",
+	// A recovery is a run of 200s from /readyz, so "ready again" is true
+	// after either kind of outage.
+	body := fmt.Sprintf("Seen from %s: %s reports ready again since %s, after about %s down. Sent by the Lattice witness on %s.",
 		cfg.NodeName, host, clock(s.OKSince), roughDuration(s.OKSince.Sub(since)), cfg.NodeName)
-	return &Push{Kind: PushRecovery, Title: "Lattice control plane reachable again", Body: body, Level: "active"}
+	return &Push{Kind: PushRecovery, Title: "Lattice control plane ready again", Body: body, Level: "active"}
 }
 
 func clock(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05Z") }

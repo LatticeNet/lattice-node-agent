@@ -129,10 +129,10 @@ func TestPushesOnceAfterTheHoldAndNeverAgainWhileDown(t *testing.T) {
 	s.run(1, cpDown)
 	s.wantPushes(PushDown)
 	p := s.pushes[0]
-	if p.Level != "critical" || p.Title != "Lattice control plane unreachable" {
+	if p.Level != "critical" || p.Title != "Lattice control plane not ready" {
 		t.Fatalf("down push = %+v", p)
 	}
-	for _, want := range []string{"[cd]-gomami-jpn-pulse-nano", "lattice.example.org", "http 502", "7 checks", "own network is up"} {
+	for _, want := range []string{"[cd]-gomami-jpn-pulse-nano", "lattice.example.org", "answered without reporting ready", "http 502", "7 checks", "own network is up"} {
 		if !strings.Contains(p.Body, want) {
 			t.Fatalf("down body %q lacks %q", p.Body, want)
 		}
@@ -159,7 +159,7 @@ func TestPushesOneRecoveryOnceTheControlPlaneKeepsAnswering(t *testing.T) {
 	s.run(2, cpUp)
 	s.wantPushes(PushDown, PushRecovery)
 	r := s.pushes[1]
-	if r.Level != "active" || !strings.Contains(r.Body, "answers again") || !strings.Contains(r.Body, "unreachable") {
+	if r.Level != "active" || r.Title != "Lattice control plane ready again" || !strings.Contains(r.Body, "reports ready again") || !strings.Contains(r.Body, "5 min down") {
 		t.Fatalf("recovery push = %+v", r)
 	}
 	s.run(100, cpUp)
@@ -191,10 +191,59 @@ func TestOwnNetworkDownNeitherCountsNorEndsTheRun(t *testing.T) {
 	if s.saved.ConsecutiveFailures != 3 {
 		t.Fatalf("network-down checks counted: %d failures", s.saved.ConsecutiveFailures)
 	}
-	// Back on the network and the control plane still does not answer: the
-	// run began before the network dropped, so the hold is long past.
+	// Back on the network and the control plane still does not answer. The
+	// run began before the network dropped, so the hold is long past, but
+	// the first check back only confirms: the network may still be settling.
+	s.run(1, cpDown)
+	s.wantPushes()
+	if s.saved.Phase != PhaseFailing || s.saved.ConsecutiveFailures != 4 {
+		t.Fatalf("first check back = %+v", s.saved)
+	}
+	// The next one, still failing with the network up, pushes.
 	s.run(1, cpDown)
 	s.wantPushes(PushDown)
+	if !strings.Contains(s.pushes[0].Body, "5 checks") {
+		t.Fatalf("down body %q", s.pushes[0].Body)
+	}
+}
+
+// A node whose own network keeps dropping does not keep a real outage from
+// being reported: the network-down checks pause the run, they do not end it.
+func TestFlakyOwnNetworkStillReachesTheHold(t *testing.T) {
+	s := newScenario(t)
+	// Failures at 30 and 60 s, a drop, failures at 120 and 150 s, a drop.
+	for range 2 {
+		s.run(2, cpDown)
+		s.run(1, networkDown)
+	}
+	s.wantPushes()
+	// 210 s: past the hold, but the first check back only confirms.
+	s.run(1, cpDown)
+	s.wantPushes()
+	// 240 s: pushes.
+	s.run(1, cpDown)
+	s.wantPushes(PushDown)
+}
+
+// A control plane that does not answer at all is unreachable; one that
+// answers with anything but 200 is not ready, and the push says which.
+func TestDownPushNamesUnreachableOrNotReady(t *testing.T) {
+	for _, tc := range []struct {
+		detail, title, body string
+	}{
+		{"connection refused", "Lattice control plane unreachable", "has not answered since"},
+		{"timeout", "Lattice control plane unreachable", "has not answered since"},
+		{"http 503", "Lattice control plane not ready", "has answered without reporting ready since"},
+		{"http 302", "Lattice control plane not ready", "has answered without reporting ready since"},
+	} {
+		s := newScenario(t)
+		s.run(8, CheckResult{Detail: tc.detail, NetworkUp: true})
+		s.wantPushes(PushDown)
+		p := s.pushes[0]
+		if p.Title != tc.title || !strings.Contains(p.Body, tc.body) || !strings.Contains(p.Body, "last: "+tc.detail) {
+			t.Errorf("%s: push = %+v", tc.detail, p)
+		}
+	}
 }
 
 func TestNetworkDownWhileAlertedHoldsTheAlertWithoutPushing(t *testing.T) {
