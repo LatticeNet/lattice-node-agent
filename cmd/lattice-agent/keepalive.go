@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/LatticeNet/lattice-node-agent/internal/witness"
 )
 
 // Keepalive: the heartbeat runs on its own goroutine and carries the work
@@ -265,9 +267,12 @@ type heartbeat struct {
 	// monitorStats reports the monitor result queue for loop health; nil
 	// leaves the fields out.
 	monitorStats func() (queued int, dropped uint64)
-	timeout      time.Duration
-	post         func(ctx context.Context, cfg agentConfig, payload map[string]any) error
-	startOnce    sync.Once
+	// witnessStatus returns the witness status file to relay, or nil when
+	// this node runs no witness.
+	witnessStatus func() *witness.State
+	timeout       time.Duration
+	post          func(ctx context.Context, cfg agentConfig, payload map[string]any) error
+	startOnce     sync.Once
 }
 
 func newHeartbeat(cfg agentConfig, health *loopHealth) *heartbeat {
@@ -275,6 +280,9 @@ func newHeartbeat(cfg agentConfig, health *loopHealth) *heartbeat {
 		cfg:     cfg,
 		health:  health,
 		timeout: heartbeatTimeout,
+		witnessStatus: func() *witness.State {
+			return readWitnessStatus(witnessStatusPath())
+		},
 		post: func(ctx context.Context, cfg agentConfig, payload map[string]any) error {
 			return postAgentJSONContext(ctx, cfg, "/api/agent/metrics", payload, nil)
 		},
@@ -308,6 +316,11 @@ func (b *heartbeat) once(ctx context.Context) error {
 		lh.MonitorResultsQueued, lh.MonitorResultsDropped = b.monitorStats()
 	}
 	payload["loop_health"] = lh
+	if b.witnessStatus != nil {
+		if ws := b.witnessStatus(); ws != nil {
+			payload["witness"] = ws
+		}
+	}
 	beatCtx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 	return b.post(beatCtx, cfg, payload)

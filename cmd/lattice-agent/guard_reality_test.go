@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
+	"github.com/LatticeNet/lattice-node-agent/internal/witness"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -65,7 +66,7 @@ func TestWriteGuardManagedSHAOnlyOutputsCanonicalHashOnSuccess(t *testing.T) {
 
 func TestReportedCapabilitiesAdvertiseGuardManagedSHA(t *testing.T) {
 	got := reportedCapabilities()
-	if !reflect.DeepEqual(got, []string{durableTaskResultCapability, guardManagedSHACapability}) {
+	if !reflect.DeepEqual(got, []string{durableTaskResultCapability, guardManagedSHACapability, witness.Capability}) {
 		t.Fatalf("reported capabilities = %#v", got)
 	}
 }
