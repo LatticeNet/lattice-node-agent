@@ -513,10 +513,15 @@ of them proves the node's own network. Then:
 - The control plane keeps failing with the network up for the hold window
   (3 minutes and at least two checks by default): one push, at the configured
   Bark level (`critical` by default), naming the node, the host, when the
-  failures began and the last classified reason.
+  failures began and the last classified reason. It is titled "not ready"
+  when the last check got an HTTP answer other than 200 (a 503 from
+  `/readyz` when its store or audit check fails, or a status from a proxy in
+  front of the server), and "unreachable" when nothing answered.
 - The control plane and every reference fail together: the node's own network
-  is down, the check neither counts toward the hold nor ends the run, and
-  nothing is pushed.
+  is down, the check is not counted as a failure, does not end the run, and
+  nothing is pushed. The hold keeps running on the clock from the run's first
+  failure; the first failed check after the network returns only confirms,
+  and the next one may push.
 - The control plane answers again without a break for the recovery window
   (1 minute and at least two checks): one recovery push at level `active`. A
   control plane that flaps during recovery sends nothing more; one that
@@ -532,7 +537,17 @@ intervals) starts counting again. The main agent attaches that file to its
 heartbeat as `witness`, re-encoded from its typed form, so the console can
 show the last check and the last push; it reads the file and nothing else and
 never starts, stops or configures the witness. `LATTICE_WITNESS_STATUS_FILE`
-moves where it looks.
+moves where it looks. The relay adds `relayed_at`, this node's clock when the
+agent read the file. A witness whose service stopped or wedged leaves its
+last status on disk and the agent keeps relaying it, so the server compares
+`relayed_at` with the last check, on the same clock, against the interval and
+shows such a witness as stopped rather than watching.
+
+The witness has no mute and no quiet hours. Once it is applied, any stop of
+the control plane longer than the hold (a server switch, the stop for a
+backup) pages at the configured level. Before a planned stop, either expect
+that page or first apply a witness plan with a hold longer than the stop;
+only a remove plan silences the witness.
 
 `lattice-agent -witness <config> -witness-check` validates the config and the
 key file and prints a summary with the config's SHA-256, never the key. The
