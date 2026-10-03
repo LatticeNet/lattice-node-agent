@@ -134,6 +134,31 @@ do
   fi
 done
 
+# Keepalive supervision: the drop-in is written only for a binary that
+# advertises sd-notify-v1, it grants a notify socket without turning the unit
+# into Type=notify (an older binary installed later must not be killed for
+# never sending READY=1), and openrc gets a supervisor that restarts a crash.
+for expected in \
+  "-compat-json 2>/dev/null | grep -Fq '\"sd-notify-v1\"'" \
+  'keepalive_dropin="$keepalive_dropin_dir/10-lattice-keepalive.conf"' \
+  'NotifyAccess=main' \
+  'RuntimeDirectory=$service_name' \
+  'rm -f "$keepalive_dropin"' \
+  'supervisor=supervise-daemon' \
+  'respawn_max=0'
+do
+  if ! grep -Fq -- "$expected" "$ROOT/scripts/install.sh"; then
+    echo "installer keepalive contract missing: $expected" >&2
+    exit 1
+  fi
+done
+for forbidden in 'Type=notify' 'WatchdogSec='; do
+  if grep -Fq -- "$forbidden" "$ROOT/scripts/install.sh"; then
+    echo "installer must not write $forbidden: an older binary under it is killed at start or by the watchdog" >&2
+    exit 1
+  fi
+done
+
 UNSAFE_LOG="$TMP/unsafe-outbox.log"
 if PATH="$FAKEBIN:/usr/bin:/bin" \
   LATTICE_HOME="$HOME_DIR" \

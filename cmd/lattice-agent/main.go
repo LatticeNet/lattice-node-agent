@@ -44,7 +44,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.9-alpha.9"
+var version = "0.3.10-alpha.1"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -53,6 +53,10 @@ type agentCompatibility struct {
 	ServerMin    string `json:"server_min"`
 	DashboardMin string `json:"dashboard_min"`
 	Channel      string `json:"channel"`
+	// Features lists node-side supervision contracts this binary keeps. An
+	// installer or agent update reads it from -compat-json before writing a
+	// unit drop-in that only works with a binary that keeps the contract.
+	Features []string `json:"features,omitempty"`
 }
 
 func compatibilityPayload() agentCompatibility {
@@ -60,6 +64,7 @@ func compatibilityPayload() agentCompatibility {
 		ServerMin:    compatServerMin,
 		DashboardMin: compatDashboardMin,
 		Channel:      compatChannel,
+		Features:     []string{sdNotifyCapability, healthMarkerCapability},
 	}
 }
 
@@ -395,14 +400,28 @@ func main() {
 	} else {
 		cfg.LinechainReady = true
 	}
-	for {
-		if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err == nil {
-			break
-		} else {
-			log.Printf("linechain recovery blocked readiness: %v", err)
-			time.Sleep(cfg.Interval)
-		}
+	// Local state is open: tell systemd the agent has started. That needs a
+	// unit that grants a notify socket; without one it does nothing.
+	health := newLoopHealth(nil)
+	if err := sdNotify("READY=1"); err == nil {
+		log.Printf("lattice-agent notified systemd: ready")
 	}
+	// The heartbeat normally starts right after hello, as the first metrics
+	// report always has. When durable recovery blocks startup it starts
+	// before hello instead, so the node reads "online, recovery blocked" with
+	// the reason rather than "offline". IPs are resolved first so that early
+	// beat does not report empty addresses. The watchdog, which judges local
+	// progress only, is armed once recovery has finished.
+	refreshIPs(&cfg)
+	beat := newHeartbeat(cfg, health)
+	recoverThenSupervise(health, beat, func() error {
+		return requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID)
+	}, func() { time.Sleep(cfg.Interval) }, func() {
+		if wd := armWatchdog(sdNotify); wd > 0 {
+			log.Printf("lattice-agent watchdog armed: timeout=%s stall_bound=%s", wd, loopStallBound(cfg.Interval))
+			go runWatchdog(context.Background(), health, wd, loopStallBound(cfg.Interval), sdNotify)
+		}
+	})
 	agentBinary, err := os.Executable()
 	if err != nil {
 		log.Fatalf("resolve lattice-agent executable failed: %v", err)
@@ -422,27 +441,34 @@ func main() {
 		log.Printf("warning: allowlisted interpreters not found on PATH: %s (tasks using them will fail until installed)", strings.Join(missing, ", "))
 	}
 	refreshIPs(&cfg)
-	if err := postAgentJSON(cfg, "/api/agent/hello", map[string]any{
-		"version":              version,
-		"compatibility":        compatibilityPayload(),
-		"capabilities":         capabilitiesFor(cfg.LinechainReady),
-		"public_ip":            cfg.PublicIP,
-		"public_ipv6":          cfg.PublicIPv6,
-		"internal_ip":          cfg.InternalIP,
-		"internal_ipv6":        cfg.InternalIPv6,
-		"wireguard_ip":         cfg.WireGuardIP,
-		"wireguard_public_key": cfg.WGPublicKey,
-		"wireguard_endpoint":   cfg.WGEndpoint,
-		"wireguard_port":       cfg.WGPort,
-		"host_facts":           hostfacts.Collect(),
-	}, nil); err != nil {
+	beat.setConfig(cfg)
+	if err := health.run(stepHello, func() error {
+		return postAgentJSON(cfg, "/api/agent/hello", map[string]any{
+			"version":              version,
+			"compatibility":        compatibilityPayload(),
+			"capabilities":         capabilitiesFor(cfg.LinechainReady),
+			"public_ip":            cfg.PublicIP,
+			"public_ipv6":          cfg.PublicIPv6,
+			"internal_ip":          cfg.InternalIP,
+			"internal_ipv6":        cfg.InternalIPv6,
+			"wireguard_ip":         cfg.WireGuardIP,
+			"wireguard_public_key": cfg.WGPublicKey,
+			"wireguard_endpoint":   cfg.WGEndpoint,
+			"wireguard_port":       cfg.WGPort,
+			"host_facts":           hostfacts.Collect(),
+		}, nil)
+	}); err != nil {
 		log.Fatalf("hello failed: %v", err)
+	}
+	if err := writeHealthMarker(version); err != nil {
+		log.Printf("warning: health marker not written, an update guard will restore the previous binary: %v", err)
 	}
 	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 		debugf(cfg, "agent config fetch failed: %v", err)
 	} else {
 		applyAgentConfig(&cfg, agentCfg)
 	}
+	beat.setConfig(cfg)
 	log.Printf("lattice-agent connected node=%s server=%s report_guard_reality=%v allow_exec=%v allow_root_exec=%v task_cgroup=%v task_work_root=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.ReportGuardReality, cfg.AllowExec, cfg.AllowRoot, cfg.taskCgroupConfig().Root != "", strings.TrimSpace(cfg.TaskWorkRoot) != "", cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
 	if cfg.SSHAlerts {
 		go watchSSHLogins(context.Background(), cfg)
@@ -467,7 +493,15 @@ func main() {
 	// host the node cannot reach, for its whole timeout) never stops the node
 	// from reporting; the loop below only hands leases over and keeps going.
 	worker := newTaskWorker(runner, taskResults, linechainManager)
+	worker.health = health
 	monitors := newMonitorManager(cfg)
+	monitorFlushCtx, stopMonitorFlush := context.WithCancel(context.Background())
+	defer stopMonitorFlush()
+	go monitors.flushLoop(monitorFlushCtx)
+	beat.monitorStats = monitors.results.stats
+	// The heartbeat beats on its own from here on, so the work loop below no
+	// longer carries it.
+	beat.start(context.Background())
 	logTailers := newLogTailManager(cfg)
 	statsDiscovery := newSingBoxStatsDiscovery()
 	ticker := time.NewTicker(cfg.Interval)
@@ -480,6 +514,7 @@ func main() {
 	defer stop()
 	// wait blocks until the next tick; false means shutdown was requested.
 	wait := func() bool {
+		health.waiting()
 		select {
 		case <-ctx.Done():
 			return false
@@ -488,65 +523,111 @@ func main() {
 		}
 	}
 	for {
+		health.cycleStart()
 		// Recovery reads and rewrites the same journals the running task owns,
 		// so it only runs while no task is in flight; the worker's own poll
 		// repeats this check before it leases anything.
 		if worker.idle() {
-			if err := requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID); err != nil {
+			if err := health.run(stepLinechainRecovery, func() error {
+				return requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID)
+			}); err != nil {
+				// The heartbeat keeps beating and carries this reason.
+				health.setLinechainBlocked(err)
 				log.Printf("linechain recovery blocked cycle: %v", err)
 				if !wait() {
 					break
 				}
 				continue
 			}
+			health.clearLinechainBlocked()
 		}
-		if agentCfg, err := fetchAgentConfig(cfg); err != nil {
-			debugf(cfg, "agent config fetch failed: %v", err)
-		} else {
+		_ = health.run(stepConfig, func() error {
+			agentCfg, err := fetchAgentConfig(cfg)
+			if err != nil {
+				debugf(cfg, "agent config fetch failed: %v", err)
+				return err
+			}
 			applyAgentConfig(&cfg, agentCfg)
 			monitors.setConfig(cfg)
 			logTailers.setConfig(cfg)
-		}
-		refreshIPs(&cfg)
-		if err := reportMetrics(cfg); err != nil {
-			log.Printf("metrics error: %v", err)
-		}
+			return nil
+		})
+		_ = health.run(stepIPRefresh, func() error {
+			refreshIPs(&cfg)
+			return nil
+		})
+		beat.setConfig(cfg)
 		statsDiscovery.refresh(&cfg)
-		if err := reportProxyUsage(cfg); err != nil {
-			log.Printf("proxy usage error: %v", err)
-		}
-		if err := reportSingBoxInventory(cfg); err != nil {
-			log.Printf("singbox discover error: %v", err)
-		}
-		if err := worker.poll(cfg); err != nil {
-			log.Printf("task poll error: %v", err)
-		}
-		if assigned, err := fetchMonitors(cfg); err != nil {
-			log.Printf("monitor poll error: %v", err)
-		} else {
+		_ = health.run(stepUsage, func() error {
+			err := reportProxyUsage(cfg)
+			if err != nil {
+				log.Printf("proxy usage error: %v", err)
+			}
+			return err
+		})
+		_ = health.run(stepInventory, func() error {
+			err := reportSingBoxInventory(cfg)
+			if err != nil {
+				log.Printf("singbox discover error: %v", err)
+			}
+			return err
+		})
+		_ = health.run(stepTasks, func() error {
+			err := worker.poll(cfg)
+			if err != nil {
+				log.Printf("task poll error: %v", err)
+			}
+			return err
+		})
+		_ = health.run(stepMonitors, func() error {
+			assigned, err := fetchMonitors(cfg)
+			if err != nil {
+				log.Printf("monitor poll error: %v", err)
+				return err
+			}
 			monitors.reconcile(assigned)
-		}
-		if sources, err := fetchLogSources(cfg); err != nil {
-			log.Printf("log source poll error: %v", err)
-		} else {
+			return nil
+		})
+		_ = health.run(stepLogSources, func() error {
+			sources, err := fetchLogSources(cfg)
+			if err != nil {
+				log.Printf("log source poll error: %v", err)
+				return err
+			}
 			logTailers.reconcile(sources)
-		}
-		traceCollector.reconcile(context.Background(), cfg)
+			return nil
+		})
+		_ = health.run(stepTrace, func() error {
+			traceCollector.reconcile(context.Background(), cfg)
+			return nil
+		})
 		debugf(cfg, "poll cycle complete")
-		if err := flushDebugEvents(cfg); err != nil {
-			log.Printf("debug event report error: %v", err)
-		}
-		reportCtx, cancelReport := context.WithTimeout(context.Background(), guardRealityReportTimeout)
-		if err := reportGuardReality(reportCtx, cfg, guardreality.Collect); err != nil {
-			log.Printf("guard reality error: %v", err)
-		}
-		cancelReport()
+		_ = health.run(stepDebug, func() error {
+			err := flushDebugEvents(cfg)
+			if err != nil {
+				log.Printf("debug event report error: %v", err)
+			}
+			return err
+		})
+		_ = health.run(stepGuardReality, func() error {
+			reportCtx, cancelReport := context.WithTimeout(context.Background(), guardRealityReportTimeout)
+			defer cancelReport()
+			err := reportGuardReality(reportCtx, cfg, guardreality.Collect)
+			if err != nil {
+				log.Printf("guard reality error: %v", err)
+			}
+			return err
+		})
+		health.cycleEnd()
 		if !wait() {
 			break
 		}
 	}
 	log.Printf("lattice-agent stopping: shutdown signal received")
+	_ = sdNotify("STOPPING=1")
 	worker.shutdown(taskShutdownGrace, taskShutdownReportGrace)
+	stopMonitorFlush()
+	monitors.drain(monitorResultShutdownGrace)
 }
 
 var guardManagedSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -570,6 +651,8 @@ type monitorManager struct {
 	cfg    agentConfig
 	mu     sync.Mutex
 	active map[string]monitorEntry
+	// results buffers probe outcomes until flushLoop sends them.
+	results *monitorResultQueue
 }
 
 type monitorEntry struct {
@@ -578,7 +661,7 @@ type monitorEntry struct {
 }
 
 func newMonitorManager(cfg agentConfig) *monitorManager {
-	return &monitorManager{cfg: cfg, active: map[string]monitorEntry{}}
+	return &monitorManager{cfg: cfg, active: map[string]monitorEntry{}, results: newMonitorResultQueue()}
 }
 
 func (mm *monitorManager) setConfig(cfg agentConfig) {
@@ -621,7 +704,7 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 	if interval < time.Second {
 		interval = 30 * time.Second
 	}
-	probeAndReport(mm.snapshotConfig(), m)
+	mm.probe(m)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -629,7 +712,7 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			probeAndReport(mm.snapshotConfig(), m)
+			mm.probe(m)
 		}
 	}
 }
@@ -639,16 +722,14 @@ func monitorChanged(a, b model.Monitor) bool {
 		a.IntervalSec != b.IntervalSec || a.TimeoutSec != b.TimeoutSec
 }
 
-func probeAndReport(cfg agentConfig, m model.Monitor) {
+// probe runs one probe and queues its result; flushLoop sends it, in a batch
+// when the server has the batch route.
+func (mm *monitorManager) probe(m model.Monitor) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSec+2)*time.Second)
 	defer cancel()
 	res := prober.Probe(ctx, m)
-	debugf(cfg, "monitor probe complete: monitor=%s success=%v latency_ms=%.1f error=%t", m.ID, res.Success, res.LatencyMs, res.Error != "")
-	if err := postAgentJSON(cfg, "/api/agent/monitor-result", map[string]any{
-		"result": res,
-	}, nil); err != nil {
-		log.Printf("monitor %s report error: %v", m.ID, err)
-	}
+	debugf(mm.snapshotConfig(), "monitor probe complete: monitor=%s success=%v latency_ms=%.1f error=%t", m.ID, res.Success, res.LatencyMs, res.Error != "")
+	mm.results.push(res)
 }
 
 func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
@@ -788,11 +869,17 @@ func (cfg agentConfig) taskSandboxOptions() taskexec.SandboxOptions {
 }
 
 func reportMetrics(cfg agentConfig) error {
+	return postAgentJSON(cfg, "/api/agent/metrics", metricsPayload(cfg), nil)
+}
+
+// metricsPayload builds one heartbeat body; the heartbeat goroutine adds
+// loop_health to it.
+func metricsPayload(cfg agentConfig) map[string]any {
 	m := metrics.Collect()
 	facts := hostfacts.Collect()
 	sandbox := taskexec.SandboxProfileWithOptions(cfg.AllowExec, cfg.AllowRoot, os.Geteuid(), cfg.taskSandboxOptions())
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
-	return postAgentJSON(cfg, "/api/agent/metrics", map[string]any{
+	return map[string]any{
 		"version":       version,
 		"compatibility": compatibilityPayload(),
 		"capabilities":  capabilitiesFor(cfg.LinechainReady),
@@ -823,7 +910,7 @@ func reportMetrics(cfg agentConfig) error {
 		"wireguard_ip":  cfg.WireGuardIP,
 		"metrics":       m,
 		"host_facts":    facts,
-	}, nil)
+	}
 }
 
 type guardRealityCollector func(context.Context, guardreality.Source, string) (model.GuardNodeReality, error)
@@ -1555,6 +1642,9 @@ type taskWorker struct {
 	runner  taskRunner
 	outbox  taskResultOutbox
 	manager *linechain.Manager
+	// health, when set before the first poll, records how long a batch has
+	// been in flight for the heartbeat's loop health.
+	health *loopHealth
 
 	mu   sync.Mutex
 	busy bool
@@ -1599,8 +1689,11 @@ func (w *taskWorker) run() {
 
 func (w *taskWorker) setBusy(busy bool) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.busy = busy
+	w.mu.Unlock()
+	if w.health != nil {
+		w.health.setTaskBusy(busy)
+	}
 }
 
 // idle reports whether no batch is in flight. Only the poll goroutine moves
