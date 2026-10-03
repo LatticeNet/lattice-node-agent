@@ -5,7 +5,38 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## 0.3.10-alpha.1 (unreleased)
+## 0.3.10-alpha.2 (unreleased)
+
+Prerelease. Changes since v0.3.10-alpha.1.
+
+Control-plane witness:
+
+- `lattice-agent -witness <config>` runs the control-plane witness as its own
+  process (`lattice-witness.service`, written by an approved server plan). It
+  polls the control plane's public `/readyz` every interval; after the hold
+  window of failures with the node's own network up (any HTTP answer from a
+  reference URL) it pushes one message through the bark-server on the node's
+  loopback interface, and one recovery once the control plane has answered
+  without a break for the recovery window. When the control plane and every
+  reference fail together it pushes nothing. Its state survives restarts, so
+  a restart in the middle of an outage neither pushes twice nor drops the
+  recovery. Standard library only; no node token, no fleet data.
+- The Bark device key is read from a root-only file the config names; a file
+  readable by group or others, owned by another user, or not shaped like a
+  Bark key is refused at start. `-witness-check` validates config and key and
+  prints a summary without the key.
+- The heartbeat relays the witness status file
+  (`/var/lib/lattice-witness/status.json`) as `witness`, so the console can
+  show the last check and the last push. Older servers ignore the field.
+- Hello capabilities and `-compat-json` features list
+  `control-plane-witness-v1`, on every beat whether or not linechain recovery
+  is ready.
+
+Compatibility: no new server or dashboard floor. The witness plan needs a
+server that knows the `controlplane-witness` plan kind
+(lattice-server `feat/witness-plan-and-fallback-channel`).
+
+## 0.3.10-alpha.1 (2026-10-03)
 
 Prerelease. Changes since v0.3.9, the current stable release.
 
