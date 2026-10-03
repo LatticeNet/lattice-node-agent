@@ -59,11 +59,11 @@ func TestHeartbeatRelaysTheWitnessStatusFile(t *testing.T) {
 	if err := beat.once(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := payloads[2]["witness"].(*witness.State)
+	got, ok := payloads[2]["witness"].(*witnessRelay)
 	if !ok || got == nil {
 		t.Fatalf("witness field = %#v", payloads[2]["witness"])
 	}
-	if got.Phase != witness.PhaseWatching || !got.LastCheckAt.Equal(checked) || got.ConfigSHA256 != "abc" {
+	if got.Phase != witness.PhaseWatching || !got.LastCheckAt.Equal(checked) || got.ConfigSHA256 != "abc" || got.RelayedAt.IsZero() {
 		t.Fatalf("relayed status = %+v", got)
 	}
 	wire, _ := json.Marshal(payloads[2])
@@ -74,13 +74,42 @@ func TestHeartbeatRelaysTheWitnessStatusFile(t *testing.T) {
 	}
 }
 
+// A witness whose service stopped leaves its last status behind, and the
+// agent goes on relaying it. The relay stamps this node's clock beside the
+// file's own times, so the server can see the last check is an hour old even
+// though the relay itself is fresh.
+func TestWitnessRelayStampsTheNodeClockBesideAnOldStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	checked := time.Date(2026, 10, 3, 3, 0, 0, 0, time.UTC)
+	st := witness.State{
+		Version: witness.StateVersion, Phase: witness.PhaseWatching, IntervalSeconds: 30,
+		StartedAt: checked.Add(-time.Hour), LastCheckAt: checked, LastCheckOK: true,
+	}
+	if err := witness.SaveState(path, st); err != nil {
+		t.Fatal(err)
+	}
+	now := checked.Add(time.Hour).In(time.FixedZone("node", 9*3600))
+	got := readWitnessStatus(path, now)
+	if got == nil {
+		t.Fatal("status not relayed")
+	}
+	var wire map[string]any
+	raw, _ := json.Marshal(got)
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["relayed_at"] != "2026-10-03T04:00:00Z" || wire["last_check_at"] != "2026-10-03T03:00:00Z" || wire["phase"] != witness.PhaseWatching {
+		t.Fatalf("relayed document = %s", raw)
+	}
+}
+
 func TestWitnessStatusRelayRefusesAnOversizedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status.json")
 	big := `{"version":1,"phase":"watching","last_check_detail":"` + strings.Repeat("x", maxWitnessStatusBytes) + `"}`
 	if err := os.WriteFile(path, []byte(big), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if st := readWitnessStatus(path); st != nil {
+	if st := readWitnessStatus(path, time.Now()); st != nil {
 		t.Fatalf("oversized status relayed: phase %q", st.Phase)
 	}
 }

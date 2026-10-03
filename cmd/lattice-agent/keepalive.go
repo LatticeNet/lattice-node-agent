@@ -6,8 +6,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/LatticeNet/lattice-node-agent/internal/witness"
 )
 
 // Keepalive: the heartbeat runs on its own goroutine and carries the work
@@ -269,7 +267,7 @@ type heartbeat struct {
 	monitorStats func() (queued int, dropped uint64)
 	// witnessStatus returns the witness status file to relay, or nil when
 	// this node runs no witness.
-	witnessStatus func() *witness.State
+	witnessStatus func() *witnessRelay
 	timeout       time.Duration
 	post          func(ctx context.Context, cfg agentConfig, payload map[string]any) error
 	startOnce     sync.Once
@@ -280,8 +278,8 @@ func newHeartbeat(cfg agentConfig, health *loopHealth) *heartbeat {
 		cfg:     cfg,
 		health:  health,
 		timeout: heartbeatTimeout,
-		witnessStatus: func() *witness.State {
-			return readWitnessStatus(witnessStatusPath())
+		witnessStatus: func() *witnessRelay {
+			return readWitnessStatus(witnessStatusPath(), time.Now())
 		},
 		post: func(ctx context.Context, cfg agentConfig, payload map[string]any) error {
 			return postAgentJSONContext(ctx, cfg, "/api/agent/metrics", payload, nil)

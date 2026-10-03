@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/witness"
 )
@@ -71,10 +72,22 @@ func witnessStatusPath() string {
 // maxWitnessStatusBytes bounds the status read on every heartbeat.
 const maxWitnessStatusBytes = 16 << 10
 
+// witnessRelay is the witness status as the heartbeat carries it: the status
+// file re-encoded from its typed form, plus this node's clock at the moment
+// the agent read it. A witness whose service stopped or wedged leaves its last
+// status on disk, and the agent keeps relaying that file, so a fresh relay
+// alone proves nothing about the witness. The witness and the agent share
+// this clock, so relayed_at minus last_check_at is how old the last check
+// really is, whatever the node's clock says against the server's.
+type witnessRelay struct {
+	witness.State
+	RelayedAt time.Time `json:"relayed_at"`
+}
+
 // readWitnessStatus returns the witness status for the heartbeat, or nil
 // when this node runs no witness. The document is re-encoded from its typed
 // form, so only the fields the witness defines leave the node.
-func readWitnessStatus(path string) *witness.State {
+func readWitnessStatus(path string, now time.Time) *witnessRelay {
 	raw, err := witness.ReadBounded(path, maxWitnessStatusBytes)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -87,7 +100,7 @@ func readWitnessStatus(path string) *witness.State {
 		debugOnce("witness status is not a witness state document")
 		return nil
 	}
-	return &st
+	return &witnessRelay{State: st, RelayedAt: now.UTC()}
 }
 
 // debugOnce logs a relay problem once per distinct message, so a broken file
