@@ -9,46 +9,21 @@ match it.
 
 Prerelease. Changes since v0.3.10-alpha.1.
 
-Control-plane witness:
+- With `-singbox-discover`, the agent asks the node's `sb` script what it can
+  do (`sb --json caps`) at startup and at most every 10 minutes, with a 5 s
+  timeout, and reports each capability as `sb:<cap>` in the hello and the
+  heartbeat. Only the names script v1.24.3-alpha.8 lists pass
+  (`user-del-by-name`, `user-park`, `user-parked-list`,
+  `user-open-proxy-guard`, `user-match-counts`, `user-socks-add`,
+  `user-lock`). An older script, a failure, a timeout or unexpected output
+  reports none and leaves the heartbeat unchanged. lattice-server uses
+  `sb:user-del-by-name` to remove a deleted VPN user from an adopted line by
+  name.
+- A timed-out `sb` call no longer waits for a child process that still holds
+  its output: the runner gives up one second after the deadline. This also
+  covers `sb --json list`.
 
-- `lattice-agent -witness <config>` runs the control-plane witness as its own
-  process (`lattice-witness.service`, written by an approved server plan). It
-  polls the control plane's public `/readyz` every interval; after the hold
-  window of failures with the node's own network up (any HTTP answer from a
-  reference URL) it pushes one message through the bark-server on the node's
-  loopback interface, and one recovery once the control plane has answered
-  without a break for the recovery window. When the control plane and every
-  reference fail together it pushes nothing. Its state survives restarts, so
-  a restart in the middle of an outage neither pushes twice nor drops the
-  recovery. Standard library only; no node token, no fleet data.
-- The Bark device key is read from a root-only file the config names; a file
-  readable by group or others, owned by another user, or not shaped like a
-  Bark key is refused at start. `-witness-check` validates config and key and
-  prints a summary without the key.
-- The heartbeat relays the witness status file
-  (`/var/lib/lattice-witness/status.json`) as `witness`, so the console can
-  show the last check and the last push. Older servers ignore the field.
-- Hello capabilities and `-compat-json` features list
-  `control-plane-witness-v1`, on every beat whether or not linechain recovery
-  is ready.
-
-sb script capabilities (merged into integration after alpha.1, 6812194 and
-4d11bfe):
-
-- With `-singbox-discover` the agent runs `sb --json caps` at startup and at
-  most every 10 minutes (5 s timeout) and appends each reported cap as
-  `sb:<cap>` to the hello and metrics capabilities. Only the seven names the
-  lr00rl/sing-box v1.24.3-alpha.8 script reports pass an allowlist; an
-  alpha.7 or older script, a timeout, or malformed output means no sb caps.
-- A bounded sb call (`sb --json list` and `sb --json caps`) returns one
-  second after its deadline even when a child the script started still holds
-  its output pipe, so such a child can no longer hold hello or the work loop.
-
-Compatibility: no new server or dashboard floor. The witness plan needs a
-server that knows the `controlplane-witness` plan kind
-(lattice-server `feat/witness-plan-and-fallback-channel`).
-
-## 0.3.10-alpha.1 (2026-10-03)
+## 0.3.10-alpha.1 (2026-10-02)
 
 Prerelease. Changes since v0.3.9, the current stable release.
 

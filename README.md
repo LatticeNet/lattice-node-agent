@@ -309,6 +309,16 @@ keys or invent credential-bearing share URLs from raw config files. Nodes that
 run with `-allow-exec=false` should use this discovery path instead of dashboard
 manual probe tasks.
 
+With discovery on, the agent also runs `sb --json caps` at startup and then at
+most every 10 minutes (5 s timeout), and adds what the script can do to the
+capabilities in its hello and heartbeat as `sb:<cap>`, for example
+`sb:user-del-by-name`. The server uses these to pick a code path per node, such
+as removing a deleted user from an adopted line by name. Only names from a fixed
+allowlist pass (the seven `lr00rl/sing-box` v1.24.3-alpha.8 lists), so a script
+cannot add arbitrary strings. A script without the verb (alpha.7 and older), a
+non-zero exit, a timeout, or output that is not the expected JSON means no `sb:`
+capabilities; the agent writes one debug line and the heartbeat is unchanged.
+
 Dashboard manual probe is different from continuous discovery: it queues a
 bounded task and asks the on-box `sb --json list/provision` interface first,
 then falls back to parsing the running sing-box config set. Older management
