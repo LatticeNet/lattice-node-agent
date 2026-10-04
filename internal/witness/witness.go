@@ -98,14 +98,26 @@ func (w *Witness) clock() time.Time { return w.now().UTC() }
 // State returns a copy of the current state.
 func (w *Witness) State() State { return w.state }
 
-// Tick runs one check, sends any push it owes, and saves the state.
+// Tick runs one check, sends any push it owes, and saves the state. A check
+// or a push cut short because ctx ended (the witness is stopping) is not
+// recorded: the probes fail when their context is cancelled, which would read
+// as this node's network going down, and a cancelled push would read as one
+// the bark-server refused.
 func (w *Witness) Tick(ctx context.Context) {
 	res := w.check(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 	now, mono := w.clock(), w.mono()
 	step, gap := sinceLastCheck(w.state.LastCheckAt, now, mono-w.lastMono, w.checked, w.cfg.maxGap())
 	w.lastMono, w.checked = mono, true
 	if p := w.state.observe(w.cfg, now, step, gap, res); p != nil {
 		kind := w.pusher.Push(ctx, w.cfg, *p)
+		if ctx.Err() != nil {
+			// Whether the push arrived is unknown. The check itself stands;
+			// the push is owed again at the first check after the restart.
+			return
+		}
 		w.state.pushed(p, w.clock(), kind)
 		switch {
 		case kind == "":

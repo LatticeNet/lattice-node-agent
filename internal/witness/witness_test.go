@@ -30,21 +30,43 @@ type scenario struct {
 	pushes []Push
 	// pushFail, when set, is the failure kind every push returns.
 	pushFail string
+	// onHealth and onPush, when set, run inside the probe and the push, so a
+	// test can stop the witness in the middle of either.
+	onHealth func()
+	onPush   func()
 	saved    State
+	saves    int
 	w        *Witness
 }
 
 type fakeProber struct{ s *scenario }
 
-func (f fakeProber) Health(context.Context, string) (bool, string) {
+func (f fakeProber) Health(ctx context.Context, _ string) (bool, string) {
+	if f.s.onHealth != nil {
+		f.s.onHealth()
+		if ctx.Err() != nil {
+			return false, "timeout"
+		}
+	}
 	return f.s.next.OK, f.s.next.Detail
 }
 
-func (f fakeProber) Reachable(context.Context, []string) bool { return f.s.next.NetworkUp }
+func (f fakeProber) Reachable(ctx context.Context, _ []string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	return f.s.next.NetworkUp
+}
 
 type fakePusher struct{ s *scenario }
 
-func (f fakePusher) Push(_ context.Context, _ Config, p Push) string {
+func (f fakePusher) Push(ctx context.Context, _ Config, p Push) string {
+	if f.s.onPush != nil {
+		f.s.onPush()
+		if ctx.Err() != nil {
+			return "timeout"
+		}
+	}
 	if f.s.pushFail != "" {
 		return f.s.pushFail
 	}
@@ -78,6 +100,7 @@ func newScenario(t *testing.T) *scenario {
 func (s *scenario) start() {
 	s.w = New(s.cfg, s.sha, s.saved, fakeProber{s}, fakePusher{s}, func() time.Time { return s.now }, func(st State) error {
 		s.saved = st
+		s.saves++
 		return nil
 	})
 	s.w.mono = func() time.Duration { return s.mono }
@@ -445,6 +468,59 @@ func TestRecoveryBeforeAnUndeliveredAlertSendsNothing(t *testing.T) {
 	if s.saved.Alerted {
 		t.Fatal("an alert that was never delivered was recorded")
 	}
+}
+
+// SIGTERM in the middle of a check cancels the probes, which then fail. That
+// failure says nothing about the control plane or this node's network and
+// must not be recorded.
+func TestStopDuringACheckRecordsNothing(t *testing.T) {
+	s := newScenario(t)
+	s.run(3, cpUp)
+	before, saves := s.saved, s.saves
+	ctx, cancel := context.WithCancel(context.Background())
+	s.onHealth = cancel
+	s.now = s.now.Add(s.cfg.Interval())
+	s.mono += s.cfg.Interval()
+	s.next = cpUp
+	s.w.Tick(ctx)
+	if s.saves != saves {
+		t.Fatal("a cancelled check was saved")
+	}
+	if st := s.w.State(); st.Phase != PhaseWatching || !st.LastCheckAt.Equal(before.LastCheckAt) || !st.NetworkDownSince.IsZero() {
+		t.Fatalf("state after a cancelled check = %+v", st)
+	}
+	// Run stops the same way and saves what it had.
+	s.w.Run(ctx)
+	if s.saved.Phase != PhaseWatching || !s.saved.LastCheckAt.Equal(before.LastCheckAt) {
+		t.Fatalf("saved after Run stopped = %+v", s.saved)
+	}
+}
+
+// SIGTERM in the middle of a push cancels it. Whether it arrived is unknown,
+// so it is not stored as a refused push, and it is owed again after the
+// restart.
+func TestStopDuringAPushDoesNotRecordItAsFailed(t *testing.T) {
+	s := newScenario(t)
+	s.run(6, cpDown) // 150 s
+	ctx, cancel := context.WithCancel(context.Background())
+	s.onPush = cancel
+	s.now = s.now.Add(s.cfg.Interval())
+	s.mono += s.cfg.Interval()
+	s.next = cpDown
+	s.w.Run(ctx)
+	s.wantPushes()
+	if s.saved.LastPushKind != "" || s.saved.LastPushError != "" || !s.saved.LastPushAt.IsZero() || s.saved.Alerted {
+		t.Fatalf("a cancelled push was recorded: %+v", s.saved)
+	}
+	if s.saved.ConsecutiveFailures != 7 {
+		t.Fatalf("the check before the push was lost: %+v", s.saved)
+	}
+	s.onPush = nil
+	s.start()
+	s.run(1, cpDown)
+	s.wantPushes(PushDown)
+	s.run(5, cpDown)
+	s.wantPushes(PushDown)
 }
 
 func TestConfigChangeKeepsTheAlertAndRestartsTheRuns(t *testing.T) {
