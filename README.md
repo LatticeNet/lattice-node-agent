@@ -504,7 +504,9 @@ never the agent's private path), one to three reference URLs, and the
 bark-server on the node's own loopback interface. The Bark device key is read
 from a root-only file the config names (mode 0600, owned by the witness's
 user, the shape of a Bark key), at start and at every push; the config holds
-only its path.
+only its path. The config must belong to the witness's user too and must not
+be writable by group or others. Both files are checked on the opened file,
+not the path, so the file checked is the file read.
 
 Every interval (30 s by default) it asks the readiness URL; only HTTP 200
 counts. When that fails it asks the references, and any HTTP answer from one
@@ -512,8 +514,9 @@ of them proves the node's own network. Then:
 
 - The control plane keeps failing with the network up for the hold window
   (3 minutes and at least two checks by default): one push, at the configured
-  Bark level (`critical` by default), naming the node, the host, when the
-  failures began and the last classified reason. It is titled "not ready"
+  Bark level (`critical` by default), naming the node, the host, how long
+  the failures have lasted, the last classified reason, and when the first
+  failure was by the node's own clock. It is titled "not ready"
   when the last check got an HTTP answer other than 200 (a 503 from
   `/readyz` when its store or audit check fails, or a status from a proxy in
   front of the server), and "unreachable" when nothing answered.
@@ -533,7 +536,15 @@ The state file (`/var/lib/lattice-witness/status.json`, 0644, no secret) is
 written atomically after every check. A witness restarted in the middle of an
 outage reads it back, so it neither pushes twice nor forgets the recovery; a
 witness that was itself stopped for longer than the hold window (or three
-intervals) starts counting again. The main agent attaches that file to its
+intervals) starts counting again. While it runs, the hold and the recovery
+window are measured on the monotonic clock, so a step of the node's wall
+clock (NTP correcting drift, a wrong RTC fixed after boot) neither pages
+early nor holds a page back; a wall clock that moved ahead by more than that
+gap while the monotonic clock stood still (the machine was suspended) starts
+the count again too. Across a restart only the saved wall time is left, so a
+saved last check later than the node's clock now starts the count again as
+well. A check or a push cut short because the witness is stopping is not
+recorded: the push is owed again after the restart. The main agent attaches that file to its
 heartbeat as `witness`, re-encoded from its typed form, so the console can
 show the last check and the last push; it reads the file and nothing else and
 never starts, stops or configures the witness. `LATTICE_WITNESS_STATUS_FILE`
