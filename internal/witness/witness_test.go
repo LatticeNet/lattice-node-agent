@@ -17,12 +17,15 @@ import (
 
 // scenario drives a witness with a fake clock, fake checks and a recording
 // pusher, and persists its state the way the real one does, so a "restart"
-// is a new witness built from the saved state.
+// is a new witness built from the saved state. The clock has two readings,
+// as the real one does: now is the wall clock and mono the monotonic one, so
+// a test can step the wall clock alone.
 type scenario struct {
 	t      *testing.T
 	cfg    Config
 	sha    string
 	now    time.Time
+	mono   time.Duration
 	next   CheckResult
 	pushes []Push
 	// pushFail, when set, is the failure kind every push returns.
@@ -77,14 +80,16 @@ func (s *scenario) start() {
 		s.saved = st
 		return nil
 	})
+	s.w.mono = func() time.Duration { return s.mono }
 	s.w.logf = func(string, ...any) {}
 }
 
-// run performs n checks of the given result, one interval apart, starting
-// one interval after the previous check.
+// run performs n checks of the given result, one interval apart on both
+// clocks, starting one interval after the previous check.
 func (s *scenario) run(n int, res CheckResult) {
 	for range n {
 		s.now = s.now.Add(s.cfg.Interval())
+		s.mono += s.cfg.Interval()
 		s.next = res
 		s.w.Tick(context.Background())
 	}
@@ -132,10 +137,14 @@ func TestPushesOnceAfterTheHoldAndNeverAgainWhileDown(t *testing.T) {
 	if p.Level != "critical" || p.Title != "Lattice control plane not ready" {
 		t.Fatalf("down push = %+v", p)
 	}
-	for _, want := range []string{"[cd]-gomami-jpn-pulse-nano", "lattice.example.org", "answered without reporting ready", "http 502", "7 checks", "own network is up"} {
+	for _, want := range []string{"[cd]-gomami-jpn-pulse-nano", "lattice.example.org", "answered without reporting ready for about 3 min", "http 502", "7 checks", "own network is up", "first failed check 2026-10-03 03:03:00 UTC by this node's clock"} {
 		if !strings.Contains(p.Body, want) {
 			t.Fatalf("down body %q lacks %q", p.Body, want)
 		}
+	}
+	// The duration leads; the node's clock comes second, labelled as such.
+	if strings.Index(p.Body, "3 min") > strings.Index(p.Body, "03:03:00") {
+		t.Fatalf("down body %q puts the node's clock before the duration", p.Body)
 	}
 	// An hour more of failures sends nothing more.
 	s.run(120, cpDown)
@@ -159,7 +168,7 @@ func TestPushesOneRecoveryOnceTheControlPlaneKeepsAnswering(t *testing.T) {
 	s.run(2, cpUp)
 	s.wantPushes(PushDown, PushRecovery)
 	r := s.pushes[1]
-	if r.Level != "active" || r.Title != "Lattice control plane ready again" || !strings.Contains(r.Body, "reports ready again") || !strings.Contains(r.Body, "5 min down") {
+	if r.Level != "active" || r.Title != "Lattice control plane ready again" || !strings.Contains(r.Body, "reports ready again after about 5 min down") || !strings.Contains(r.Body, "answering for 1 min") {
 		t.Fatalf("recovery push = %+v", r)
 	}
 	s.run(100, cpUp)
@@ -231,10 +240,10 @@ func TestDownPushNamesUnreachableOrNotReady(t *testing.T) {
 	for _, tc := range []struct {
 		detail, title, body string
 	}{
-		{"connection refused", "Lattice control plane unreachable", "has not answered since"},
-		{"timeout", "Lattice control plane unreachable", "has not answered since"},
-		{"http 503", "Lattice control plane not ready", "has answered without reporting ready since"},
-		{"http 302", "Lattice control plane not ready", "has answered without reporting ready since"},
+		{"connection refused", "Lattice control plane unreachable", "has not answered for about 3 min"},
+		{"timeout", "Lattice control plane unreachable", "has not answered for about 3 min"},
+		{"http 503", "Lattice control plane not ready", "has answered without reporting ready for about 3 min"},
+		{"http 302", "Lattice control plane not ready", "has answered without reporting ready for about 3 min"},
 	} {
 		s := newScenario(t)
 		s.run(8, CheckResult{Detail: tc.detail, NetworkUp: true})
@@ -331,6 +340,84 @@ func TestRestartAfterALongGapWhileAlertedStillPushesTheRecovery(t *testing.T) {
 	s.start()
 	s.run(3, cpUp)
 	s.wantPushes(PushDown, PushRecovery)
+}
+
+// chrony stepping a slow clock forward mid-run must not turn a short failure
+// into a page: the hold is measured on the monotonic clock.
+func TestForwardWallClockStepDoesNotPageEarly(t *testing.T) {
+	stepped := func() *scenario {
+		s := newScenario(t)
+		s.run(3, cpUp)
+		s.run(1, cpDown)
+		// The wall clock jumps 130 s ahead between two checks.
+		s.now = s.now.Add(130 * time.Second)
+		s.run(2, cpDown) // 60 s of failures, 190 s by the wall clock
+		s.wantPushes()
+		if s.saved.FailingFor != time.Minute || s.saved.ConsecutiveFailures != 3 {
+			t.Fatalf("run after the step = %s over %d checks, want 1m0s over 3", s.saved.FailingFor, s.saved.ConsecutiveFailures)
+		}
+		return s
+	}
+	// A blip that ends here sends nothing at all.
+	blip := stepped()
+	blip.run(3, cpUp)
+	blip.wantPushes()
+	// One that keeps failing pages after a full hold, not before.
+	s := stepped()
+	s.run(3, cpDown) // 150 s
+	s.wantPushes()
+	s.run(1, cpDown) // 180 s
+	s.wantPushes(PushDown)
+	if !strings.Contains(s.pushes[0].Body, "for about 3 min (7 checks") {
+		t.Fatalf("down body %q", s.pushes[0].Body)
+	}
+}
+
+// A wall clock stepped back mid-run (a fast clock corrected) must not hold
+// the page back by the size of the step.
+func TestBackwardWallClockStepDoesNotDelayThePage(t *testing.T) {
+	s := newScenario(t)
+	s.run(2, cpDown) // 30 s
+	s.now = s.now.Add(-time.Hour)
+	s.run(4, cpDown) // 150 s
+	s.wantPushes()
+	s.run(1, cpDown) // 180 s
+	s.wantPushes(PushDown)
+}
+
+// Across a restart only the saved wall time is left. A clock now behind the
+// saved last check (a wrong RTC at boot, a VM resumed from an old snapshot)
+// starts the count again, and the page comes one full hold later.
+func TestBackwardWallClockAcrossARestartStartsCountingAgain(t *testing.T) {
+	s := newScenario(t)
+	s.run(5, cpDown) // 120 s
+	s.now = s.now.Add(-10 * time.Minute)
+	s.start()
+	s.run(1, cpDown)
+	if s.saved.ConsecutiveFailures != 1 || s.saved.FailingFor != 0 {
+		t.Fatalf("first check after the restart = %d checks over %s, want a new run", s.saved.ConsecutiveFailures, s.saved.FailingFor)
+	}
+	s.run(5, cpDown) // 150 s of the new run
+	s.wantPushes()
+	s.run(1, cpDown) // 180 s
+	s.wantPushes(PushDown)
+}
+
+// The monotonic clock stops while the machine is suspended. A wall clock that
+// moved on by more than the gap while it stood still starts the count again,
+// as a stopped witness does.
+func TestSuspendLongerThanTheGapStartsCountingAgain(t *testing.T) {
+	s := newScenario(t)
+	s.run(5, cpDown) // 120 s
+	s.now = s.now.Add(time.Hour)
+	s.run(1, cpDown)
+	if s.saved.ConsecutiveFailures != 1 {
+		t.Fatalf("first check after the suspend = %d checks, want a new run", s.saved.ConsecutiveFailures)
+	}
+	s.run(5, cpDown)
+	s.wantPushes()
+	s.run(1, cpDown)
+	s.wantPushes(PushDown)
 }
 
 func TestFailedPushIsRetriedAndDeliveredOnce(t *testing.T) {

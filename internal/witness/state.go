@@ -52,11 +52,16 @@ type State struct {
 	LastOKAt        time.Time `json:"last_ok_at,omitzero"`
 
 	// The current run of failed checks with this node's network up.
-	FailingSince        time.Time `json:"failing_since,omitzero"`
-	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
-	// The current run of answered checks.
-	OKSince       time.Time `json:"ok_since,omitzero"`
-	ConsecutiveOK int       `json:"consecutive_ok,omitempty"`
+	// FailingSince is when it began by this node's wall clock, for display;
+	// FailingFor is how long it has lasted, summed from the time between
+	// checks, and is what the hold is measured on (see sinceLastCheck).
+	FailingSince        time.Time     `json:"failing_since,omitzero"`
+	FailingFor          time.Duration `json:"failing_for_ns,omitempty"`
+	ConsecutiveFailures int           `json:"consecutive_failures,omitempty"`
+	// The current run of answered checks, kept the same way.
+	OKSince       time.Time     `json:"ok_since,omitzero"`
+	OKFor         time.Duration `json:"ok_for_ns,omitempty"`
+	ConsecutiveOK int           `json:"consecutive_ok,omitempty"`
 	// Set while checks reach neither the control plane nor any reference.
 	NetworkDownSince time.Time `json:"network_down_since,omitzero"`
 
@@ -65,6 +70,9 @@ type State struct {
 	Alerted   bool      `json:"alerted"`
 	AlertedAt time.Time `json:"alerted_at,omitzero"`
 	DownSince time.Time `json:"down_since,omitzero"`
+	// OutageFor is how long the announced outage has lasted, from the run's
+	// first failure, for the recovery push.
+	OutageFor time.Duration `json:"outage_for_ns,omitempty"`
 
 	LastPushAt    time.Time `json:"last_push_at,omitzero"`
 	LastPushKind  string    `json:"last_push_kind,omitempty"`
@@ -93,35 +101,70 @@ type Push struct {
 	Level string
 }
 
+// sinceLastCheck is the time since the previous check and whether that gap
+// breaks the runs, as the witness takes it from two clocks. Inside one
+// process it uses mono, the time on the monotonic clock, which a step of the
+// wall clock (NTP correcting a drifted clock, a wrong RTC fixed after boot)
+// does not move: such a step neither pushes early nor holds a push back. The
+// wall clock still breaks the runs when it moved ahead by more than maxGap:
+// the monotonic clock stops while the machine is suspended, and restarting
+// the count can only delay a push, never send one early. The first check
+// after a start has only the saved wall time to go by, so a gap that is
+// negative (the clock is now behind the saved check) or longer than maxGap
+// breaks the runs too.
+func sinceLastCheck(prev, now time.Time, mono time.Duration, inProcess bool, maxGap time.Duration) (time.Duration, bool) {
+	if prev.IsZero() {
+		return 0, false
+	}
+	wall := now.Sub(prev)
+	if inProcess {
+		return mono, mono > maxGap || wall > maxGap
+	}
+	return wall, wall < 0 || wall > maxGap
+}
+
 // observe folds one check into the state and returns the push it now owes,
-// if any. It is pure: the caller sends the push and reports the outcome with
-// pushed.
-func (s *State) observe(cfg Config, now time.Time, res CheckResult) *Push {
-	prev := s.LastCheckAt
+// if any. now is the wall time, recorded for display; step is the time since
+// the previous check and gap whether that time breaks the runs, both from
+// sinceLastCheck. It is pure: the caller sends the push and reports the
+// outcome with pushed.
+func (s *State) observe(cfg Config, now time.Time, step time.Duration, gap bool, res CheckResult) *Push {
 	s.LastCheckAt = now
 	s.LastCheckOK = res.OK
 	s.LastCheckDetail = res.Detail
-	if !prev.IsZero() && now.Sub(prev) > cfg.maxGap() {
+	if gap {
 		// The witness itself was away (stopped, the machine asleep or
-		// rebooting) for longer than a run may pause: whatever it counted
-		// before says nothing about now.
-		s.FailingSince, s.ConsecutiveFailures = time.Time{}, 0
-		s.OKSince, s.ConsecutiveOK = time.Time{}, 0
+		// rebooting) for longer than a run may pause, or the clock it has to
+		// go by went backwards: whatever it counted before says nothing
+		// about now.
+		s.FailingSince, s.FailingFor, s.ConsecutiveFailures = time.Time{}, 0, 0
+		s.OKSince, s.OKFor, s.ConsecutiveOK = time.Time{}, 0, 0
+	} else {
+		// The time since the last check belongs to the run still going on.
+		if s.ConsecutiveFailures > 0 {
+			s.FailingFor += step
+		}
+		if s.ConsecutiveOK > 0 {
+			s.OKFor += step
+		}
+	}
+	if s.Alerted && step > 0 {
+		s.OutageFor += step
 	}
 
 	if res.OK {
 		s.LastOKAt = now
 		s.NetworkDownSince = time.Time{}
-		s.FailingSince, s.ConsecutiveFailures = time.Time{}, 0
+		s.FailingSince, s.FailingFor, s.ConsecutiveFailures = time.Time{}, 0, 0
 		if s.ConsecutiveOK == 0 {
-			s.OKSince = now
+			s.OKSince, s.OKFor = now, 0
 		}
 		s.ConsecutiveOK++
 		s.Phase = PhaseWatching
 		if s.Alerted {
 			s.Phase = PhaseDown
-			if s.ConsecutiveOK >= 2 && now.Sub(s.OKSince) >= cfg.Recover() {
-				return recoveryPush(cfg, s, now)
+			if s.ConsecutiveOK >= 2 && s.OKFor >= cfg.Recover() {
+				return recoveryPush(cfg, s)
 			}
 		}
 		return nil
@@ -129,13 +172,13 @@ func (s *State) observe(cfg Config, now time.Time, res CheckResult) *Push {
 
 	// A failed check ends any run of answers: a recovery has to be seen
 	// answering without a break.
-	s.OKSince, s.ConsecutiveOK = time.Time{}, 0
+	s.OKSince, s.OKFor, s.ConsecutiveOK = time.Time{}, 0, 0
 	if !res.NetworkUp {
 		// Nothing answers, so this check says nothing about the control
 		// plane: it is not counted as a failure and does not end the run.
-		// The hold is measured on the clock from the run's first failure, so
-		// a run that began before the network dropped can be past its hold
-		// when the network comes back.
+		// The hold keeps running from the run's first failure, so a run that
+		// began before the network dropped can be past its hold when the
+		// network comes back.
 		if s.NetworkDownSince.IsZero() {
 			s.NetworkDownSince = now
 		}
@@ -151,7 +194,7 @@ func (s *State) observe(cfg Config, now time.Time, res CheckResult) *Push {
 	backFromNetworkDown := !s.NetworkDownSince.IsZero()
 	s.NetworkDownSince = time.Time{}
 	if s.ConsecutiveFailures == 0 {
-		s.FailingSince = now
+		s.FailingSince, s.FailingFor = now, 0
 	}
 	s.ConsecutiveFailures++
 	if s.Alerted {
@@ -159,8 +202,8 @@ func (s *State) observe(cfg Config, now time.Time, res CheckResult) *Push {
 		return nil
 	}
 	s.Phase = PhaseFailing
-	if s.ConsecutiveFailures >= 2 && now.Sub(s.FailingSince) >= cfg.Hold() && !backFromNetworkDown {
-		return downPush(cfg, s, now)
+	if s.ConsecutiveFailures >= 2 && s.FailingFor >= cfg.Hold() && !backFromNetworkDown {
+		return downPush(cfg, s)
 	}
 	return nil
 }
@@ -181,44 +224,48 @@ func (s *State) pushed(p *Push, now time.Time, errKind string) {
 		s.Alerted = true
 		s.AlertedAt = now
 		s.DownSince = s.FailingSince
+		s.OutageFor = s.FailingFor
 		s.Phase = PhaseDown
 	case PushRecovery:
 		s.Alerted = false
 		s.AlertedAt = time.Time{}
 		s.DownSince = time.Time{}
+		s.OutageFor = 0
 		s.Phase = PhaseWatching
 	}
 }
 
-func downPush(cfg Config, s *State, now time.Time) *Push {
+// downPush and recoveryPush lead with how long the outage has lasted, which
+// is measured the same way the hold is. The node's clock may be off, so when
+// a run began by that clock comes second and is labelled as such.
+func downPush(cfg Config, s *State) *Push {
 	host := hostOf(cfg.HealthURL)
-	title, failed := "Lattice control plane unreachable", "has not answered since"
+	title, failed := "Lattice control plane unreachable", "has not answered"
 	if strings.HasPrefix(s.LastCheckDetail, "http ") {
 		// Something on the public path answers, just not with 200: the
 		// server says it is not ready (its store or audit check failed), or a
 		// proxy or CDN in front of it answers in its place. "Unreachable"
 		// would send the operator after the network.
-		title, failed = "Lattice control plane not ready", "has answered without reporting ready since"
+		title, failed = "Lattice control plane not ready", "has answered without reporting ready"
 	}
-	body := fmt.Sprintf("Seen from %s: %s %s %s (%d checks over %s; last: %s). This node's own network is up. Sent by the Lattice witness on %s through its local Bark server, because Lattice itself cannot send anything now.",
-		cfg.NodeName, host, failed, clock(s.FailingSince), s.ConsecutiveFailures, roughDuration(now.Sub(s.FailingSince)), orUnknown(s.LastCheckDetail), cfg.NodeName)
+	body := fmt.Sprintf("Seen from %s: %s %s for about %s (%d checks; last: %s; first failed check %s by this node's clock). This node's own network is up. Sent by the Lattice witness on %s through its local Bark server, because Lattice itself cannot send anything now.",
+		cfg.NodeName, host, failed, roughDuration(s.FailingFor), s.ConsecutiveFailures, orUnknown(s.LastCheckDetail), clock(s.FailingSince), cfg.NodeName)
 	return &Push{Kind: PushDown, Title: title, Body: body, Level: cfg.Level()}
 }
 
-func recoveryPush(cfg Config, s *State, now time.Time) *Push {
+func recoveryPush(cfg Config, s *State) *Push {
 	host := hostOf(cfg.HealthURL)
-	since := s.DownSince
-	if since.IsZero() {
-		since = s.AlertedAt
-	}
+	// OutageFor runs from the first failure to now and OKFor from the first
+	// answer of this run to now, so the outage is the difference.
+	outage := max(s.OutageFor-s.OKFor, 0)
 	// A recovery is a run of 200s from /readyz, so "ready again" is true
 	// after either kind of outage.
-	body := fmt.Sprintf("Seen from %s: %s reports ready again since %s, after about %s down. Sent by the Lattice witness on %s.",
-		cfg.NodeName, host, clock(s.OKSince), roughDuration(s.OKSince.Sub(since)), cfg.NodeName)
+	body := fmt.Sprintf("Seen from %s: %s reports ready again after about %s down (answering for %s, since %s by this node's clock). Sent by the Lattice witness on %s.",
+		cfg.NodeName, host, roughDuration(outage), roughDuration(s.OKFor), clock(s.OKSince), cfg.NodeName)
 	return &Push{Kind: PushRecovery, Title: "Lattice control plane ready again", Body: body, Level: "active"}
 }
 
-func clock(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05Z") }
+func clock(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05 UTC") }
 
 func orUnknown(s string) string {
 	if s == "" {
@@ -245,10 +292,10 @@ func roughDuration(d time.Duration) string {
 // so a recovery is still pushed for an outage announced under the old one.
 func (s *State) adopt(cfg Config, configSHA string, now time.Time) {
 	if s.Version != StateVersion || s.ConfigSHA256 != configSHA {
-		alerted, alertedAt, downSince := s.Alerted, s.AlertedAt, s.DownSince
+		alerted, alertedAt, downSince, outageFor := s.Alerted, s.AlertedAt, s.DownSince, s.OutageFor
 		lastPushAt, lastPushKind, lastPushOK, lastPushErr, pushes := s.LastPushAt, s.LastPushKind, s.LastPushOK, s.LastPushError, s.Pushes
 		*s = State{
-			Alerted: alerted, AlertedAt: alertedAt, DownSince: downSince,
+			Alerted: alerted, AlertedAt: alertedAt, DownSince: downSince, OutageFor: outageFor,
 			LastPushAt: lastPushAt, LastPushKind: lastPushKind, LastPushOK: lastPushOK, LastPushError: lastPushErr, Pushes: pushes,
 		}
 	}

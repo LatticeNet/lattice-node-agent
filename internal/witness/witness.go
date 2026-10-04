@@ -50,6 +50,12 @@ type Witness struct {
 	prober    Prober
 	pusher    Pusher
 	now       func() time.Time
+	// mono is how long this witness has been running, on the monotonic
+	// clock. lastMono is its value at this process's previous check, and
+	// checked says whether there was one.
+	mono      func() time.Duration
+	lastMono  time.Duration
+	checked   bool
 	save      func(State) error
 	logf      func(string, ...any)
 	lastPhase string
@@ -74,12 +80,19 @@ func New(cfg Config, configSHA string, state State, prober Prober, pusher Pusher
 		path := cfg.State()
 		save = func(st State) error { return SaveState(path, st) }
 	}
-	w := &Witness{cfg: cfg, configSHA: configSHA, state: state, prober: prober, pusher: pusher, now: now, save: save, logf: log.Printf}
+	// A time.Now reading carries Go's monotonic clock reading, and Sub
+	// between two such readings uses it, so a step of the wall clock does
+	// not move mono. clock drops that reading (UTC does), so no elapsed time
+	// is ever taken from it.
+	start := now()
+	mono := func() time.Duration { return now().Sub(start) }
+	w := &Witness{cfg: cfg, configSHA: configSHA, state: state, prober: prober, pusher: pusher, now: now, mono: mono, save: save, logf: log.Printf}
 	w.state.adopt(cfg, configSHA, w.clock())
 	w.lastPhase = w.state.Phase
 	return w
 }
 
+// clock is the wall time the witness records and shows, in UTC.
 func (w *Witness) clock() time.Time { return w.now().UTC() }
 
 // State returns a copy of the current state.
@@ -88,8 +101,10 @@ func (w *Witness) State() State { return w.state }
 // Tick runs one check, sends any push it owes, and saves the state.
 func (w *Witness) Tick(ctx context.Context) {
 	res := w.check(ctx)
-	now := w.clock()
-	if p := w.state.observe(w.cfg, now, res); p != nil {
+	now, mono := w.clock(), w.mono()
+	step, gap := sinceLastCheck(w.state.LastCheckAt, now, mono-w.lastMono, w.checked, w.cfg.maxGap())
+	w.lastMono, w.checked = mono, true
+	if p := w.state.observe(w.cfg, now, step, gap, res); p != nil {
 		kind := w.pusher.Push(ctx, w.cfg, *p)
 		w.state.pushed(p, w.clock(), kind)
 		switch {
