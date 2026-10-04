@@ -5,7 +5,55 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## 0.3.10-alpha.2 (unreleased)
+## 0.3.10-alpha.3 (unreleased)
+
+Prerelease. Changes since v0.3.10-alpha.2.
+
+Control-plane witness:
+
+- `lattice-agent -witness <config>` runs the control-plane witness as its own
+  process (`lattice-witness.service`, written by an approved server plan). It
+  polls the control plane's public `/readyz` every interval; after the hold
+  window of failures with the node's own network up (any HTTP answer from a
+  reference URL) it pushes one message through the bark-server on the node's
+  loopback interface, and one recovery once the control plane has answered
+  without a break for the recovery window. The push is titled "not ready"
+  when the control plane answered with something other than 200 and
+  "unreachable" when nothing answered. When the control plane and every
+  reference fail together it pushes nothing, and the first failed check after
+  the node's own network returns only confirms. Its state survives restarts,
+  so a restart in the middle of an outage neither pushes twice nor drops the
+  recovery. Standard library only; no node token, no fleet data. It has no
+  mute: a control plane stop longer than the hold pages.
+- The hold and the recovery window are measured on the monotonic clock while
+  the witness runs, so a step of the node's wall clock neither pages early nor
+  holds a page back. A saved last check later than the node's clock after a
+  restart, or a wall clock that moved ahead by more than the gap while the
+  monotonic clock stood still (a suspend), starts the count again. The push
+  leads with how long the outage has lasted; the node's clock comes second
+  and is labelled as such. A check or push cut short by the witness stopping
+  is not recorded.
+- The Bark device key is read from a root-only file the config names; a file
+  readable by group or others, owned by another user, or not shaped like a
+  Bark key is refused at start. The config must belong to the witness's user
+  and must not be writable by group or others. Both are checked on the opened
+  file, not the path, and a FIFO at either path is refused without blocking.
+  `-witness-check` validates config and key and prints a summary without the
+  key.
+- The heartbeat relays the witness status file
+  (`/var/lib/lattice-witness/status.json`) as `witness`, with `relayed_at`
+  (this node's clock when the agent read it), so the console can show the
+  last check and the last push, and the server can tell a witness whose
+  service stopped from one that is watching. Older servers ignore the field.
+- Hello capabilities and `-compat-json` features list
+  `control-plane-witness-v1`, on every beat whether or not linechain recovery
+  is ready.
+
+Compatibility: no new server or dashboard floor. The witness plan needs a
+server that knows the `controlplane-witness` plan kind
+(lattice-server `feat/witness-plan-and-fallback-channel`).
+
+## 0.3.10-alpha.2 (2026-10-03)
 
 Prerelease. Changes since v0.3.10-alpha.1.
 

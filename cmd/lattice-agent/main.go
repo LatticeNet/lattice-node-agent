@@ -41,10 +41,11 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/sshwatch"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskexec"
 	"github.com/LatticeNet/lattice-node-agent/internal/taskoutbox"
+	"github.com/LatticeNet/lattice-node-agent/internal/witness"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.10-alpha.2"
+var version = "0.3.10-alpha.3"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -64,7 +65,7 @@ func compatibilityPayload() agentCompatibility {
 		ServerMin:    compatServerMin,
 		DashboardMin: compatDashboardMin,
 		Channel:      compatChannel,
-		Features:     []string{sdNotifyCapability, healthMarkerCapability},
+		Features:     []string{sdNotifyCapability, healthMarkerCapability, witness.Capability},
 	}
 }
 
@@ -84,14 +85,17 @@ const (
 )
 
 func reportedCapabilities() []string {
-	return []string{durableTaskResultCapability, guardManagedSHACapability}
+	return []string{durableTaskResultCapability, guardManagedSHACapability, witness.Capability}
 }
 
+// capabilitiesFor withholds the durable task capability while linechain is
+// not ready. Witness mode is a property of the binary, so it is always
+// reported: the server reads it before it plans a witness on this node.
 func capabilitiesFor(linechainReady bool) []string {
 	if linechainReady {
 		return reportedCapabilities()
 	}
-	return []string{guardManagedSHACapability}
+	return []string{guardManagedSHACapability, witness.Capability}
 }
 
 type agentConfig struct {
@@ -222,6 +226,8 @@ func main() {
 	var printCompat bool
 	var printGuardManagedSHA bool
 	var applyLinechain bool
+	var witnessConfig string
+	var witnessCheck bool
 	flag.StringVar(&cfg.Server, "server", env("LATTICE_SERVER", "http://127.0.0.1:8088"), "server base URL")
 	flag.StringVar(&cfg.NodeID, "node-id", os.Getenv("LATTICE_NODE_ID"), "node id")
 	flag.StringVar(&cfg.Token, "token", os.Getenv("LATTICE_NODE_TOKEN"), "node enrollment token")
@@ -288,6 +294,8 @@ func main() {
 	flag.BoolVar(&applyLinechain, "linechain-apply", false, "apply one bounded linechain document from stdin and exit")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-agent version and exit")
 	flag.BoolVar(&printCompat, "compat-json", false, "print embedded server/dashboard compatibility metadata and exit")
+	flag.StringVar(&witnessConfig, "witness", "", "run as the control-plane witness with this config file (its own process and unit; needs no node token)")
+	flag.BoolVar(&witnessCheck, "witness-check", false, "with -witness: validate the config and the device key file, print a summary without the key, and exit")
 	flag.BoolVar(&printGuardManagedSHA, "guard-managed-sha", false, "print the canonical SHA-256 of the managed lattice_guard nft table and exit")
 	flag.Parse()
 	if printVersion {
@@ -303,6 +311,12 @@ func main() {
 	if printGuardManagedSHA {
 		if err := writeGuardManagedSHA(context.Background(), os.Stdout, guardreality.CollectManagedTableSHA); err != nil {
 			log.Fatalf("guard managed SHA collection failed: %v", err)
+		}
+		return
+	}
+	if witnessConfig != "" || witnessCheck {
+		if err := runWitnessMode(witnessConfig, witnessCheck, os.Stdout); err != nil {
+			log.Fatalf("witness: %v", err)
 		}
 		return
 	}
