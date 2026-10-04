@@ -3,6 +3,7 @@ package witness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -595,6 +596,36 @@ func TestLoadConfigRefusesUnknownFieldsAndHashesTheBytes(t *testing.T) {
 	}
 }
 
+// The config decides where the witness looks and where the key goes, so one
+// that group or others can rewrite is refused. One they can only read is
+// accepted: it holds no secret, and refusing it would only leave the node
+// without a witness.
+func TestLoadConfigRefusesAWritableOrIrregularFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "witness.json")
+	data, _ := json.Marshal(testConfig())
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []os.FileMode{0o620, 0o602} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%04o", mode)) {
+			t.Errorf("mode %04o: LoadConfig err = %v", mode, err)
+		}
+	}
+	if err := os.Chmod(path, 0o644); err != nil { // #nosec G302 -- a readable config is the case under test
+		t.Fatal(err)
+	}
+	if _, _, err := LoadConfig(path); err != nil {
+		t.Fatalf("a config readable by others was refused: %v", err)
+	}
+	if _, _, err := LoadConfig(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("a directory as config: err = %v", err)
+	}
+}
+
 func TestReadDeviceKeyRefusesAReadableOrMalformedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "key")
@@ -619,6 +650,21 @@ func TestReadDeviceKeyRefusesAReadableOrMalformedFile(t *testing.T) {
 	}
 	if _, err := ReadDeviceKey(path); err == nil || strings.Contains(err.Error(), "spaces") {
 		t.Fatalf("malformed key: err = %v (must be refused without echoing it)", err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("A", 2048)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadDeviceKey(path); err == nil || strings.Contains(err.Error(), "AAAA") {
+		t.Fatalf("oversized key file: err = %v (must be refused without echoing it)", err)
+	}
+	if err := os.Chmod(path, 0o620); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadDeviceKey(path); err == nil || !strings.Contains(err.Error(), "0620") {
+		t.Fatalf("group-writable key accepted: %v", err)
+	}
+	if _, err := ReadDeviceKey(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("a directory as key file: err = %v", err)
 	}
 }
 

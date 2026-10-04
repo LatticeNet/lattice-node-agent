@@ -12,14 +12,16 @@
 package witness
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -238,14 +240,18 @@ func sameHost(a, b string) bool {
 
 // LoadConfig reads and validates the witness config. It returns the raw
 // bytes' SHA-256 too, which the witness reports so the control plane can see
-// that the node runs the config it approved.
+// that the node runs the config it approved. The config decides where the
+// witness looks and where the key goes, so it must belong to the user the
+// witness runs as and must not be writable by group or others. Reading it is
+// harmless (it holds no secret, only the key file's path), so a readable
+// config is accepted rather than turned into a witness that never starts.
 func LoadConfig(path string) (Config, string, error) {
-	raw, err := os.ReadFile(filepath.Clean(path))
+	raw, err := readChecked(path, "witness config", maxConfigBytes, 0o022, "group and others must not be able to write it")
 	if err != nil {
-		return Config{}, "", fmt.Errorf("read witness config: %w", err)
+		return Config{}, "", err
 	}
 	var cfg Config
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, "", fmt.Errorf("parse witness config: %w", err)
@@ -257,31 +263,60 @@ func LoadConfig(path string) (Config, string, error) {
 	return cfg, hex.EncodeToString(sum[:]), nil
 }
 
-// ReadDeviceKey reads the Bark device key from its file. The file must not be
-// readable by group or others and must belong to the user the witness runs
+// ReadDeviceKey reads the Bark device key from its file. The file must give
+// group and others no access and must belong to the user the witness runs
 // as; the key must look like a Bark key. Nothing returned here ever carries
 // the key except the key itself.
 func ReadDeviceKey(path string) (string, error) {
-	info, err := os.Stat(path)
+	raw, err := readChecked(path, "device key file", maxKeyFileBytes, 0o077, "group and others must have no access")
 	if err != nil {
-		return "", fmt.Errorf("device key file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("device key file is not a regular file")
-	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return "", fmt.Errorf("device key file mode is %04o; it must not be readable by group or others", perm)
-	}
-	if err := checkOwner(info); err != nil {
 		return "", err
-	}
-	raw, err := os.ReadFile(filepath.Clean(path))
-	if err != nil {
-		return "", fmt.Errorf("device key file: %w", err)
 	}
 	key := strings.TrimSpace(string(raw))
 	if !deviceKeyRe.MatchString(key) {
 		return "", errors.New("device key file does not hold a Bark device key")
 	}
 	return key, nil
+}
+
+// Bounds on the two files the witness reads at start. The config is well
+// under 2 KiB; a Bark key is at most 128 bytes.
+const (
+	maxConfigBytes  = 64 << 10
+	maxKeyFileBytes = 1 << 10
+)
+
+// readChecked reads a file the witness trusts: a regular file that belongs to
+// the user the witness runs as and whose mode has none of the deny bits. The
+// checks run on the opened file, not on the path, so the file checked is the
+// file read; one swapped in between cannot slip past them. what names the
+// file in errors and rule says what the mode must be; neither carries the
+// file's contents.
+func readChecked(path, what string, limit int64, deny fs.FileMode, rule string) ([]byte, error) {
+	f, err := openForCheck(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", what)
+	}
+	if perm := info.Mode().Perm(); perm&deny != 0 {
+		return nil, fmt.Errorf("%s mode is %04o; %s", what, perm, rule)
+	}
+	if err := checkOwner(what, info); err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("%s is over the %d byte bound", what, limit)
+	}
+	return raw, nil
 }
