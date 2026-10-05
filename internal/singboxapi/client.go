@@ -67,7 +67,7 @@ type Client struct {
 // than loopback would put that token, and full control of the local core, on
 // the wire. This is a security boundary, not a convenience check.
 func New(cfg Config) (*Client, error) {
-	addr, err := validateLoopbackAddr(cfg.Addr)
+	addr, err := ValidateLoopbackAddr(cfg.Addr)
 	if err != nil {
 		return nil, err
 	}
@@ -93,12 +93,15 @@ func New(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// validateLoopbackAddr normalizes and checks a host:port Clash API address.
+// ValidateLoopbackAddr normalizes and checks a host:port Clash API address.
+//
+// It is exported so the trace collector can refuse a discovered address by
+// exactly the rule this client enforces on a configured one.
 //
 // This mirrors ValidateLocalHTTPURL in internal/proxyusage, which guards the
 // same class of local API for the same reason. It is duplicated rather than
 // imported so the two packages stay independent.
-func validateLoopbackAddr(raw string) (string, error) {
+func ValidateLoopbackAddr(raw string) (string, error) {
 	addr := strings.TrimSpace(raw)
 	if addr == "" {
 		return "", fmt.Errorf("singboxapi: clash api address is required")

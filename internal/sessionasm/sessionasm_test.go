@@ -1229,3 +1229,32 @@ func TestMultiplexedInnerStreamIsUnobservedNotUnnamed(t *testing.T) {
 		}
 	}
 }
+
+// Tracked is what the collector's budget guard asks before shedding a log id.
+// It must cover open connections and finished ones: the inbound's own close
+// line routinely trails a finished connection, and if Tracked missed it the
+// guard would count that trailing line as a whole connection shed. A core
+// restart clears the done set, so ids of the old process stop being tracked.
+func TestTrackedCoversOpenAndFinishedIDs(t *testing.T) {
+	a := newAsm(t, func(o *Options) { o.SnapshotEvery = time.Hour })
+	if a.Tracked(21) {
+		t.Fatal("an id never seen is tracked")
+	}
+	openConn(a, 21, t0, 5001, "example.com")
+	if !a.Tracked(21) {
+		t.Fatal("an open connection is not tracked")
+	}
+	a.Line(half(21, t0.Add(20*time.Millisecond), 20, singboxlog.EventFinished, singboxlog.DirectionDownload, ""))
+	a.Line(half(21, t0.Add(20*time.Millisecond), 20, singboxlog.EventClosed, singboxlog.DirectionUpload, ""))
+	_ = drainOne(t, a)
+	if a.Stats().Open != 0 {
+		t.Fatal("the connection did not finish")
+	}
+	if !a.Tracked(21) {
+		t.Fatal("a finished connection is not tracked, so its trailing close line would be counted as shed")
+	}
+	a.CoreRestart(2, t0.Add(time.Minute))
+	if a.Tracked(21) {
+		t.Fatal("an id of the previous core process is still tracked after a restart")
+	}
+}

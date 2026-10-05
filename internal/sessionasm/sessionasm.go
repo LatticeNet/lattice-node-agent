@@ -918,6 +918,20 @@ func (a *Assembler) Context(logID uint32) ConnContext {
 	}
 }
 
+// Tracked reports whether the assembler holds this log id open or has already
+// emitted it. The trace collector's budget guard keeps every line of a tracked
+// connection, and Context alone would not do: it only sees open connections,
+// so the trailing close line of a finished one would read as a new connection
+// and be counted as shed.
+func (a *Assembler) Tracked(logID uint32) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.open[logID]; ok {
+		return true
+	}
+	return a.done.has(logID)
+}
+
 // Tag records that these capture sessions claimed the connection. It is a set
 // union, so a session that matches on several of a connection's lines is still
 // recorded once, and later lines inherit the membership decided earlier.

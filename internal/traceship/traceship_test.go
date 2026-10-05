@@ -760,3 +760,80 @@ func TestDropPressureDuringFailedShipRestoresAndCountsOnce(t *testing.T) {
 		t.Fatalf("final stats: %+v", st)
 	}
 }
+
+// Shed connections travel as their own count and inside Dropped. Dropped is
+// what a server that predates ShedConnections audits as a gap, so leaving the
+// shed count out of it would make a new agent read loss-free to an old server.
+func TestShedRidesTheBatchAndIsIncludedInDropped(t *testing.T) {
+	rec := &recorder{}
+	s := newShipper(t, rec, nil)
+	s.AddRecords(records(1))
+	s.AddDropped(5)
+	s.AddShed(3)
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	batch := rec.at(t, 0).batch
+	if batch.ShedConnections != 3 {
+		t.Fatalf("shed_connections = %d, want 3", batch.ShedConnections)
+	}
+	if batch.Dropped != 8 {
+		t.Fatalf("dropped = %d, want 8 (5 lines plus the 3 shed connections)", batch.Dropped)
+	}
+	if st := s.Stats(); st.Dropped != 0 || st.DroppedTotal != 8 {
+		t.Fatalf("dropped counters after the batch was accepted: %+v", st)
+	}
+}
+
+// A shed that arrives while a batch is on the wire is still owed afterwards,
+// exactly like a drop: commit subtracts what the batch carried rather than
+// zeroing the counter.
+func TestCommitSubtractsShedLikeDropped(t *testing.T) {
+	var s *Shipper
+	rec := &recorder{respond: func(n int, w http.ResponseWriter) bool {
+		if n == 1 {
+			s.AddShed(2)
+		}
+		return false
+	}}
+	s = newShipper(t, rec, nil)
+	s.AddShed(4)
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("first flush: %v", err)
+	}
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("requests = %d, want 2", rec.count())
+	}
+	first, second := rec.at(t, 0).batch, rec.at(t, 1).batch
+	if first.ShedConnections != 4 || first.Dropped != 4 {
+		t.Fatalf("first batch shed=%d dropped=%d, want 4 and 4", first.ShedConnections, first.Dropped)
+	}
+	if second.ShedConnections != 2 || second.Dropped != 2 {
+		t.Fatalf("second batch shed=%d dropped=%d, want the 2 that arrived in flight", second.ShedConnections, second.Dropped)
+	}
+	if err := s.Flush(context.Background()); err != nil || rec.count() != 2 {
+		t.Fatalf("a third flush with nothing owed sent a request (err %v, count %d)", err, rec.count())
+	}
+}
+
+// With nothing queued, a shed count alone is worth a request: a node whose
+// budget sheds everything new produces no records at all, and that silence
+// must not read as a quiet network.
+func TestShedAloneIsWorthABatch(t *testing.T) {
+	rec := &recorder{}
+	s := newShipper(t, rec, nil)
+	s.AddShed(1)
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("requests = %d, want 1", rec.count())
+	}
+	batch := rec.at(t, 0).batch
+	if batch.ShedConnections != 1 || batch.SourceLooksBare() {
+		t.Fatalf("batch = %+v, want one shed connection and not bare", batch)
+	}
+}

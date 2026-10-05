@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,6 +57,8 @@ func traceTestCollector(t *testing.T, api *httptest.Server) (*traceCollector, mo
 		NodeID: "node-a",
 		Token:  "tok",
 	})
+	// Never the machine's own sing-box config.
+	c.configPath = filepath.Join(t.TempDir(), "absent-config.json")
 	cfg := model.TraceAgentConfig{
 		Policy: model.TracePolicy{
 			NodeID:            "node-a",
@@ -245,7 +251,10 @@ func TestLevelChangeKeepsThePipelineAndItsOpenConnections(t *testing.T) {
 	}
 }
 
-// A budget-only policy change must reach the running stream.
+// A budget-only policy change must reach the running stream's guard, which is
+// what applies the parsed-line budget per line, without replacing the guard
+// (its shed marks have to outlive the change). A budget of 0 is what a server
+// sends for "the agent default", which is 5,000 parsed lines a second.
 func TestBudgetChangeTakesEffectWithoutRebuildingTheStream(t *testing.T) {
 	api := fakeClashAPI(t)
 	c, cfg := traceTestCollector(t, api)
@@ -256,19 +265,28 @@ func TestBudgetChangeTakesEffectWithoutRebuildingTheStream(t *testing.T) {
 	c.applyConfig(ctx, cfg)
 	time.Sleep(100 * time.Millisecond)
 	c.mu.Lock()
-	first := c.budget
+	first, guard := c.budget, c.guard
 	c.mu.Unlock()
-	if first != 100 {
-		t.Fatalf("budget = %d, want 100", first)
+	if first != 100 || guard == nil || guard.Budget() != 100 {
+		t.Fatalf("budget = %d, guard %v, want 100 on both", first, guard)
 	}
 
 	cfg.Policy.BudgetLinesPerSec = 7
 	c.applyConfig(ctx, cfg)
 	c.mu.Lock()
-	second := c.budget
+	second, sameGuard := c.budget, c.guard == guard
 	c.mu.Unlock()
-	if second != 7 {
-		t.Fatalf("budget stayed %d after a budget-only policy change; the control is inert", second)
+	if second != 7 || guard.Budget() != 7 {
+		t.Fatalf("budget stayed %d (guard %d) after a budget-only policy change; the control is inert", second, guard.Budget())
+	}
+	if !sameGuard {
+		t.Fatal("a budget change replaced the guard and forgot its shed marks")
+	}
+
+	cfg.Policy.BudgetLinesPerSec = 0
+	c.applyConfig(ctx, cfg)
+	if got := guard.Budget(); got != defaultTraceBudgetLines || defaultTraceBudgetLines != 5000 {
+		t.Fatalf("budget 0 applied as %d, want the agent default of 5000", got)
 	}
 }
 
@@ -312,7 +330,7 @@ func TestRestartIsDetectedFromProcessIdentityNotReachability(t *testing.T) {
 	if !regressed {
 		t.Fatal("a totals reset was not recognised as a new process")
 	}
-	c.noteCoreRestart(asm)
+	c.noteCoreRestart(asm, nil)
 	c.mu.Lock()
 	after := c.generation
 	c.mu.Unlock()
@@ -364,5 +382,511 @@ func TestSessionExpiresLocallyWithoutTheServer(t *testing.T) {
 	}
 	if after != model.TraceLevelInfo {
 		t.Fatalf("subscription stayed at %q after expiry; it must fall back to the node floor", after)
+	}
+}
+
+// --- Design 26 R1: discovery, collector status, the raw switch, shedding ---
+
+// countingClashAPI is a fake Clash API that counts every request it gets and,
+// when secret is non-empty, answers 401 to any other bearer token. /logs
+// writes lines once and then holds the stream open, as sing-box does.
+type countingClashAPI struct {
+	srv      *httptest.Server
+	requests atomic.Int64
+}
+
+func newCountingClashAPI(t *testing.T, secret string, lines []string) *countingClashAPI {
+	t.Helper()
+	api := &countingClashAPI{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/connections", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}, "uploadTotal": 0, "downloadTotal": 0})
+	})
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		for _, l := range lines {
+			_, _ = fmt.Fprintln(w, l)
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	})
+	api.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		api.requests.Add(1)
+		if secret != "" && r.Header.Get("Authorization") != "Bearer "+secret {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(api.srv.Close)
+	return api
+}
+
+func (a *countingClashAPI) addr() string { return a.srv.Listener.Addr().String() }
+
+// writeSingBoxConfig writes a sing-box config with the given clash_api object,
+// or none when clashAPI is nil, and returns its path.
+func writeSingBoxConfig(t *testing.T, clashAPI map[string]any) string {
+	t.Helper()
+	cfg := map[string]any{"log": map[string]any{"level": "info"}}
+	if clashAPI != nil {
+		cfg["experimental"] = map[string]any{"clash_api": clashAPI}
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// discoveryCollector is a collector reading the given config, with a policy
+// that is on and names no Clash API address and no secret path.
+func discoveryCollector(t *testing.T, configPath string) (*traceCollector, model.TraceAgentConfig) {
+	t.Helper()
+	c := newTraceCollector(agentConfig{Server: "http://127.0.0.1:1", NodeID: "node-a", Token: "tok"})
+	c.configPath = configPath
+	return c, model.TraceAgentConfig{
+		Policy:     model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelInfo},
+		ServerTime: time.Now().UTC(),
+	}
+}
+
+func collectorState(c *traceCollector) model.CollectorState {
+	if st := c.Status(); st != nil {
+		return st.State
+	}
+	return ""
+}
+
+func waitForState(t *testing.T, c *traceCollector, want model.CollectorState) *model.CollectorStatus {
+	t.Helper()
+	waitFor(t, "collector state "+string(want), func() bool { return collectorState(c) == want })
+	return c.Status()
+}
+
+// Acceptance 1, agent side: a node switched on with no Clash API anywhere says
+// so, names where it looked, and starts nothing.
+func TestEnabledWithoutAnyClashAPIReportsNoClashAPI(t *testing.T) {
+	path := writeSingBoxConfig(t, nil)
+	c, cfg := discoveryCollector(t, path)
+	if st := c.Status(); st != nil {
+		t.Fatalf("status before any policy = %+v, want none", st)
+	}
+	c.applyConfig(context.Background(), cfg)
+	defer c.stop()
+
+	st := c.Status()
+	if st == nil || st.State != model.CollectorNoClashAPI {
+		t.Fatalf("status = %+v, want no_clash_api", st)
+	}
+	// A pipeline whose stream has not answered yet has decided nothing either.
+	pending := newTraceCollector(agentConfig{Server: "http://127.0.0.1:1", NodeID: "node-a", Token: "tok"})
+	pending.mu.Lock()
+	pending.runCancel = func() {}
+	pending.mu.Unlock()
+	pending.evaluateStream()
+	if got := pending.Status(); got != nil {
+		t.Fatalf("status before the stream answered = %+v, want none", got)
+	}
+	if !strings.Contains(st.Detail, path) || !strings.Contains(st.Detail, "no experimental.clash_api") {
+		t.Fatalf("detail %q does not say what is missing and where", st.Detail)
+	}
+	if st.ClashAPIAddr != "" || st.AddrSource != "" || st.RawLines || st.Since.IsZero() {
+		t.Fatalf("status = %+v, want no address, no raw lines, a since", st)
+	}
+	if st.BudgetLinesPerSec != defaultTraceBudgetLines || st.CountersSince.IsZero() {
+		t.Fatalf("status = %+v, want the default budget and counters_since", st)
+	}
+	c.mu.Lock()
+	running := c.runCancel != nil || c.asm != nil || c.client != nil
+	c.mu.Unlock()
+	if running {
+		t.Fatal("a pipeline was started with no Clash API to read")
+	}
+}
+
+// With no address in the policy, the controller in the node's sing-box config
+// is used, with the secret from the same config.
+func TestDiscoveryUsesTheConfigControllerWhenThePolicyHasNone(t *testing.T) {
+	api := newCountingClashAPI(t, "cfg-secret", nil)
+	path := writeSingBoxConfig(t, map[string]any{"external_controller": api.addr(), "secret": "cfg-secret"})
+	c, cfg := discoveryCollector(t, path)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	st := waitForState(t, c, model.CollectorReady)
+	if st.AddrSource != model.ClashAddrFromConfig || st.ClashAPIAddr != api.addr() {
+		t.Fatalf("status = %+v, want %s from the config", st, api.addr())
+	}
+	if st.Level != model.TraceLevelInfo || st.Detail != "" {
+		t.Fatalf("ready status = %+v, want level info and no detail", st)
+	}
+}
+
+// Discovery refuses a controller that is not loopback by the client's own
+// rule, and never dials it.
+func TestDiscoveryRefusesANonLoopbackController(t *testing.T) {
+	api := newCountingClashAPI(t, "", nil)
+	_, port, err := net.SplitHostPort(api.addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ctrl := range []string{"0.0.0.0:" + port, ":" + port, "http://127.0.0.1:" + port} {
+		path := writeSingBoxConfig(t, map[string]any{"external_controller": ctrl})
+		c, cfg := discoveryCollector(t, path)
+		c.applyConfig(context.Background(), cfg)
+		st := c.Status()
+		c.stop()
+		if st.State != model.CollectorNoClashAPI || !strings.Contains(st.Detail, "not a loopback") {
+			t.Fatalf("controller %q: status = %+v, want no_clash_api naming the loopback rule", ctrl, st)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := api.requests.Load(); n != 0 {
+		t.Fatalf("the fake Clash API saw %d requests; a refused controller was dialled", n)
+	}
+}
+
+// An explicit policy address wins over whatever the config says.
+func TestPolicyAddressWinsOverTheConfig(t *testing.T) {
+	inPolicy := newCountingClashAPI(t, "", nil)
+	inConfig := newCountingClashAPI(t, "", nil)
+	path := writeSingBoxConfig(t, map[string]any{"external_controller": inConfig.addr()})
+	c, cfg := discoveryCollector(t, path)
+	cfg.Policy.ClashAPIAddr = inPolicy.addr()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	st := waitForState(t, c, model.CollectorReady)
+	if st.AddrSource != model.ClashAddrFromPolicy || st.ClashAPIAddr != inPolicy.addr() {
+		t.Fatalf("status = %+v, want the policy address", st)
+	}
+	if n := inConfig.requests.Load(); n != 0 {
+		t.Fatalf("the config's controller saw %d requests although the policy named another", n)
+	}
+}
+
+// `sb api on` writes the controller into the config. The next poll notices it
+// without the agent restarting.
+func TestDiscoveryNoticesApiOnWithoutARestart(t *testing.T) {
+	api := newCountingClashAPI(t, "", nil)
+	path := writeSingBoxConfig(t, nil)
+	c, cfg := discoveryCollector(t, path)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	if got := collectorState(c); got != model.CollectorNoClashAPI {
+		t.Fatalf("state = %q before api on, want no_clash_api", got)
+	}
+	data, _ := json.Marshal(map[string]any{"experimental": map[string]any{"clash_api": map[string]any{"external_controller": api.addr()}}})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.applyConfig(ctx, cfg)
+	st := waitForState(t, c, model.CollectorReady)
+	if st.AddrSource != model.ClashAddrFromConfig {
+		t.Fatalf("status = %+v, want the discovered address", st)
+	}
+}
+
+// An address exists but the bearer secret cannot be read.
+func TestUnreadableSecretReportsSecretUnreadable(t *testing.T) {
+	api := newCountingClashAPI(t, "", nil)
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	cfg.Policy.ClashAPIAddr = api.addr()
+	cfg.Policy.SecretPath = t.TempDir() // a directory: present, and unreadable as a file
+	c.applyConfig(context.Background(), cfg)
+	defer c.stop()
+
+	st := c.Status()
+	if st.State != model.CollectorSecretUnreadable || st.ClashAPIAddr != api.addr() || st.AddrSource != model.ClashAddrFromPolicy {
+		t.Fatalf("status = %+v, want secret_unreadable for the policy address", st)
+	}
+	if !strings.Contains(st.Detail, "secret") {
+		t.Fatalf("detail %q does not say the secret is the problem", st.Detail)
+	}
+}
+
+// A Clash API that refuses the subscription from the start is a fault, and is
+// reported at once rather than after the grace.
+func TestStreamThatNeverOpensReportsStreamFailing(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/connections", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}})
+	})
+	api := httptest.NewServer(mux)
+	defer api.Close()
+	c, cfg := traceTestCollector(t, api)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	st := waitForState(t, c, model.CollectorStreamFailing)
+	if !strings.Contains(st.Detail, "503") || st.Level != "" {
+		t.Fatalf("status = %+v, want the 503 in the detail and no level", st)
+	}
+}
+
+// A stream that drops after it was up (a sing-box restart) stays ready inside
+// the grace and turns stream_failing once the grace has passed. The clock is
+// injected, so no test sleeps fifteen seconds.
+func TestBriefStreamDropStaysReadyInsideTheGrace(t *testing.T) {
+	clock := newFakeClock()
+	api := fakeClashAPI(t)
+	c, cfg := traceTestCollector(t, api)
+	c.now = clock.now
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	waitForState(t, c, model.CollectorReady)
+	c.mu.Lock()
+	epoch := c.streamEpoch
+	c.mu.Unlock()
+
+	c.noteStreamError(epoch, errors.New("singboxapi: log stream closed by peer"))
+	clock.advance(traceStreamGrace - time.Second)
+	c.evaluateStream()
+	if got := collectorState(c); got != model.CollectorReady {
+		t.Fatalf("state = %q inside the grace, want ready", got)
+	}
+	// Back before the grace ran out: still ready, and the clock restarts.
+	c.noteStreamOpen(epoch)
+	c.noteStreamError(epoch, errors.New("singboxapi: log stream closed by peer"))
+	clock.advance(traceStreamGrace - time.Second)
+	c.evaluateStream()
+	if got := collectorState(c); got != model.CollectorReady {
+		t.Fatalf("state = %q, want ready: the grace restarts after the stream came back", got)
+	}
+	clock.advance(time.Second)
+	c.evaluateStream()
+	st := c.Status()
+	if st.State != model.CollectorStreamFailing || !strings.Contains(st.Detail, "closed by peer") {
+		t.Fatalf("status = %+v past the grace, want stream_failing with the cause", st)
+	}
+	if !st.Since.Equal(clock.now()) {
+		t.Fatalf("since = %s, want the moment the state changed (%s)", st.Since, clock.now())
+	}
+	// A hook of a replaced subscription moves nothing.
+	c.noteStreamOpen(epoch + 100)
+	if got := collectorState(c); got != model.CollectorStreamFailing {
+		t.Fatalf("a stale subscription's Open moved the state to %q", got)
+	}
+}
+
+// The beat is nudged once per state change, not once per poll.
+func TestStateChangeCallsOnStateChangeOncePerChange(t *testing.T) {
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	var calls atomic.Int32
+	c.setOnStateChange(func() { calls.Add(1) })
+	for i := 0; i < 10; i++ {
+		c.applyConfig(context.Background(), cfg)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("ten polls in no_clash_api called onStateChange %d times, want 1", n)
+	}
+	before := c.Status().Since
+	cfg.Policy.Enabled = false
+	c.applyConfig(context.Background(), cfg)
+	c.applyConfig(context.Background(), cfg)
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("turning off called onStateChange %d times in total, want 2", n)
+	}
+	if st := c.Status(); st.State != model.CollectorOff || st.Detail != "" || st.Since.Before(before) {
+		t.Fatalf("status = %+v, want off with no detail", st)
+	}
+}
+
+// A wrong secret is refused with 401. The detail says so and never carries
+// the secret, here or anywhere in the status.
+func TestStatusDetailNeverCarriesTheSecret(t *testing.T) {
+	const wrong = "wrong-s3cret-9f8e7d6c"
+	api := newCountingClashAPI(t, "the-right-one", nil)
+	secretPath := filepath.Join(t.TempDir(), "clash.secret")
+	if err := os.WriteFile(secretPath, []byte(wrong+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	cfg.Policy.ClashAPIAddr = api.addr()
+	cfg.Policy.SecretPath = secretPath
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	st := waitForState(t, c, model.CollectorStreamFailing)
+	if !strings.Contains(st.Detail, "401") {
+		t.Fatalf("detail %q does not name the 401", st.Detail)
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), wrong) || strings.Contains(string(data), "the-right-one") {
+		t.Fatalf("the status carries a secret: %s", data)
+	}
+	if len(st.Detail) > model.CollectorDetailMaxBytes || strings.ContainsAny(st.Detail, "\r\n") {
+		t.Fatalf("detail is not one bounded line: %q", st.Detail)
+	}
+}
+
+// fakeControlPlane counts what the collector ships: trace batches (and the
+// records in them) and raw log batches.
+type fakeControlPlane struct {
+	srv         *httptest.Server
+	traceBodies atomic.Int64
+	records     atomic.Int64
+	logBodies   atomic.Int64
+	mu          sync.Mutex
+	logSources  []string
+}
+
+func newFakeControlPlane(t *testing.T) *fakeControlPlane {
+	t.Helper()
+	cp := &fakeControlPlane{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/trace", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Batch model.TraceBatch `json:"batch"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		cp.traceBodies.Add(1)
+		cp.records.Add(int64(len(body.Batch.Records)))
+	})
+	mux.HandleFunc("/api/agent/logs", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Batch model.LogBatch `json:"batch"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		cp.logBodies.Add(1)
+		cp.mu.Lock()
+		cp.logSources = append(cp.logSources, body.Batch.SourceID)
+		cp.mu.Unlock()
+	})
+	cp.srv = httptest.NewServer(mux)
+	t.Cleanup(cp.srv.Close)
+	return cp
+}
+
+// oneConnection is a complete connection as sing-box 1.13 prints it
+// (internal/singboxlog/testdata/v1.13.14/entry_nosniff.jsonl).
+var oneConnection = []string{
+	`{"type":"info","payload":"[2064424212 0ms] inbound/mixed[mixed-entry]: inbound connection from 127.0.0.1:62010"}`,
+	`{"type":"info","payload":"[2064424212 3ms] inbound/mixed[mixed-entry]: inbound connection to 127.0.0.1:18081"}`,
+	`{"type":"debug","payload":"[2064424212 4ms] router: match[0] inbound=mixed-entry => route(chain-to-exit)"}`,
+	`{"type":"info","payload":"[2064424212 5ms] outbound/vless[chain-to-exit]: outbound connection to 127.0.0.1:18081"}`,
+	`{"type":"debug","payload":"[2064424212 11ms] connection: connection download finished"}`,
+	`{"type":"trace","payload":"[2064424212 11ms] connection: connection upload closed"}`,
+	`{"type":"debug","payload":"[2064424212 11ms] inbound/mixed[mixed-entry]: connection closed: read http request: EOF"}`,
+}
+
+// rawSwitchRun runs a collector with records on against a fake Clash API that
+// prints one whole connection, and returns the control plane once a record has
+// arrived and flushCycles more assembler ticks have passed.
+func rawSwitchRun(t *testing.T, raw *model.RawLinePolicy, flushCycles int) *fakeControlPlane {
+	t.Helper()
+	api := newCountingClashAPI(t, "", oneConnection)
+	cp := newFakeControlPlane(t)
+	c := newTraceCollector(agentConfig{Server: cp.srv.URL, NodeID: "node-a", Token: "tok"})
+	c.configPath = writeSingBoxConfig(t, map[string]any{"external_controller": api.addr()})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, model.TraceAgentConfig{
+		Policy:      model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelTrace, Raw: raw},
+		RawSourceID: "src-singbox-node-a",
+		ServerTime:  time.Now().UTC(),
+	})
+	waitFor(t, "a record to reach the control plane", func() bool { return cp.records.Load() > 0 })
+	time.Sleep(time.Duration(flushCycles)*traceAssemblerTick + 200*time.Millisecond)
+	return cp
+}
+
+// Acceptance 2, agent side: records on and raw off ships records and zero raw
+// lines, even though the server named a raw source (an a117 server does
+// whenever records are on).
+func TestRecordsOnRawOffShipsZeroRawLines(t *testing.T) {
+	cp := rawSwitchRun(t, &model.RawLinePolicy{Enabled: false}, 3)
+	if n := cp.logBodies.Load(); n != 0 {
+		t.Fatalf("%d /api/agent/logs requests with raw off, want 0", n)
+	}
+	if cp.records.Load() == 0 {
+		t.Fatal("no records shipped; records must flow while raw is off")
+	}
+}
+
+// A policy written before the switch (nil Raw) keeps today's behaviour: raw
+// lines follow RawSourceID.
+func TestRawFollowsRawSourceIDWhenThePolicyPredatesTheSwitch(t *testing.T) {
+	cp := rawSwitchRun(t, nil, 1)
+	waitFor(t, "raw lines to ship", func() bool { return cp.logBodies.Load() > 0 })
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if cp.logSources[0] != "src-singbox-node-a" {
+		t.Fatalf("raw lines went to %q, want the named source", cp.logSources[0])
+	}
+}
+
+// Raw lines queued while raw was on are discarded when it turns off, so none
+// of them ships on a later flush.
+func TestRawOffDiscardsTheQueuedRawLines(t *testing.T) {
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	cfg.RawSourceID = "src-singbox-node-a"
+	c.applyConfig(context.Background(), cfg)
+	c.mu.Lock()
+	if c.rawSourceID != "src-singbox-node-a" {
+		c.mu.Unlock()
+		t.Fatalf("raw source = %q with a nil switch, want the named source", c.rawSourceID)
+	}
+	c.rawQueue = []string{"line one", "line two"}
+	c.rawDropped = 3
+	c.mu.Unlock()
+
+	cfg.Policy.Raw = &model.RawLinePolicy{Enabled: false}
+	c.applyConfig(context.Background(), cfg)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rawSourceID != "" || len(c.rawQueue) != 0 || c.rawDropped != 0 {
+		t.Fatalf("after raw off: source %q, %d queued, %d dropped; want all empty", c.rawSourceID, len(c.rawQueue), c.rawDropped)
+	}
+}
+
+// Local session expiry rebuilds the policy set from Enabled and Level only. The
+// raw switch lives on the collector, so expiry cannot turn raw lines back on.
+func TestRawSwitchSurvivesLocalSessionExpiry(t *testing.T) {
+	api := fakeClashAPI(t)
+	c, cfg := traceTestCollector(t, api)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	now := time.Now().UTC()
+	cfg.ServerTime = now
+	cfg.RawSourceID = "src-singbox-node-a"
+	cfg.Policy.Raw = &model.RawLinePolicy{Enabled: false}
+	cfg.Sessions = []model.TraceAgentSession{{ID: "sess-1", Level: model.TraceLevelTrace, ExpiresAt: now.Add(time.Second)}}
+	c.applyConfig(ctx, cfg)
+	c.expireSessionsLocally(now.Add(5 * time.Second))
+
+	c.mu.Lock()
+	src, active := c.rawSourceID, len(c.policy.ActiveSessions())
+	c.mu.Unlock()
+	if active != 0 {
+		t.Fatalf("%d sessions still active after expiry", active)
+	}
+	if src != "" {
+		t.Fatalf("raw source %q after local expiry; the raw switch was lost", src)
+	}
+	if st := waitForState(t, c, model.CollectorReady); st.RawLines {
+		t.Fatal("status reports raw lines after local expiry with raw off")
 	}
 }

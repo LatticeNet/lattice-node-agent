@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxapi"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxlog"
 	"github.com/LatticeNet/lattice-node-agent/internal/tracepolicy"
+	"github.com/LatticeNet/lattice-node-agent/internal/traceshed"
 	"github.com/LatticeNet/lattice-node-agent/internal/traceship"
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -38,8 +41,26 @@ const (
 	traceCoreProbeTimeout = 2 * time.Second
 	// traceFinalFlushTimeout bounds the last delivery attempt on shutdown.
 	traceFinalFlushTimeout = 5 * time.Second
-	// defaultTraceBudgetLines is the per-second ceiling when a policy sets none.
-	defaultTraceBudgetLines = 500
+	// defaultTraceBudgetLines is the per-second parsed-line budget when a
+	// policy sets none (or sets 0, which a server sends to mean "the agent
+	// default"). Over it the collector sheds new connections whole; see
+	// internal/traceshed.
+	defaultTraceBudgetLines = 5000
+	// traceStreamGrace is how long the /logs stream may stay down after it
+	// was open before the collector reports stream_failing. A sing-box
+	// restart is back well inside it, and flashing a failure on every restart
+	// would teach the operator to ignore the state.
+	traceStreamGrace = 15 * time.Second
+	// traceConnPollFailLimit consecutive /connections failures (15 s at the
+	// poll interval) report stream_failing even while /logs is open.
+	traceConnPollFailLimit = 3
+	// traceLinesWindow is the window, in whole seconds, that LinesPerSec
+	// averages over.
+	traceLinesWindow = 10
+	// defaultSingBoxConfigPath is where the sb script and the managed profile
+	// both put the node's sing-box config. Discovery reads the Clash API
+	// address from it and the secret fallback reads the secret.
+	defaultSingBoxConfigPath = "/etc/sing-box/config.json"
 )
 
 type traceCollector struct {
@@ -110,8 +131,51 @@ type traceCollector struct {
 	serverSkew time.Duration
 
 	// budget is live, so a policy that changes only the budget takes effect
-	// without waiting for a level change to rebuild the stream.
+	// without waiting for a level change to rebuild the stream. guard applies
+	// it per line; it lives as long as the assembler, because a shed mark has
+	// to outlive a resubscribe or the shed connection's later lines would
+	// reach the assembler mid-connection.
 	budget int
+	guard  *traceshed.Guard
+
+	// configPath is the node's sing-box config, read for the Clash API
+	// address when the policy names none and for the secret fallback. A field
+	// so tests can point it at a temporary file.
+	configPath string
+	// now is the clock for the status, a field so the grace can be tested
+	// without sleeping.
+	now func() time.Time
+
+	// configured turns true the first time a state is decided. Until then
+	// the collector has not heard its policy, or has started a pipeline whose
+	// stream has not answered yet, and reports no status rather than an
+	// "off" it has not decided.
+	configured bool
+	// status holds State, Since, ClashAPIAddr, AddrSource and Detail; Status
+	// fills in the rest when it is read.
+	status        model.CollectorStatus
+	onStateChange func()
+	// streamEpoch identifies the current /logs subscription, so hooks of a
+	// subscription that was replaced cannot move the state. streamOpen is
+	// whether that subscription is up now; streamOpened whether it ever came
+	// up; streamDownSince when it went down after being up (or first failed).
+	streamEpoch     uint64
+	streamOpen      bool
+	streamOpened    bool
+	streamDownSince time.Time
+	streamErr       string
+	// connPollFailures counts consecutive /connections failures.
+	connPollFailures int
+	connErr          string
+	// lineSecs and lineCounts are a ring of parsed lines per wall second, for
+	// LinesPerSec. One slot more than the window, so the second in progress
+	// never overwrites the oldest second the window still counts.
+	lineSecs   [traceLinesWindow + 1]int64
+	lineCounts [traceLinesWindow + 1]uint32
+	// The cumulative counters the status reports, since countersSince.
+	unparsedTotal uint64
+	shedTotal     uint64
+	countersSince time.Time
 
 	// pending holds the opening lines of connections whose identity is not
 	// known yet. A session filtered by user cannot match "inbound connection
@@ -133,9 +197,12 @@ type traceCollector struct {
 	rawSourceID string
 	rawQueue    []string
 	rawDropped  uint64
+	// rawEpoch moves when the queue is discarded, so a flush that was in
+	// flight at that moment does not trim a queue that is no longer its own.
+	rawEpoch uint64
 
+	// unparsed is owed to the shipper; unparsedTotal above is cumulative.
 	unparsed uint64
-	dropped  uint64
 }
 
 const (
@@ -148,12 +215,143 @@ const (
 )
 
 func newTraceCollector(cfg agentConfig) *traceCollector {
+	start := time.Now().UTC()
 	return &traceCollector{
-		cfg:        cfg,
-		generation: 1,
-		pending:    map[uint32][]model.TraceLine{},
-		tagged:     map[uint32][]string{},
+		cfg:           cfg,
+		generation:    1,
+		pending:       map[uint32][]model.TraceLine{},
+		tagged:        map[uint32][]string{},
+		configPath:    defaultSingBoxConfigPath,
+		now:           time.Now,
+		status:        model.CollectorStatus{State: model.CollectorOff, Since: start},
+		countersSince: start,
 	}
+}
+
+func (c *traceCollector) clock() time.Time { return c.now().UTC() }
+
+// setOnStateChange registers what to call when the collector's state changes,
+// which is how a change reaches the server within a second instead of a beat.
+func (c *traceCollector) setOnStateChange(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onStateChange = fn
+}
+
+// setStatusLocked records a state and its detail. Since moves only when the
+// state changes, and the return value says whether it did. The caller holds
+// c.mu and calls notifyStateChange after releasing it.
+func (c *traceCollector) setStatusLocked(state model.CollectorState, detail string) bool {
+	c.configured = true
+	c.status.Detail = model.BoundCollectorDetail(detail)
+	if c.status.State == state {
+		return false
+	}
+	c.status.State = state
+	c.status.Since = c.clock()
+	return true
+}
+
+// setStatus records a state, with the Clash API address it concerns (empty
+// when none was found), and nudges the beat if the state changed.
+func (c *traceCollector) setStatus(state model.CollectorState, detail, addr, source string) {
+	c.mu.Lock()
+	c.status.ClashAPIAddr, c.status.AddrSource = addr, source
+	changed := c.setStatusLocked(state, detail)
+	notify := c.onStateChange
+	c.mu.Unlock()
+	if changed && notify != nil {
+		notify()
+	}
+}
+
+// evaluateStream decides ready and stream_failing for a running pipeline,
+// from what the stream hooks and the connection poll recorded. It runs on
+// every hook, every poll and every assembler tick, the last being what lets
+// the grace expire. Before the first answer after a (re)subscribe the state
+// stands: on loopback that answer takes milliseconds.
+func (c *traceCollector) evaluateStream() {
+	now := c.clock()
+	c.mu.Lock()
+	if c.runCancel == nil {
+		// No pipeline: applyConfig owns the state.
+		c.mu.Unlock()
+		return
+	}
+	var (
+		state  model.CollectorState
+		detail string
+	)
+	switch {
+	case c.connPollFailures >= traceConnPollFailLimit:
+		state, detail = model.CollectorStreamFailing, "connections: "+c.connErr
+	case c.streamOpen:
+		state = model.CollectorReady
+	case !c.streamDownSince.IsZero() && now.Sub(c.streamDownSince) >= traceStreamGrace:
+		state, detail = model.CollectorStreamFailing, "log stream: "+c.streamErr
+	case !c.streamOpened && c.streamErr != "":
+		// Refused before it ever opened. On loopback that is a real fault
+		// (nothing listening, a wrong secret), not a restart in progress.
+		state, detail = model.CollectorStreamFailing, "log stream: "+c.streamErr
+	default:
+		c.mu.Unlock()
+		return
+	}
+	changed := c.setStatusLocked(state, detail)
+	notify := c.onStateChange
+	c.mu.Unlock()
+	if changed && notify != nil {
+		notify()
+	}
+}
+
+// Status is the collector's account of itself for the metrics beat, or nil
+// before it has applied a policy.
+func (c *traceCollector) Status() *model.CollectorStatus {
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.configured {
+		return nil
+	}
+	st := c.status
+	if st.State == model.CollectorReady {
+		st.Level = c.haveLevel
+	}
+	// Raw lines flow only through a running pipeline.
+	st.RawLines = c.rawSourceID != "" && c.runCancel != nil
+	st.LinesPerSec = c.linesPerSecLocked(now)
+	st.BudgetLinesPerSec = c.budget
+	if st.BudgetLinesPerSec <= 0 {
+		st.BudgetLinesPerSec = defaultTraceBudgetLines
+	}
+	st.ShedConnections = c.shedTotal
+	st.Unparsed = c.unparsedTotal
+	st.CountersSince = c.countersSince
+	return &st
+}
+
+// countParsedLocked adds one parsed line to the per-second ring.
+func (c *traceCollector) countParsedLocked(now time.Time) {
+	sec := now.Unix()
+	i := int(sec % int64(len(c.lineSecs)))
+	if c.lineSecs[i] != sec {
+		c.lineSecs[i], c.lineCounts[i] = sec, 0
+	}
+	c.lineCounts[i]++
+}
+
+// linesPerSecLocked averages the last traceLinesWindow whole seconds, leaving
+// out the second still in progress.
+func (c *traceCollector) linesPerSecLocked(now time.Time) float64 {
+	cur := now.Unix()
+	var sum uint64
+	for i, sec := range c.lineSecs {
+		if sec >= cur-traceLinesWindow && sec < cur {
+			sum += uint64(c.lineCounts[i])
+		}
+	}
+	return float64(sum) / traceLinesWindow
 }
 
 // bufferPending remembers a line whose connection has not been claimed yet.
@@ -245,21 +443,32 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 		c.serverSkew = agentCfg.ServerTime.Sub(now)
 	}
 	c.policy = set
-	c.rawSourceID = strings.TrimSpace(agentCfg.RawSourceID)
+	c.setRawSourceLocked(effectiveRawSourceID(agentCfg))
 	enabled := set.Enabled()
-	addr := strings.TrimSpace(agentCfg.Policy.ClashAPIAddr)
 	secretPath := strings.TrimSpace(agentCfg.Policy.SecretPath)
 	cfg := c.cfg
 	pipelineUp := c.runCancel != nil
-	sameEndpoint := c.addr == addr
+	running := c.addr
 	have := c.haveLevel
 	c.mu.Unlock()
 
-	if !enabled || addr == "" {
+	// The budget is recorded whatever happens next, so the status reports
+	// the ceiling the policy asks for even before a pipeline exists.
+	c.setBudget(agentCfg.Policy.BudgetLinesPerSec)
+	if !enabled {
 		c.stop()
+		c.setStatus(model.CollectorOff, "", "", "")
 		return
 	}
-	if pipelineUp && !sameEndpoint {
+	// Discovery runs on every poll and every pushed config, so `sb api on`
+	// on the node is noticed without restarting the agent.
+	addr, source, detail := c.resolveAddr(agentCfg.Policy)
+	if addr == "" {
+		c.stop()
+		c.setStatus(model.CollectorNoClashAPI, detail, "", "")
+		return
+	}
+	if pipelineUp && running != addr {
 		// A different Clash API means a different core. Nothing in flight
 		// belongs to it, so take the whole pipeline down, flushing what is
 		// already assembled rather than dropping it.
@@ -267,43 +476,82 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 		pipelineUp = false
 	}
 	if !pipelineUp {
-		if !c.startPipeline(ctx, cfg, addr, secretPath, agentCfg.Policy) {
+		if !c.startPipeline(ctx, cfg, addr, source, secretPath) {
 			return
 		}
 		have = ""
+	} else {
+		// Same endpoint, but the policy may now name the address discovery
+		// found, or the other way round.
+		c.mu.Lock()
+		c.status.ClashAPIAddr, c.status.AddrSource = addr, source
+		c.mu.Unlock()
 	}
-	c.setBudget(agentCfg.Policy.BudgetLinesPerSec)
 	if have == set.SubscribeLevel() {
 		return
 	}
 	c.restartStream(cfg, set.SubscribeLevel(), len(set.ActiveSessions()))
 }
 
+// effectiveRawSourceID is the raw log source the collector feeds, after the
+// policy's raw switch. A nil switch is a policy written before the switch
+// existed (an alpha-0.2.2a117 server or older): raw lines then follow
+// RawSourceID, which such a server sends whenever records are on.
+func effectiveRawSourceID(agentCfg model.TraceAgentConfig) string {
+	if raw := agentCfg.Policy.Raw; raw != nil && !raw.Enabled {
+		return ""
+	}
+	return strings.TrimSpace(agentCfg.RawSourceID)
+}
+
+// setRawSourceLocked switches the raw source. Turning it off discards what is
+// queued: those lines belong to a stream the operator stopped, and shipping
+// them on a later flush would break "records on, raw off ships zero raw
+// lines". The switch lives here and never on tracepolicy.Set, which drops
+// every policy field but Enabled and Level when it is rebuilt locally.
+func (c *traceCollector) setRawSourceLocked(id string) {
+	if id == "" && (len(c.rawQueue) > 0 || c.rawDropped > 0) {
+		c.rawQueue = nil
+		c.rawDropped = 0
+		c.rawEpoch++
+	}
+	c.rawSourceID = id
+}
+
 // setBudget makes the per-second line budget live, so a policy that changes
 // only the budget takes effect without waiting for a level change to rebuild
-// the stream.
+// the stream. 0 means the agent default.
 func (c *traceCollector) setBudget(budget int) {
 	if budget <= 0 {
 		budget = defaultTraceBudgetLines
 	}
 	c.mu.Lock()
 	c.budget = budget
+	guard := c.guard
 	c.mu.Unlock()
+	if guard != nil {
+		guard.SetBudget(budget)
+	}
 }
 
 // startPipeline brings up the parts that must outlive any one subscription:
 // the assembler holding open connections, the shipper holding queued delivery,
-// and the connection poll. Returns false if the endpoint cannot be reached at
-// all, in which case nothing is left half-built.
-func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, addr, secretPath string, pol model.TracePolicy) bool {
-	secret, err := resolveClashSecret(secretPath, cfg)
+// the budget guard, and the connection poll. Returns false if the endpoint
+// cannot be used at all, in which case nothing is left half-built and the
+// status says why.
+func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, addr, source, secretPath string) bool {
+	secret, err := resolveClashSecret(secretPath, c.configPath)
 	if err != nil {
 		log.Printf("trace: cannot read the Clash API secret: %v", err)
+		c.setStatus(model.CollectorSecretUnreadable, "cannot read the Clash API secret: "+err.Error(), addr, source)
 		return false
 	}
 	client, err := singboxapi.New(singboxapi.Config{Addr: addr, Secret: secret})
 	if err != nil {
+		// Only a policy address can get here: discovery refuses a
+		// non-loopback controller by the same rule before it is used.
 		log.Printf("trace: Clash API client: %v", err)
+		c.setStatus(model.CollectorNoClashAPI, err.Error(), addr, source)
 		return false
 	}
 
@@ -317,22 +565,59 @@ func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, add
 		NodeID: cfg.NodeID,
 		Token:  cfg.Token,
 	})
+	budget := c.budget
+	if budget <= 0 {
+		budget = defaultTraceBudgetLines
+	}
+	guard := traceshed.New(budget, traceshed.DefaultRingCapacity)
 	runCtx, runCancel := context.WithCancel(ctx)
 	c.client = client
 	c.asm = asm
 	c.shipper = shipper
+	c.guard = guard
 	c.runCancel = runCancel
 	c.addr = addr
+	c.status.ClashAPIAddr, c.status.AddrSource = addr, source
+	c.connPollFailures, c.connErr = 0, ""
 	generation, coreStart := c.generation, c.coreStart
 	c.mu.Unlock()
 
 	shipper.SetCore(generation, coreStart)
 
 	go shipper.Run(runCtx)
-	go c.pollConnections(runCtx, client, asm)
-	go c.driveAssembler(runCtx, asm, shipper)
-	debugf(cfg, "trace: pipeline up for %s generation=%d", addr, generation)
+	go c.pollConnections(runCtx, client, asm, guard)
+	go c.driveAssembler(runCtx, asm, shipper, guard)
+	debugf(cfg, "trace: pipeline up for %s (%s) generation=%d", addr, source, generation)
 	return true
+}
+
+// resolveAddr finds the Clash API address. The policy's address wins.
+// Otherwise the node's sing-box config is read, and its external_controller
+// is used only if it passes the same loopback rule the client enforces. With
+// no usable address, detail says why in one line that names the file.
+func (c *traceCollector) resolveAddr(pol model.TracePolicy) (addr, source, detail string) {
+	if a := strings.TrimSpace(pol.ClashAPIAddr); a != "" {
+		return a, model.ClashAddrFromPolicy, ""
+	}
+	path := c.configPath
+	api, err := readClashAPIConfig(path)
+	switch {
+	case err != nil:
+		var pathErr *fs.PathError
+		if errors.As(err, &pathErr) {
+			return "", "", fmt.Sprintf("cannot read %s: %v", path, pathErr.Err)
+		}
+		return "", "", fmt.Sprintf("cannot parse %s: %v", path, err)
+	case !api.Present:
+		return "", "", fmt.Sprintf("no experimental.clash_api in %s", path)
+	case api.Controller == "":
+		return "", "", fmt.Sprintf("experimental.clash_api in %s has no external_controller", path)
+	}
+	normalized, err := singboxapi.ValidateLoopbackAddr(api.Controller)
+	if err != nil {
+		return "", "", fmt.Sprintf("external_controller %q in %s is not a loopback host:port", api.Controller, path)
+	}
+	return normalized, model.ClashAddrFromConfig, ""
 }
 
 // restartStream reopens the /logs subscription at a new level, leaving the
@@ -342,11 +627,12 @@ func (c *traceCollector) restartStream(cfg agentConfig, level model.TraceLevel, 
 	if c.streamCancel != nil {
 		c.streamCancel()
 	}
-	client, asm := c.client, c.asm
+	client, asm, guard := c.client, c.asm, c.guard
 	budget := c.budget
+	addr := c.addr
 	runCancelSet := c.runCancel != nil
 	c.mu.Unlock()
-	if client == nil || asm == nil || !runCancelSet {
+	if client == nil || asm == nil || guard == nil || !runCancelSet {
 		return
 	}
 
@@ -354,11 +640,17 @@ func (c *traceCollector) restartStream(cfg agentConfig, level model.TraceLevel, 
 	c.mu.Lock()
 	c.streamCancel = streamCancel
 	c.haveLevel = level
+	// A new subscription starts with no answer yet. The state stands until
+	// its first Open or Error.
+	c.streamEpoch++
+	epoch := c.streamEpoch
+	c.streamOpen, c.streamOpened = false, false
+	c.streamDownSince, c.streamErr = time.Time{}, ""
 	c.mu.Unlock()
 
 	debugf(cfg, "trace: subscribed to %s at level=%s budget=%d lines/s sessions=%d",
-		c.addr, level, budget, sessionCount)
-	go c.streamLogs(streamCtx, client, asm, string(level))
+		addr, level, budget, sessionCount)
+	go c.streamLogs(streamCtx, client, asm, guard, string(level), epoch)
 }
 
 // stop takes the whole collector down and does NOT discard what is in flight:
@@ -368,11 +660,16 @@ func (c *traceCollector) restartStream(cfg agentConfig, level model.TraceLevel, 
 func (c *traceCollector) stop() {
 	c.mu.Lock()
 	streamCancel, runCancel := c.streamCancel, c.runCancel
-	asm, shipper := c.asm, c.shipper
+	asm, shipper, guard := c.asm, c.shipper, c.guard
 	c.streamCancel, c.runCancel = nil, nil
-	c.asm, c.shipper, c.client = nil, nil, nil
+	c.asm, c.shipper, c.client, c.guard = nil, nil, nil, nil
 	c.haveLevel = ""
 	c.addr = ""
+	// Hooks of the subscription being stopped must not move the state.
+	c.streamEpoch++
+	c.streamOpen, c.streamOpened = false, false
+	c.streamDownSince, c.streamErr = time.Time{}, ""
+	c.connPollFailures, c.connErr = 0, ""
 	c.mu.Unlock()
 
 	if streamCancel != nil {
@@ -385,6 +682,16 @@ func (c *traceCollector) stop() {
 		if records := asm.Drain(); len(records) > 0 {
 			shipper.AddRecords(records)
 		}
+		// The guard's counts since the last tick are owed too, or a node
+		// switched off mid-overload would under-report what it shed.
+		if guard != nil {
+			shed, dropped := guard.Take()
+			c.mu.Lock()
+			c.shedTotal += shed
+			c.mu.Unlock()
+			shipper.AddShed(shed)
+			shipper.AddDropped(dropped)
+		}
 		// An independent context: the one that just got cancelled cannot carry
 		// a final delivery.
 		flushCtx, cancel := context.WithTimeout(context.Background(), traceFinalFlushTimeout)
@@ -395,62 +702,51 @@ func (c *traceCollector) stop() {
 	}
 }
 
-// streamLogs is the hot path. Every kept line is parsed, offered to the
-// assembler, and (when a session asked for it) shipped verbatim.
-func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Client, asm *sessionasm.Assembler, level string) {
-	// nodeID is captured once: reading c.cfg from inside the hot path would race
-	// with the poll loop that reassigns it every cycle.
+// streamLogs is the hot path. Every line under the hard ceiling is parsed; the
+// budget guard then decides whether its connection is observed, and a kept
+// line is offered to the assembler and (when a session asked for it) shipped
+// verbatim.
+func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Client, asm *sessionasm.Assembler, guard *traceshed.Guard, level string, epoch uint64) {
+	// nodeID and cfg are captured once: reading c.cfg from inside the hot
+	// path would race with the poll loop that reassigns it every cycle.
 	c.mu.Lock()
-	nodeID := c.cfg.NodeID
+	cfg := c.cfg
+	nodeID := cfg.NodeID
 	c.mu.Unlock()
 
-	var (
-		windowStart = time.Now()
-		inWindow    int
-	)
 	onEntry := func(entry []byte) {
 		now := time.Now().UTC()
 
-		if now.Sub(windowStart) >= time.Second {
-			windowStart = now
-			inWindow = 0
-		}
-		inWindow++
-		// The budget is read live rather than captured, so a policy that
-		// changes only the budget takes effect on the running stream instead
-		// of waiting for a level change to rebuild it.
-		c.mu.Lock()
-		budgetPerSec := c.budget
-		c.mu.Unlock()
-		if budgetPerSec <= 0 {
-			budgetPerSec = defaultTraceBudgetLines
-		}
-		if inWindow > budgetPerSec {
-			// Over budget: drop and count. A silently discarded line reads later
-			// as a quiet network, so the count rides along in the next batch.
-			// The tick loop hands it to the shipper, so no drop waits on a
-			// threshold before it becomes visible.
-			c.mu.Lock()
-			c.dropped++
-			c.mu.Unlock()
+		// The pre-parse ceiling is the CPU brake. Over it a line is dropped
+		// unparsed and counted, and the tick loop hands the count to the
+		// shipper, so a silently discarded line never reads as a quiet
+		// network. The budget behind it is live, so a policy that changes
+		// only the budget takes effect on the running stream.
+		if !guard.Ceiling(now) {
 			return
 		}
-
 		line, err := singboxlog.ParseEntry(entry, now)
-		if err != nil {
-			c.mu.Lock()
-			c.unparsed++
-			c.mu.Unlock()
-			return
-		}
-		if !line.Parsed() {
+		c.mu.Lock()
+		c.countParsedLocked(now)
+		if err != nil || !line.Parsed() {
 			// Every unrecognised line counts, with or without a connection id.
 			// A newer sing-box can reword a message while keeping the
 			// "[id elapsed] tag: message" shape, and only counting the
-			// id-less ones would let that drift read as quiet traffic.
-			c.mu.Lock()
+			// id-less ones would let that drift read as quiet traffic. It is
+			// counted before the guard decides, so the parser signal does not
+			// depend on the budget.
 			c.unparsed++
-			c.mu.Unlock()
+			c.unparsedTotal++
+		}
+		c.mu.Unlock()
+		if err != nil {
+			return
+		}
+		// Over budget, a connection the assembler does not already hold is
+		// shed whole; one it holds keeps every line, so no record is ever cut
+		// in the middle.
+		if !guard.Admit(now, line, line.HasLogID && asm.Tracked(line.LogID)) {
+			return
 		}
 
 		asm.Line(line)
@@ -557,31 +853,73 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 		// backwards when a new process is answering. That check lives in the
 		// connection poll, which sees every reset whether or not the stream
 		// noticed a gap.
-		c.mu.Lock()
-		c.observationGaps++
-		c.mu.Unlock()
-		debugf(c.cfg, "trace: log stream ended, treating as an observation gap: %v", err)
+		debugf(cfg, "trace: log stream ended, treating as an observation gap: %v", err)
+		c.noteStreamError(epoch, err)
 	}
 
-	if err := client.StreamLogsWithRetry(ctx, level, onEntry, onError); err != nil && ctx.Err() == nil {
+	if err := client.StreamLogsWithHooks(ctx, level, singboxapi.StreamHooks{
+		Entry: onEntry,
+		Open:  func() { c.noteStreamOpen(epoch) },
+		Error: onError,
+	}); err != nil && ctx.Err() == nil {
 		log.Printf("trace: log stream stopped: %v", err)
 	}
 }
 
-func (c *traceCollector) noteCoreRestart(asm *sessionasm.Assembler) {
+// noteStreamOpen records that subscription epoch was accepted. A hook of a
+// subscription that has since been replaced changes nothing.
+func (c *traceCollector) noteStreamOpen(epoch uint64) {
+	c.mu.Lock()
+	if c.streamEpoch != epoch {
+		c.mu.Unlock()
+		return
+	}
+	c.streamOpen, c.streamOpened = true, true
+	c.streamDownSince, c.streamErr = time.Time{}, ""
+	c.mu.Unlock()
+	c.evaluateStream()
+}
+
+// noteStreamError records a disconnect or a refusal of subscription epoch.
+// The grace runs from the first failure after the stream was last up.
+func (c *traceCollector) noteStreamError(epoch uint64, err error) {
+	now := c.clock()
+	c.mu.Lock()
+	c.observationGaps++
+	if c.streamEpoch != epoch {
+		c.mu.Unlock()
+		return
+	}
+	c.streamOpen = false
+	if c.streamDownSince.IsZero() {
+		c.streamDownSince = now
+	}
+	c.streamErr = err.Error()
+	c.mu.Unlock()
+	c.evaluateStream()
+}
+
+// noteCoreRestart moves the generation on. guard may be nil in tests; when
+// set, its shed marks are forgotten, because the new process draws its log
+// ids afresh.
+func (c *traceCollector) noteCoreRestart(asm *sessionasm.Assembler, guard *traceshed.Guard) {
 	c.mu.Lock()
 	c.generation++
 	generation := c.generation
 	c.coreStart = time.Now().UTC()
+	coreStart := c.coreStart
 	sh := c.shipper
 	c.mu.Unlock()
 	asm.CoreRestart(generation, time.Now().UTC())
+	if guard != nil {
+		guard.Reset()
+	}
 	if sh != nil {
-		sh.SetCore(generation, c.coreStart)
+		sh.SetCore(generation, coreStart)
 	}
 }
 
-func (c *traceCollector) pollConnections(ctx context.Context, client *singboxapi.Client, asm *sessionasm.Assembler) {
+func (c *traceCollector) pollConnections(ctx context.Context, client *singboxapi.Client, asm *sessionasm.Assembler, guard *traceshed.Guard) {
 	ticker := time.NewTicker(traceConnectionsPoll)
 	defer ticker.Stop()
 	for {
@@ -591,19 +929,33 @@ func (c *traceCollector) pollConnections(ctx context.Context, client *singboxapi
 		case <-ticker.C:
 		}
 		snap, err := client.Connections(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		c.mu.Lock()
+		if c.client != client {
+			// This poll belongs to a pipeline that was replaced.
+			c.mu.Unlock()
+			return
+		}
 		if err != nil {
+			c.connPollFailures++
+			c.connErr = err.Error()
+			c.mu.Unlock()
+			c.evaluateStream()
 			continue
 		}
+		c.connPollFailures, c.connErr = 0, ""
 		// Cumulative totals are monotonic within one sing-box process, so a
 		// decrease is a new process answering. This is the restart signal:
 		// it fires on a fast restart the stream never noticed, and does not
 		// fire on a stall that merely interrupted observation.
-		c.mu.Lock()
 		regressed := c.sawTotals && (snap.UploadTotal < c.lastUpload || snap.DownloadTotal < c.lastDownload)
 		c.lastUpload, c.lastDownload, c.sawTotals = snap.UploadTotal, snap.DownloadTotal, true
 		c.mu.Unlock()
+		c.evaluateStream()
 		if regressed {
-			c.noteCoreRestart(asm)
+			c.noteCoreRestart(asm, guard)
 		}
 		items := make([]sessionasm.SnapshotItem, 0, len(snap.Connections))
 		for _, conn := range snap.Connections {
@@ -627,7 +979,7 @@ func (c *traceCollector) pollConnections(ctx context.Context, client *singboxapi
 	}
 }
 
-func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Assembler, sh *traceship.Shipper) {
+func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Assembler, sh *traceship.Shipper, guard *traceshed.Guard) {
 	ticker := time.NewTicker(traceAssemblerTick)
 	defer ticker.Stop()
 	for {
@@ -659,11 +1011,16 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 			// The assembler keeps its own loss counters and nothing was
 			// reading them, so bounded eviction and suppressed partial records
 			// were invisible: the server's gap audit could report zero loss
-			// while connections had been discarded. Forward the deltas.
+			// while connections had been discarded. Forward the deltas, with
+			// the guard's: lines over the hard ceiling or id-less over budget
+			// go to dropped, shed connections to AddShed (which also counts
+			// them as dropped for a server that predates the field).
 			asmStats := asm.Stats()
+			shed, dropped := guard.Take()
 			c.mu.Lock()
-			unparsed, dropped := c.unparsed, c.dropped
-			c.unparsed, c.dropped = 0, 0
+			unparsed := c.unparsed
+			c.unparsed = 0
+			c.shedTotal += shed
 			if d := asmStats.Dropped - c.lastAsmDropped; d > 0 {
 				dropped += d
 				c.lastAsmDropped = asmStats.Dropped
@@ -676,12 +1033,11 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 				c.lastAsmPartial = asmStats.Partial
 			}
 			c.mu.Unlock()
-			if unparsed > 0 {
-				sh.AddUnparsed(unparsed)
-			}
-			if dropped > 0 {
-				sh.AddDropped(dropped)
-			}
+			sh.AddUnparsed(unparsed)
+			sh.AddDropped(dropped)
+			sh.AddShed(shed)
+			// The grace for a dropped stream expires on this tick.
+			c.evaluateStream()
 		}
 	}
 }
@@ -690,7 +1046,7 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 // never sends it: for an adopted node the management script writes a 0600 file,
 // and for a managed node the token lives in the rendered sing-box config, which
 // is already handled as a node-scoped secret-bearing artifact.
-func resolveClashSecret(secretPath string, cfg agentConfig) (string, error) {
+func resolveClashSecret(secretPath, configPath string) (string, error) {
 	if secretPath != "" {
 		b, err := os.ReadFile(secretPath)
 		if err == nil {
@@ -705,29 +1061,49 @@ func resolveClashSecret(secretPath string, cfg agentConfig) (string, error) {
 			return strings.TrimSpace(string(b)), nil
 		}
 	}
-	secret, err := clashSecretFromConfig("/etc/sing-box/config.json")
+	api, err := readClashAPIConfig(configPath)
 	if err != nil {
 		return "", fmt.Errorf("no Clash API secret found in %s or the sing-box config: %w", secretPath, err)
 	}
-	return secret, nil
+	return api.Secret, nil
 }
 
-func clashSecretFromConfig(path string) (string, error) {
+// clashAPIConfig is experimental.clash_api as the node's sing-box config has it.
+type clashAPIConfig struct {
+	// Present is whether the config has an experimental.clash_api object.
+	Present    bool
+	Controller string
+	Secret     string
+}
+
+// readClashAPIConfig reads experimental.clash_api.{external_controller,secret}
+// in one parse. Discovery uses the controller and the secret fallback the
+// secret. The error never carries the file's contents.
+func readClashAPIConfig(path string) (clashAPIConfig, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return clashAPIConfig{}, err
 	}
 	var parsed struct {
 		Experimental struct {
-			ClashAPI struct {
-				Secret string `json:"secret"`
+			ClashAPI *struct {
+				ExternalController string `json:"external_controller"`
+				Secret             string `json:"secret"`
 			} `json:"clash_api"`
 		} `json:"experimental"`
 	}
 	if err := json.Unmarshal(b, &parsed); err != nil {
-		return "", err
+		return clashAPIConfig{}, err
 	}
-	return strings.TrimSpace(parsed.Experimental.ClashAPI.Secret), nil
+	api := parsed.Experimental.ClashAPI
+	if api == nil {
+		return clashAPIConfig{}, nil
+	}
+	return clashAPIConfig{
+		Present:    true,
+		Controller: strings.TrimSpace(api.ExternalController),
+		Secret:     strings.TrimSpace(api.Secret),
+	}, nil
 }
 
 func fetchTraceConfig(cfg agentConfig) (model.TraceAgentConfig, error) {
@@ -768,6 +1144,7 @@ func (c *traceCollector) flushRaw() {
 	}
 	lines := c.rawQueue
 	dropped := c.rawDropped
+	epoch := c.rawEpoch
 	cfg := c.cfg
 	c.mu.Unlock()
 
@@ -782,8 +1159,12 @@ func (c *traceCollector) flushRaw() {
 		return
 	}
 	c.mu.Lock()
-	c.rawQueue = c.rawQueue[len(lines):]
-	c.rawDropped = 0
+	// A raw switch turned off while this was on the wire discarded the
+	// queue; what is there now is not what was shipped.
+	if c.rawEpoch == epoch {
+		c.rawQueue = c.rawQueue[len(lines):]
+		c.rawDropped = 0
+	}
 	c.mu.Unlock()
 }
 

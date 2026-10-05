@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // Keepalive: the heartbeat runs on its own goroutine and carries the work
@@ -268,16 +270,31 @@ type heartbeat struct {
 	// witnessStatus returns the witness status file to relay, or nil when
 	// this node runs no witness.
 	witnessStatus func() *witnessRelay
-	timeout       time.Duration
-	post          func(ctx context.Context, cfg agentConfig, payload map[string]any) error
-	startOnce     sync.Once
+	// traceStatus returns the trace collector's status, or nil before the
+	// collector has applied a policy. It is set once the collector exists,
+	// which can be after the beat started (the recovery-blocked start), so
+	// it is read and written under mu.
+	traceStatus func() *model.CollectorStatus
+	// nudge asks for a beat now rather than at the next tick; nudgeMinGap is
+	// the least time between two beats a nudge may cause.
+	nudge       chan struct{}
+	nudgeMinGap time.Duration
+	timeout     time.Duration
+	post        func(ctx context.Context, cfg agentConfig, payload map[string]any) error
+	startOnce   sync.Once
 }
+
+// heartbeatNudgeMinGap keeps a flapping state from turning the beat into a
+// stream of posts: at most one nudged beat per second.
+const heartbeatNudgeMinGap = time.Second
 
 func newHeartbeat(cfg agentConfig, health *loopHealth) *heartbeat {
 	return &heartbeat{
-		cfg:     cfg,
-		health:  health,
-		timeout: heartbeatTimeout,
+		cfg:         cfg,
+		health:      health,
+		nudge:       make(chan struct{}, 1),
+		nudgeMinGap: heartbeatNudgeMinGap,
+		timeout:     heartbeatTimeout,
 		witnessStatus: func() *witnessRelay {
 			return readWitnessStatus(witnessStatusPath(), time.Now())
 		},
@@ -301,6 +318,22 @@ func (b *heartbeat) config() agentConfig {
 	return b.cfg
 }
 
+// setTraceStatus hands the heartbeat the trace collector's status func.
+func (b *heartbeat) setTraceStatus(fn func() *model.CollectorStatus) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.traceStatus = fn
+}
+
+// nudgeNow asks for a beat as soon as the minimum gap allows. It never
+// blocks: a nudge already pending covers this one.
+func (b *heartbeat) nudgeNow() {
+	select {
+	case b.nudge <- struct{}{}:
+	default:
+	}
+}
+
 // once sends one beat under its own deadline.
 func (b *heartbeat) once(ctx context.Context) error {
 	defer b.health.beat()
@@ -319,6 +352,17 @@ func (b *heartbeat) once(ctx context.Context) error {
 			payload["witness"] = ws
 		}
 	}
+	// "trace_collector" is omitted until the collector exists and has
+	// decided a state; it is never sent as a placeholder "off". Older
+	// servers decode the beat leniently and ignore it.
+	b.mu.Lock()
+	traceStatus := b.traceStatus
+	b.mu.Unlock()
+	if traceStatus != nil {
+		if st := traceStatus(); st != nil {
+			payload["trace_collector"] = st
+		}
+	}
 	beatCtx, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 	return b.post(beatCtx, cfg, payload)
@@ -334,7 +378,8 @@ func (b *heartbeat) start(ctx context.Context) {
 	})
 }
 
-// run beats at once and then every interval until ctx ends.
+// run beats at once and then every interval until ctx ends. A nudge beats
+// early, but never sooner than nudgeMinGap after the previous beat started.
 func (b *heartbeat) run(ctx context.Context) {
 	interval := b.config().Interval
 	if interval <= 0 {
@@ -343,6 +388,7 @@ func (b *heartbeat) run(ctx context.Context) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
+		started := time.Now()
 		if err := b.once(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("metrics error: %v", err)
 		}
@@ -350,6 +396,16 @@ func (b *heartbeat) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-b.nudge:
+			if wait := b.nudgeMinGap - time.Since(started); wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
 		}
 	}
 }

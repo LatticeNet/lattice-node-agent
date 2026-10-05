@@ -50,11 +50,17 @@ var ErrStreamClosed = errors.New("singboxapi: log stream closed by peer")
 // when ctx is cancelled, and an error otherwise. The response body is closed on
 // every path.
 func (c *Client) StreamLogs(ctx context.Context, level string, fn func(entry []byte)) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	if fn == nil {
 		return fmt.Errorf("singboxapi: StreamLogs requires a callback")
+	}
+	return c.streamLogs(ctx, level, fn, nil)
+}
+
+// streamLogs is StreamLogs with an optional onOpen, called once the peer has
+// answered the subscription with a 2xx and before the first entry is read.
+func (c *Client) streamLogs(ctx context.Context, level string, fn func(entry []byte), onOpen func()) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	query := url.Values{}
 	query.Set("level", normalizeLevel(level))
@@ -74,6 +80,11 @@ func (c *Client) StreamLogs(ctx context.Context, level string, fn func(entry []b
 	// Close only. Draining is deliberate elsewhere but wrong here: the body is
 	// unbounded, so a drain would block until the peer went away.
 	defer resp.Body.Close()
+	if onOpen != nil {
+		// do has already refused anything but a 2xx, so this is the peer
+		// accepting the subscription, not merely a connection being made.
+		onOpen()
+	}
 
 	reader := bufio.NewReaderSize(resp.Body, logReadBufferBytes)
 	for {
@@ -158,24 +169,48 @@ func normalizeLevel(level string) string {
 	return level
 }
 
-// StreamLogsWithRetry runs StreamLogs and reconnects until ctx is done.
+// StreamHooks are the callbacks StreamLogsWithHooks drives. Entry is
+// required; Open and Error may be nil.
+type StreamHooks struct {
+	// Entry receives each entry, exactly as the fn of StreamLogs does.
+	Entry func(entry []byte)
+	// Open is called each time a subscription is accepted with a 2xx, on the
+	// first connect and after every reconnect. It is the only positive signal
+	// that the stream is up: an Error that is never followed by an Open means
+	// the API keeps refusing.
+	Open func()
+	// Error is called for every disconnect and every refused attempt,
+	// including a clean close by the peer, which arrives as ErrStreamClosed.
+	Error func(error)
+}
+
+// StreamLogsWithRetry runs StreamLogs and reconnects until ctx is done. It is
+// StreamLogsWithHooks without an Open hook.
+func (c *Client) StreamLogsWithRetry(ctx context.Context, level string, fn func(entry []byte), onError func(error)) error {
+	if fn == nil {
+		return fmt.Errorf("singboxapi: StreamLogsWithRetry requires a callback")
+	}
+	return c.StreamLogsWithHooks(ctx, level, StreamHooks{Entry: fn, Error: onError})
+}
+
+// StreamLogsWithHooks runs StreamLogs and reconnects until ctx is done.
 //
 // A sing-box restart drops the stream, and the agent has to come back on its
-// own. That recovery is also the signal used to detect the restart, so onError
-// is called for every disconnect, including a clean close by the peer, which
-// arrives as ErrStreamClosed. onError may be nil.
+// own. That recovery is also the signal used to detect the restart, so
+// h.Error is called for every disconnect, including a clean close by the peer,
+// which arrives as ErrStreamClosed, and h.Open for every accepted subscription.
 //
 // Backoff is exponential from backoffBase to backoffMax with jitter, and resets
 // once a stream has stayed up for backoffResetAfter. Without that reset a node
 // that flaps every few minutes would creep to the maximum delay and stay there.
 //
 // It returns only when ctx is done, with ctx.Err().
-func (c *Client) StreamLogsWithRetry(ctx context.Context, level string, fn func(entry []byte), onError func(error)) error {
+func (c *Client) StreamLogsWithHooks(ctx context.Context, level string, h StreamHooks) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if fn == nil {
-		return fmt.Errorf("singboxapi: StreamLogsWithRetry requires a callback")
+	if h.Entry == nil {
+		return fmt.Errorf("singboxapi: StreamLogsWithHooks requires an entry callback")
 	}
 	attempt := 0
 	for {
@@ -183,15 +218,15 @@ func (c *Client) StreamLogsWithRetry(ctx context.Context, level string, fn func(
 			return ctxErr
 		}
 		startedAt := time.Now()
-		err := c.StreamLogs(ctx, level, fn)
+		err := c.streamLogs(ctx, level, h.Entry, h.Open)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		if err == nil {
 			err = ErrStreamClosed
 		}
-		if onError != nil {
-			onError(err)
+		if h.Error != nil {
+			h.Error(err)
 		}
 		// A stream that stayed up long enough counts as healthy, so the next
 		// failure starts from the bottom of the ladder again.

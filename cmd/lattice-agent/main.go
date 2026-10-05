@@ -498,6 +498,10 @@ func main() {
 	// control socket, which is how a pushed trace policy reaches the collector.
 	traceCollector := newTraceCollector(cfg)
 	defer traceCollector.stop()
+	// The collector's status rides the metrics beat, and a state change
+	// beats at once instead of waiting up to one interval.
+	traceCollector.setOnStateChange(beat.nudgeNow)
+	beat.setTraceStatus(traceCollector.Status)
 	if cfg.AllowTerminal {
 		// The control socket is shared, so a pushed trace policy arrives here.
 		// It is the same path the poll takes, just without the wait.
