@@ -5,7 +5,65 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## 0.3.10-alpha.3 (unreleased)
+## 0.3.10-alpha.4 (unreleased)
+
+Prerelease. Changes since v0.3.10-alpha.3. Design 26, slice R1: the trace
+collector says whether it is really collecting, raw lines have their own
+switch, and the budget sheds whole connections instead of cutting lines.
+
+Clash API discovery and collector status:
+
+- When the trace policy names no Clash API address, the collector reads
+  `experimental.clash_api.external_controller` from
+  `/etc/sing-box/config.json` on every poll and uses it only if it passes the
+  same loopback rule the Clash API client enforces (`localhost` or a loopback
+  literal, `host:port`, no URL). A policy address still wins. `sb api on` on
+  the node is picked up at the next poll without restarting the agent.
+- The metrics beat carries `trace_collector` (lattice-sdk
+  `model.CollectorStatus`): `state` is `off`, `ready`, `no_clash_api`,
+  `secret_unreadable` or `stream_failing`, with `since`, the address in use
+  and where it came from (`policy` or `config`), a detail line of at most 256
+  bytes saying why it is not ready (it never carries the secret), whether raw
+  lines are flowing, parsed lines per second over the last 10 s, the budget
+  in force, and the cumulative shed connections and unparsed lines. The key
+  is left out until the collector has applied a policy. A state change beats
+  at once (at most one nudged beat per second) instead of waiting for the
+  next interval.
+- `ready` means the `/logs` subscription was accepted and `/connections`
+  answers. A subscription refused before it ever opened is `stream_failing`
+  at once; one that drops after it was up stays `ready` for 15 s (a sing-box
+  restart is back well inside that), and three consecutive `/connections`
+  failures are `stream_failing` too.
+
+Raw lines:
+
+- Raw sing-box lines go to the `singbox://<node>` source only when the
+  server names `raw_source_id` and the policy's `raw.enabled` is not false.
+  A policy without `raw` (every server up to alpha-0.2.2a117) keeps the
+  previous behaviour. Turning raw off discards the raw lines still queued, so
+  none ships on a later flush.
+
+Connection shedding:
+
+- The budget is now a CPU guard in parsed lines per second, default 5,000
+  (a policy budget of 0 means this default). Over it, a connection first seen
+  in that second is shed whole: none of its lines reach the assembler, and
+  connections already being assembled keep every line, so the budget never
+  produces a partial record. A shed connection is counted once, as
+  `shed_connections` on the trace batch and also inside `dropped`, so an
+  older server still audits the gap. Up to 65,536 shed ids are remembered; a
+  sing-box restart forgets them. Lines without a connection id over budget
+  are dropped and counted as before.
+- A hard ceiling of four times the budget per second still drops entries
+  before they are parsed, counted into `dropped`.
+
+Compatibility: no new server or dashboard floor. Against alpha-0.2.2a117 the
+new beat key and batch field are ignored by its lenient decoders, raw lines
+follow `raw_source_id` as before, and a117's explicit budget of 500 is applied
+as a parsed-line budget. lattice-sdk pinned at
+`v0.2.24-0.20261005113750-cae46247ddb6`.
+
+## 0.3.10-alpha.3 (2026-10-04)
 
 Prerelease. Changes since v0.3.10-alpha.2.
 
