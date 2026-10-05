@@ -398,3 +398,195 @@ func TestStreamLogsRequiresCallback(t *testing.T) {
 		t.Error("StreamLogsWithRetry accepted a nil callback")
 	}
 }
+
+// The Open hook is the collector's only positive signal that the stream is up,
+// so it must not fire for a refused subscription. Here the API refuses twice
+// with 401 and then accepts: two Errors, no Open, then exactly one Open before
+// the first entry.
+func TestOpenHookFiresOnlyAfterA2xx(t *testing.T) {
+	var attempts atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) <= 2 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = fmt.Fprintln(w, `{"type":"info","payload":"up"}`)
+		flush(t, w)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	client := newTestClient(t, srv)
+	client.backoffBase = time.Millisecond
+	client.backoffMax = 2 * time.Millisecond
+	client.jitter = func() float64 { return 1 }
+
+	events := make(chan string, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.StreamLogsWithHooks(ctx, "info", StreamHooks{
+			Entry: func(entry []byte) { events <- "entry" },
+			Open:  func() { events <- "open" },
+			Error: func(err error) {
+				if !strings.Contains(err.Error(), "401") {
+					t.Errorf("refusal reported as %v, want the 401", err)
+				}
+				events <- "error"
+			},
+		})
+	}()
+
+	var got []string
+	for len(got) < 4 {
+		select {
+		case ev := <-events:
+			got = append(got, ev)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out; events so far %v", got)
+		}
+	}
+	if want := []string{"error", "error", "open", "entry"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StreamLogsWithHooks returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamLogsWithHooks did not return after cancel")
+	}
+}
+
+// StreamLogsWithRetry is now a wrapper over StreamLogsWithHooks with no Open
+// hook. Its contract is unchanged: entries arrive and every refusal reaches
+// onError.
+func TestStreamLogsWithRetryStillWorksWithoutHooks(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprintln(w, `{"type":"info","payload":"after-refusal"}`)
+		flush(t, w)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, srv)
+	client.backoffBase = time.Millisecond
+	client.backoffMax = 2 * time.Millisecond
+	client.jitter = func() float64 { return 1 }
+
+	entries := make(chan string, 4)
+	errs := make(chan error, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = client.StreamLogsWithRetry(ctx, "info",
+			func(entry []byte) { entries <- string(entry) },
+			func(err error) { errs <- err })
+	}()
+	select {
+	case err := <-errs:
+		if !strings.Contains(err.Error(), "503") {
+			t.Fatalf("onError got %v, want the 503", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refused attempt never reached onError")
+	}
+	expectEntry(t, entries, `{"type":"info","payload":"after-refusal"}`)
+}
+
+// A subscription the peer accepts at the TCP level but never answers must not
+// hang forever: the first answer has a deadline, the hang reaches the Error
+// hook, Open never fires, and the retry loop goes on.
+func TestStreamOpenDeadlineEndsAHungSubscription(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		<-r.Context().Done() // never writes a header
+	}))
+	defer srv.Close()
+
+	client, err := New(Config{Addr: addrOf(t, srv), HTTPClient: srv.Client(), StreamOpenTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.backoffBase = time.Millisecond
+	client.backoffMax = 2 * time.Millisecond
+	client.jitter = func() float64 { return 1 }
+
+	errs := make(chan error, 16)
+	var opened atomic.Bool
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.StreamLogsWithHooks(ctx, "info", StreamHooks{
+			Entry: func([]byte) {},
+			Open:  func() { opened.Store(true) },
+			Error: func(err error) { errs <- err },
+		})
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if !strings.Contains(err.Error(), "no answer within") {
+				t.Fatalf("hang reported as %v, want the first-answer deadline", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a hung subscription never reached the Error hook")
+		}
+	}
+	if opened.Load() {
+		t.Fatal("Open fired for a subscription that never answered")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StreamLogsWithHooks returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamLogsWithHooks did not return after cancel")
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("attempts = %d, want the retry loop to go on after the deadline", attempts.Load())
+	}
+}
+
+// The deadline covers the first answer only: a stream that answered and then
+// stays quiet for longer than the deadline is still open.
+func TestStreamOpenDeadlineDoesNotBoundAnOpenStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flush(t, w)
+		select {
+		case <-time.After(300 * time.Millisecond):
+			_, _ = fmt.Fprintln(w, `{"type":"info","payload":"late"}`)
+			flush(t, w)
+		case <-r.Context().Done():
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	client, err := New(Config{Addr: addrOf(t, srv), HTTPClient: srv.Client(), StreamOpenTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = client.StreamLogs(ctx, "info", func(entry []byte) { entries <- string(entry) })
+	}()
+	expectEntry(t, entries, `{"type":"info","payload":"late"}`)
+}

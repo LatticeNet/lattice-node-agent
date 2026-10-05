@@ -122,6 +122,10 @@ type Shipper struct {
 	droppedTotal  uint64
 	unparsed      uint64
 	unparsedTotal uint64
+	// shed is the part of dropped that is whole connections the collector's
+	// budget refused to observe. It is always also in dropped, and travels as
+	// the batch's ShedConnections.
+	shed uint64
 
 	shippedRecords uint64
 	shippedLines   uint64
@@ -228,6 +232,21 @@ func (s *Shipper) AddDropped(n uint64) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dropped += n
+	s.droppedTotal += n
+}
+
+// AddShed counts connections the collector's budget shed whole: their lines
+// were never parsed into a record. Each one is also added to dropped, so a
+// server that predates TraceBatch.ShedConnections still sees the gap and
+// audits it; a newer server can tell connections from lines.
+func (s *Shipper) AddShed(n uint64) {
+	if n == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shed += n
 	s.dropped += n
 	s.droppedTotal += n
 }
@@ -348,16 +367,17 @@ func (s *Shipper) takeBatch() (model.TraceBatch, bool) {
 	recordN, lineN = s.trimToByteBudget(recordN, lineN)
 	// An empty batch is still worth sending when counters are owed: drops that
 	// stopped the flow entirely would otherwise never be reported.
-	if recordN == 0 && lineN == 0 && s.dropped == 0 && s.unparsed == 0 {
+	if recordN == 0 && lineN == 0 && s.dropped == 0 && s.unparsed == 0 && s.shed == 0 {
 		return model.TraceBatch{}, false
 	}
 	batch := model.TraceBatch{
-		NodeID:         s.nodeID,
-		CoreGeneration: s.coreGeneration,
-		CoreStartedAt:  s.coreStartedAt,
-		Dropped:        s.dropped,
-		Unparsed:       s.unparsed,
-		CapturedAt:     now.UTC(),
+		NodeID:          s.nodeID,
+		CoreGeneration:  s.coreGeneration,
+		CoreStartedAt:   s.coreStartedAt,
+		Dropped:         s.dropped,
+		ShedConnections: s.shed,
+		Unparsed:        s.unparsed,
+		CapturedAt:      now.UTC(),
 	}
 	if recordN > 0 {
 		s.inflightRecords = append([]model.ConnRecord(nil), s.records[:recordN]...)
@@ -401,6 +421,7 @@ func (s *Shipper) commit(batch model.TraceBatch) {
 	s.inflightRecords = nil
 	s.inflightLines = nil
 	s.dropped = saturatingSub(s.dropped, batch.Dropped)
+	s.shed = saturatingSub(s.shed, batch.ShedConnections)
 	s.unparsed = saturatingSub(s.unparsed, batch.Unparsed)
 	s.shippedBatches++
 	s.lastSuccess = s.now().UTC()
