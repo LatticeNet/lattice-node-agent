@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/sessionasm"
@@ -54,6 +57,11 @@ const (
 	// traceConnPollFailLimit consecutive /connections failures (15 s at the
 	// poll interval) report stream_failing even while /logs is open.
 	traceConnPollFailLimit = 3
+	// traceDiscoveryFailLimit consecutive polls that could not read or parse
+	// the sing-box config, while a pipeline built from it is running, report
+	// no_clash_api. The pipeline keeps running: a config caught mid-rewrite
+	// is not a reason to drop the connections being assembled.
+	traceDiscoveryFailLimit = traceConnPollFailLimit
 	// traceLinesWindow is the window, in whole seconds, that LinesPerSec
 	// averages over.
 	traceLinesWindow = 10
@@ -61,6 +69,12 @@ const (
 	// both put the node's sing-box config. Discovery reads the Clash API
 	// address from it and the secret fallback reads the secret.
 	defaultSingBoxConfigPath = "/etc/sing-box/config.json"
+	// defaultClashSecretPath is where `sb api on` writes the Clash API secret
+	// (root:root 0600) when the policy names no secret path.
+	defaultClashSecretPath = "/etc/sing-box/lattice-clash-api.secret"
+	// nodeFileMaxBytes caps a config or secret read. A sing-box config is a
+	// few kilobytes; anything past this is not one.
+	nodeFileMaxBytes = 1 << 20
 )
 
 type traceCollector struct {
@@ -167,9 +181,22 @@ type traceCollector struct {
 	// connPollFailures counts consecutive /connections failures.
 	connPollFailures int
 	connErr          string
-	// lineSecs and lineCounts are a ring of parsed lines per wall second, for
-	// LinesPerSec. One slot more than the window, so the second in progress
-	// never overwrites the oldest second the window still counts.
+	// discoveryFailures counts consecutive polls whose config read or parse
+	// failed while a pipeline was running without a policy address, and
+	// discoveryErr is the last such detail.
+	discoveryFailures int
+	discoveryErr      string
+	// secretHash is the SHA-256 of the bearer secret the client holds, so a
+	// rotated secret is noticed without keeping a second copy of it.
+	secretHash [sha256.Size]byte
+	// fallbackSecretPath and streamOpenTimeout are fields so tests can point
+	// them at a temporary file and shorten the wait.
+	fallbackSecretPath string
+	streamOpenTimeout  time.Duration
+	// lineSecs and lineCounts are a ring of lines arriving per wall second,
+	// counted before the pre-parse ceiling, for LinesPerSec. One slot more
+	// than the window, so the second in progress never overwrites the oldest
+	// second the window still counts.
 	lineSecs   [traceLinesWindow + 1]int64
 	lineCounts [traceLinesWindow + 1]uint32
 	// The cumulative counters the status reports, since countersSince.
@@ -217,14 +244,15 @@ const (
 func newTraceCollector(cfg agentConfig) *traceCollector {
 	start := time.Now().UTC()
 	return &traceCollector{
-		cfg:           cfg,
-		generation:    1,
-		pending:       map[uint32][]model.TraceLine{},
-		tagged:        map[uint32][]string{},
-		configPath:    defaultSingBoxConfigPath,
-		now:           time.Now,
-		status:        model.CollectorStatus{State: model.CollectorOff, Since: start},
-		countersSince: start,
+		cfg:                cfg,
+		generation:         1,
+		pending:            map[uint32][]model.TraceLine{},
+		tagged:             map[uint32][]string{},
+		configPath:         defaultSingBoxConfigPath,
+		fallbackSecretPath: defaultClashSecretPath,
+		now:                time.Now,
+		status:             model.CollectorStatus{State: model.CollectorOff, Since: start},
+		countersSince:      start,
 	}
 }
 
@@ -285,6 +313,8 @@ func (c *traceCollector) evaluateStream() {
 	switch {
 	case c.connPollFailures >= traceConnPollFailLimit:
 		state, detail = model.CollectorStreamFailing, "connections: "+c.connErr
+	case c.discoveryFailures >= traceDiscoveryFailLimit:
+		state, detail = model.CollectorNoClashAPI, c.discoveryErr+"; the stream to "+c.addr+" keeps running"
 	case c.streamOpen:
 		state = model.CollectorReady
 	case !c.streamDownSince.IsZero() && now.Sub(c.streamDownSince) >= traceStreamGrace:
@@ -331,8 +361,8 @@ func (c *traceCollector) Status() *model.CollectorStatus {
 	return &st
 }
 
-// countParsedLocked adds one parsed line to the per-second ring.
-func (c *traceCollector) countParsedLocked(now time.Time) {
+// countLineLocked adds one arriving line to the per-second ring.
+func (c *traceCollector) countLineLocked(now time.Time) {
 	sec := now.Unix()
 	i := int(sec % int64(len(c.lineSecs)))
 	if c.lineSecs[i] != sec {
@@ -449,6 +479,7 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 	cfg := c.cfg
 	pipelineUp := c.runCancel != nil
 	running := c.addr
+	runningSource := c.status.AddrSource
 	have := c.haveLevel
 	c.mu.Unlock()
 
@@ -462,11 +493,22 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 	}
 	// Discovery runs on every poll and every pushed config, so `sb api on`
 	// on the node is noticed without restarting the agent.
-	addr, source, detail := c.resolveAddr(agentCfg.Policy)
-	if addr == "" {
+	addr, source, detail, transient := c.resolveAddr(agentCfg.Policy)
+	switch {
+	case addr == "" && transient && pipelineUp:
+		// The config could not be read or parsed this time (a rewrite in
+		// progress, a permission slip). Only a config that was read and has
+		// no usable controller is an answer; this is not one, so the running
+		// pipeline and the connections it holds stay. noteDiscovery turns the
+		// state after traceDiscoveryFailLimit polls in a row.
+		addr, source = running, runningSource
+		c.noteDiscovery(detail)
+	case addr == "":
 		c.stop()
 		c.setStatus(model.CollectorNoClashAPI, detail, "", "")
 		return
+	default:
+		c.noteDiscovery("")
 	}
 	if pipelineUp && running != addr {
 		// A different Clash API means a different core. Nothing in flight
@@ -475,6 +517,7 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 		c.stop()
 		pipelineUp = false
 	}
+	resubscribe := false
 	if !pipelineUp {
 		if !c.startPipeline(ctx, cfg, addr, source, secretPath) {
 			return
@@ -486,8 +529,11 @@ func (c *traceCollector) applyConfig(ctx context.Context, agentCfg model.TraceAg
 		c.mu.Lock()
 		c.status.ClashAPIAddr, c.status.AddrSource = addr, source
 		c.mu.Unlock()
+		// A rotated secret, picked up while the stream is down, resubscribes
+		// at once instead of waiting out the retry backoff with the old one.
+		resubscribe = c.refreshSecret(secretPath)
 	}
-	if have == set.SubscribeLevel() {
+	if have == set.SubscribeLevel() && !resubscribe {
 		return
 	}
 	c.restartStream(cfg, set.SubscribeLevel(), len(set.ActiveSessions()))
@@ -540,13 +586,13 @@ func (c *traceCollector) setBudget(budget int) {
 // cannot be used at all, in which case nothing is left half-built and the
 // status says why.
 func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, addr, source, secretPath string) bool {
-	secret, err := resolveClashSecret(secretPath, c.configPath)
+	secret, err := resolveClashSecret(secretPath, c.fallbackSecretPath, c.configPath)
 	if err != nil {
 		log.Printf("trace: cannot read the Clash API secret: %v", err)
 		c.setStatus(model.CollectorSecretUnreadable, "cannot read the Clash API secret: "+err.Error(), addr, source)
 		return false
 	}
-	client, err := singboxapi.New(singboxapi.Config{Addr: addr, Secret: secret})
+	client, err := singboxapi.New(singboxapi.Config{Addr: addr, Secret: secret, StreamOpenTimeout: c.streamOpenTimeout})
 	if err != nil {
 		// Only a policy address can get here: discovery refuses a
 		// non-loopback controller by the same rule before it is used.
@@ -579,6 +625,7 @@ func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, add
 	c.addr = addr
 	c.status.ClashAPIAddr, c.status.AddrSource = addr, source
 	c.connPollFailures, c.connErr = 0, ""
+	c.secretHash = sha256.Sum256([]byte(strings.TrimSpace(secret)))
 	generation, coreStart := c.generation, c.coreStart
 	c.mu.Unlock()
 
@@ -594,10 +641,13 @@ func (c *traceCollector) startPipeline(ctx context.Context, cfg agentConfig, add
 // resolveAddr finds the Clash API address. The policy's address wins.
 // Otherwise the node's sing-box config is read, and its external_controller
 // is used only if it passes the same loopback rule the client enforces. With
-// no usable address, detail says why in one line that names the file.
-func (c *traceCollector) resolveAddr(pol model.TracePolicy) (addr, source, detail string) {
+// no usable address, detail says why in one line that names the file and
+// never quotes it. transient reports a failure to read or parse the config,
+// as opposed to a config that was read and has no usable controller: a file
+// caught mid-rewrite is the first kind, `sb api off` the second.
+func (c *traceCollector) resolveAddr(pol model.TracePolicy) (addr, source, detail string, transient bool) {
 	if a := strings.TrimSpace(pol.ClashAPIAddr); a != "" {
-		return a, model.ClashAddrFromPolicy, ""
+		return a, model.ClashAddrFromPolicy, "", false
 	}
 	path := c.configPath
 	api, err := readClashAPIConfig(path)
@@ -605,19 +655,57 @@ func (c *traceCollector) resolveAddr(pol model.TracePolicy) (addr, source, detai
 	case err != nil:
 		var pathErr *fs.PathError
 		if errors.As(err, &pathErr) {
-			return "", "", fmt.Sprintf("cannot read %s: %v", path, pathErr.Err)
+			return "", "", fmt.Sprintf("cannot read %s: %v", path, pathErr.Err), true
 		}
-		return "", "", fmt.Sprintf("cannot parse %s: %v", path, err)
+		return "", "", err.Error(), true
 	case !api.Present:
-		return "", "", fmt.Sprintf("no experimental.clash_api in %s", path)
+		return "", "", fmt.Sprintf("no experimental.clash_api in %s", path), false
 	case api.Controller == "":
-		return "", "", fmt.Sprintf("experimental.clash_api in %s has no external_controller", path)
+		return "", "", fmt.Sprintf("experimental.clash_api in %s has no external_controller", path), false
 	}
 	normalized, err := singboxapi.ValidateLoopbackAddr(api.Controller)
 	if err != nil {
-		return "", "", fmt.Sprintf("external_controller %q in %s is not a loopback host:port", api.Controller, path)
+		return "", "", fmt.Sprintf("external_controller %q in %s is not a loopback host:port", api.Controller, path), false
 	}
-	return normalized, model.ClashAddrFromConfig, ""
+	return normalized, model.ClashAddrFromConfig, "", false
+}
+
+// noteDiscovery records the outcome of one config read for a running
+// pipeline: failed with detail, or succeeded when detail is empty. The
+// pipeline stays up either way; evaluateStream turns the state to
+// no_clash_api once traceDiscoveryFailLimit reads in a row have failed.
+func (c *traceCollector) noteDiscovery(detail string) {
+	c.mu.Lock()
+	if detail == "" {
+		c.discoveryFailures, c.discoveryErr = 0, ""
+	} else {
+		c.discoveryFailures++
+		c.discoveryErr = detail
+	}
+	c.mu.Unlock()
+	c.evaluateStream()
+}
+
+// refreshSecret re-reads the Clash API secret for a running pipeline and
+// reports whether the caller should resubscribe. A changed secret is handed
+// to the client only while the subscription is not open: an open one proves
+// the core still holds the secret in use, and a core reads its secret only
+// when it starts, so the new one is wanted once the stream has dropped. A
+// read failure changes nothing; the next poll reads again.
+func (c *traceCollector) refreshSecret(secretPath string) bool {
+	secret, err := resolveClashSecret(secretPath, c.fallbackSecretPath, c.configPath)
+	if err != nil {
+		return false
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(secret)))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if sum == c.secretHash || c.client == nil || c.streamOpen {
+		return false
+	}
+	c.client.SetSecret(secret)
+	c.secretHash = sum
+	return true
 }
 
 // restartStream reopens the /logs subscription at a new level, leaving the
@@ -670,6 +758,8 @@ func (c *traceCollector) stop() {
 	c.streamOpen, c.streamOpened = false, false
 	c.streamDownSince, c.streamErr = time.Time{}, ""
 	c.connPollFailures, c.connErr = 0, ""
+	c.discoveryFailures, c.discoveryErr = 0, ""
+	c.secretHash = [sha256.Size]byte{}
 	c.mu.Unlock()
 
 	if streamCancel != nil {
@@ -722,12 +812,17 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 		// shipper, so a silently discarded line never reads as a quiet
 		// network. The budget behind it is live, so a policy that changes
 		// only the budget takes effect on the running stream.
+		//
+		// The rate is counted first, so LinesPerSec is what sing-box sends,
+		// not what the ceiling lets through; the lines over the ceiling are
+		// in dropped.
+		c.mu.Lock()
+		c.countLineLocked(now)
+		c.mu.Unlock()
 		if !guard.Ceiling(now) {
 			return
 		}
 		line, err := singboxlog.ParseEntry(entry, now)
-		c.mu.Lock()
-		c.countParsedLocked(now)
 		if err != nil || !line.Parsed() {
 			// Every unrecognised line counts, with or without a connection id.
 			// A newer sing-box can reword a message while keeping the
@@ -735,10 +830,11 @@ func (c *traceCollector) streamLogs(ctx context.Context, client *singboxapi.Clie
 			// id-less ones would let that drift read as quiet traffic. It is
 			// counted before the guard decides, so the parser signal does not
 			// depend on the budget.
+			c.mu.Lock()
 			c.unparsed++
 			c.unparsedTotal++
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 		if err != nil {
 			return
 		}
@@ -1046,9 +1142,15 @@ func (c *traceCollector) driveAssembler(ctx context.Context, asm *sessionasm.Ass
 // never sends it: for an adopted node the management script writes a 0600 file,
 // and for a managed node the token lives in the rendered sing-box config, which
 // is already handled as a node-scoped secret-bearing artifact.
-func resolveClashSecret(secretPath, configPath string) (string, error) {
+//
+// The policy's secret path is tried first, then fallbackPath, then the config.
+// A missing file falls through to the next; so does a fallback file the agent
+// may not open (a non-root agent beside a root-only secret), as before. A file
+// that is there and fails readNodeFile's checks is refused, never skipped
+// silently, so a secret anyone can rewrite is never used.
+func resolveClashSecret(secretPath, fallbackPath, configPath string) (string, error) {
 	if secretPath != "" {
-		b, err := os.ReadFile(secretPath)
+		b, err := readNodeFile(secretPath, true)
 		if err == nil {
 			return strings.TrimSpace(string(b)), nil
 		}
@@ -1056,9 +1158,13 @@ func resolveClashSecret(secretPath, configPath string) (string, error) {
 			return "", err
 		}
 	}
-	for _, path := range []string{"/etc/sing-box/lattice-clash-api.secret"} {
-		if b, err := os.ReadFile(path); err == nil {
+	if fallbackPath != "" {
+		b, err := readNodeFile(fallbackPath, true)
+		if err == nil {
 			return strings.TrimSpace(string(b)), nil
+		}
+		if !os.IsNotExist(err) && !errors.Is(err, fs.ErrPermission) {
+			return "", err
 		}
 	}
 	api, err := readClashAPIConfig(configPath)
@@ -1066,6 +1172,64 @@ func resolveClashSecret(secretPath, configPath string) (string, error) {
 		return "", fmt.Errorf("no Clash API secret found in %s or the sing-box config: %w", secretPath, err)
 	}
 	return api.Secret, nil
+}
+
+// nodeFileError refuses a config or secret file for what it is rather than
+// for whether it can be opened. Its text is fixed and names the path; it never
+// carries a byte of the file.
+type nodeFileError struct {
+	path   string
+	reason string
+}
+
+func (e *nodeFileError) Error() string { return e.path + " " + e.reason }
+
+// readNodeFile reads a sing-box config or Clash API secret the way a file that
+// gates a bearer token should be read. O_NOFOLLOW refuses a symlink at the
+// last component and O_NONBLOCK keeps a FIFO from blocking the open; the
+// checks then run on the open descriptor, so the file cannot be swapped
+// between check and read. It must be a regular file owned by root or the
+// agent's own uid, writable by nobody else, and, for a secret, readable by
+// nobody else either. At most nodeFileMaxBytes are read. A missing file
+// returns the *fs.PathError from open, so os.IsNotExist still works.
+func readNodeFile(path string, secret bool) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, &nodeFileError{path, "is a symlink"}
+		}
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, &nodeFileError{path, "is not a regular file"}
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, &nodeFileError{path, "has no owner the agent can check"}
+	}
+	if st.Uid != 0 && int(st.Uid) != os.Geteuid() {
+		return nil, &nodeFileError{path, fmt.Sprintf("is owned by uid %d, not root or the agent", st.Uid)}
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o022 != 0 {
+		return nil, &nodeFileError{path, "is writable by group or others"}
+	}
+	if secret && perm&0o044 != 0 {
+		return nil, &nodeFileError{path, "is readable by group or others"}
+	}
+	b, err := io.ReadAll(io.LimitReader(f, nodeFileMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > nodeFileMaxBytes {
+		return nil, &nodeFileError{path, "is larger than 1 MiB"}
+	}
+	return b, nil
 }
 
 // clashAPIConfig is experimental.clash_api as the node's sing-box config has it.
@@ -1078,9 +1242,11 @@ type clashAPIConfig struct {
 
 // readClashAPIConfig reads experimental.clash_api.{external_controller,secret}
 // in one parse. Discovery uses the controller and the secret fallback the
-// secret. The error never carries the file's contents.
+// secret. A parse failure is reported as a fixed sentence with the path: the
+// decoder's own message quotes bytes of the file, and the file holds the
+// secret.
 func readClashAPIConfig(path string) (clashAPIConfig, error) {
-	b, err := os.ReadFile(path)
+	b, err := readNodeFile(path, false)
 	if err != nil {
 		return clashAPIConfig{}, err
 	}
@@ -1093,7 +1259,7 @@ func readClashAPIConfig(path string) (clashAPIConfig, error) {
 		} `json:"experimental"`
 	}
 	if err := json.Unmarshal(b, &parsed); err != nil {
-		return clashAPIConfig{}, err
+		return clashAPIConfig{}, &nodeFileError{path, "cannot be parsed as JSON"}
 	}
 	api := parsed.Experimental.ClashAPI
 	if api == nil {

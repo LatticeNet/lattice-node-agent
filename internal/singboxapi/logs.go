@@ -65,9 +65,24 @@ func (c *Client) streamLogs(ctx context.Context, level string, fn func(entry []b
 	query := url.Values{}
 	query.Set("level", normalizeLevel(level))
 
-	// No timeout on this context. The stream is meant to stay open, and the
-	// only thing that should end it is ctx or the peer.
-	resp, err := c.do(ctx, "/logs", query)
+	// Only the first answer has a deadline. Once the peer accepts, the stream
+	// is meant to stay open, and the only thing that should end it is ctx or
+	// the peer. The deadline cancels a child context, because a timeout on
+	// the request context itself would also bound the body.
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+	openTimer := time.AfterFunc(c.streamOpenTimeout, cancelReq)
+	resp, err := c.do(reqCtx, "/logs", query)
+	if !openTimer.Stop() {
+		// The deadline fired, whether or not the headers squeezed in after.
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("singboxapi: /logs gave no answer within %s", c.streamOpenTimeout)
+	}
 	if err != nil {
 		// A cancellation during the handshake is a cancellation, not a
 		// transport failure, and the retry loop has to be able to tell them

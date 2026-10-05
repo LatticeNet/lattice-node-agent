@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -354,5 +355,29 @@ func TestParsePortRejectsBadValues(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("parsePort(%q) = %d, want %d", tc.raw, got, tc.want)
 		}
+	}
+}
+
+// A rotated secret reaches the next request without a new client.
+func TestSetSecretAppliesToTheNextRequest(t *testing.T) {
+	var seen atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Get("Authorization"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"version": "test"})
+	}))
+	defer srv.Close()
+	client := newTestClient(t, srv)
+	if _, err := client.Version(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Load(); got != "Bearer s3cret" {
+		t.Fatalf("first request sent %q", got)
+	}
+	client.SetSecret(" rotated \n")
+	if _, err := client.Version(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Load(); got != "Bearer rotated" {
+		t.Fatalf("after SetSecret the request sent %q, want the rotated secret", got)
 	}
 }

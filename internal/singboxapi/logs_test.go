@@ -505,3 +505,88 @@ func TestStreamLogsWithRetryStillWorksWithoutHooks(t *testing.T) {
 	}
 	expectEntry(t, entries, `{"type":"info","payload":"after-refusal"}`)
 }
+
+// A subscription the peer accepts at the TCP level but never answers must not
+// hang forever: the first answer has a deadline, the hang reaches the Error
+// hook, Open never fires, and the retry loop goes on.
+func TestStreamOpenDeadlineEndsAHungSubscription(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		<-r.Context().Done() // never writes a header
+	}))
+	defer srv.Close()
+
+	client, err := New(Config{Addr: addrOf(t, srv), HTTPClient: srv.Client(), StreamOpenTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.backoffBase = time.Millisecond
+	client.backoffMax = 2 * time.Millisecond
+	client.jitter = func() float64 { return 1 }
+
+	errs := make(chan error, 16)
+	var opened atomic.Bool
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.StreamLogsWithHooks(ctx, "info", StreamHooks{
+			Entry: func([]byte) {},
+			Open:  func() { opened.Store(true) },
+			Error: func(err error) { errs <- err },
+		})
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if !strings.Contains(err.Error(), "no answer within") {
+				t.Fatalf("hang reported as %v, want the first-answer deadline", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a hung subscription never reached the Error hook")
+		}
+	}
+	if opened.Load() {
+		t.Fatal("Open fired for a subscription that never answered")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StreamLogsWithHooks returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamLogsWithHooks did not return after cancel")
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("attempts = %d, want the retry loop to go on after the deadline", attempts.Load())
+	}
+}
+
+// The deadline covers the first answer only: a stream that answered and then
+// stays quiet for longer than the deadline is still open.
+func TestStreamOpenDeadlineDoesNotBoundAnOpenStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flush(t, w)
+		select {
+		case <-time.After(300 * time.Millisecond):
+			_, _ = fmt.Fprintln(w, `{"type":"info","payload":"late"}`)
+			flush(t, w)
+		case <-r.Context().Done():
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	client, err := New(Config{Addr: addrOf(t, srv), HTTPClient: srv.Client(), StreamOpenTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = client.StreamLogs(ctx, "info", func(entry []byte) { entries <- string(entry) })
+	}()
+	expectEntry(t, entries, `{"type":"info","payload":"late"}`)
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -57,8 +59,9 @@ func traceTestCollector(t *testing.T, api *httptest.Server) (*traceCollector, mo
 		NodeID: "node-a",
 		Token:  "tok",
 	})
-	// Never the machine's own sing-box config.
+	// Never the machine's own sing-box config or secret.
 	c.configPath = filepath.Join(t.TempDir(), "absent-config.json")
+	c.fallbackSecretPath = filepath.Join(t.TempDir(), "absent.secret")
 	cfg := model.TraceAgentConfig{
 		Policy: model.TracePolicy{
 			NodeID:            "node-a",
@@ -450,6 +453,7 @@ func discoveryCollector(t *testing.T, configPath string) (*traceCollector, model
 	t.Helper()
 	c := newTraceCollector(agentConfig{Server: "http://127.0.0.1:1", NodeID: "node-a", Token: "tok"})
 	c.configPath = configPath
+	c.fallbackSecretPath = filepath.Join(t.TempDir(), "absent.secret")
 	return c, model.TraceAgentConfig{
 		Policy:     model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelInfo},
 		ServerTime: time.Now().UTC(),
@@ -888,5 +892,457 @@ func TestRawSwitchSurvivesLocalSessionExpiry(t *testing.T) {
 	}
 	if st := waitForState(t, c, model.CollectorReady); st.RawLines {
 		t.Fatal("status reports raw lines after local expiry with raw off")
+	}
+}
+
+// --- Review of design 26 R1: transient discovery, hardened reads, rotation ---
+
+// switchableClashAPI is a fake Clash API whose secret can rotate and whose
+// /logs can hang before answering. rotate also drops every open /logs
+// stream, the way a sing-box restart does.
+type switchableClashAPI struct {
+	srv    *httptest.Server
+	secret atomic.Pointer[string]
+	hang   atomic.Bool
+	mu     sync.Mutex
+	kick   chan struct{}
+}
+
+func newSwitchableClashAPI(t *testing.T, secret string) *switchableClashAPI {
+	t.Helper()
+	a := &switchableClashAPI{kick: make(chan struct{})}
+	a.secret.Store(&secret)
+	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if want := *a.secret.Load(); want != "" && r.Header.Get("Authorization") != "Bearer "+want {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/connections":
+			_ = json.NewEncoder(w).Encode(map[string]any{"connections": []any{}, "uploadTotal": 0, "downloadTotal": 0})
+		case "/logs":
+			if a.hang.Load() {
+				<-r.Context().Done() // accepted, never answered
+				return
+			}
+			a.mu.Lock()
+			kick := a.kick
+			a.mu.Unlock()
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+			case <-kick:
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(a.srv.Close)
+	return a
+}
+
+func (a *switchableClashAPI) addr() string { return a.srv.Listener.Addr().String() }
+
+func (a *switchableClashAPI) rotate(secret string) {
+	a.secret.Store(&secret)
+	a.mu.Lock()
+	close(a.kick)
+	a.kick = make(chan struct{})
+	a.mu.Unlock()
+}
+
+func pipelineParts(c *traceCollector) (*sessionasm.Assembler, bool, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.asm, c.runCancel != nil, c.streamEpoch
+}
+
+// A config that is momentarily empty or half written while the collector is
+// recording is not an answer. The pipeline and the connection it is
+// assembling stay; three failed reads in a row say no_clash_api while the
+// stream keeps running; a good read is ready again; and only a config that
+// was read and has no Clash API stops the pipeline.
+func TestTransientConfigFailureKeepsThePipelineAndItsOpenConnections(t *testing.T) {
+	api := newCountingClashAPI(t, "", nil)
+	path := writeSingBoxConfig(t, map[string]any{"external_controller": api.addr()})
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, cfg := discoveryCollector(t, path)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	waitForState(t, c, model.CollectorReady)
+	asm, _, _ := pipelineParts(c)
+	asm.Line(singboxlog.Line{
+		At: time.Now().UTC(), Level: "info", HasLogID: true, LogID: 4242,
+		TagKind: singboxlog.TagInbound, TagType: "vless", TagName: "in",
+		Event: singboxlog.EventInboundFrom, SrcIP: "10.0.0.5", SrcPort: 1234,
+	})
+
+	for i, content := range []string{"", `{"experimental":{"clash_api":{"external_contr`} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c.applyConfig(ctx, cfg)
+		gotAsm, up, _ := pipelineParts(c)
+		if !up || gotAsm != asm {
+			t.Fatalf("read %d of a partial config tore the pipeline down", i+1)
+		}
+		if got := asm.Stats().Open; got != 1 {
+			t.Fatalf("read %d of a partial config lost the open connection: %d open", i+1, got)
+		}
+		if got := collectorState(c); got != model.CollectorReady {
+			t.Fatalf("read %d of a partial config moved the state to %q, want ready inside the limit", i+1, got)
+		}
+	}
+
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.applyConfig(ctx, cfg)
+	st := c.Status()
+	if st.State != model.CollectorNoClashAPI || !strings.Contains(st.Detail, "cannot be parsed as JSON") || !strings.Contains(st.Detail, "keeps running") {
+		t.Fatalf("status after %d failed reads = %+v, want no_clash_api saying the stream keeps running", traceDiscoveryFailLimit, st)
+	}
+	if gotAsm, up, _ := pipelineParts(c); !up || gotAsm != asm || asm.Stats().Open != 1 {
+		t.Fatal("the pipeline or its open connection did not survive the failure limit")
+	}
+
+	if err := os.WriteFile(path, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.applyConfig(ctx, cfg)
+	if got := collectorState(c); got != model.CollectorReady {
+		t.Fatalf("state after a good read = %q, want ready", got)
+	}
+	if gotAsm, _, _ := pipelineParts(c); gotAsm != asm {
+		t.Fatal("a good read rebuilt the pipeline")
+	}
+
+	// A config that was read and has no Clash API is an answer.
+	if err := os.WriteFile(path, []byte(`{"log":{"level":"info"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.applyConfig(ctx, cfg)
+	if _, up, _ := pipelineParts(c); up {
+		t.Fatal("the pipeline survived `sb api off`")
+	}
+	if st := c.Status(); st.State != model.CollectorNoClashAPI || !strings.Contains(st.Detail, "no experimental.clash_api") {
+		t.Fatalf("status after api off = %+v", st)
+	}
+}
+
+// readNodeFile refuses every file that should not gate a bearer token, with a
+// detail that names the path and the reason, and never blocks.
+func TestNodeFileReadRefusesUnsafeFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, data []byte, mode os.FileMode) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	good := write("good", []byte("s3cret\n"), 0o600)
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		path   string
+		secret bool
+		want   string // empty means accepted
+	}{
+		{"regular 0600 secret", good, true, ""},
+		{"fifo", fifo, true, "is not a regular file"},
+		{"directory", dir, false, "is not a regular file"},
+		{"symlink", link, true, "is a symlink"},
+		{"oversized", write("big", make([]byte, nodeFileMaxBytes+1), 0o600), false, "is larger than 1 MiB"},
+		{"exactly the cap", write("cap", make([]byte, nodeFileMaxBytes), 0o600), false, ""},
+		{"group-writable secret", write("gw", []byte("s"), 0o620), true, "is writable by group or others"},
+		{"world-writable config", write("ww", []byte("{}"), 0o602), false, "is writable by group or others"},
+		{"group-readable secret", write("gr", []byte("s"), 0o640), true, "is readable by group or others"},
+		{"group-readable config", write("grc", []byte("{}"), 0o644), false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			type result struct {
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				_, err := readNodeFile(tc.path, tc.secret)
+				done <- result{err}
+			}()
+			var res result
+			select {
+			case res = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("readNodeFile blocked")
+			}
+			if tc.want == "" {
+				if res.err != nil {
+					t.Fatalf("refused: %v", res.err)
+				}
+				return
+			}
+			if res.err == nil || !strings.Contains(res.err.Error(), tc.want) || !strings.Contains(res.err.Error(), tc.path) {
+				t.Fatalf("err = %v, want %q naming %s", res.err, tc.want, tc.path)
+			}
+		})
+	}
+}
+
+// Through the collector: an unsafe secret or config is reported in the
+// status, and applyConfig, which runs on the work loop, returns at once.
+func TestUnsafeSecretOrConfigIsRefusedWithoutBlockingTheWorkLoop(t *testing.T) {
+	api := newCountingClashAPI(t, "", nil)
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gw := filepath.Join(dir, "gw.secret")
+	if err := os.WriteFile(gw, []byte("s3cret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(gw, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	cfgLink := filepath.Join(dir, "config-link.json")
+	if err := os.Symlink(writeSingBoxConfig(t, map[string]any{"external_controller": api.addr()}), cfgLink); err != nil {
+		t.Fatal(err)
+	}
+
+	apply := func(c *traceCollector, cfg model.TraceAgentConfig) *model.CollectorStatus {
+		t.Helper()
+		done := make(chan struct{})
+		go func() { c.applyConfig(context.Background(), cfg); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("applyConfig blocked on a node file")
+		}
+		return c.Status()
+	}
+	for _, tc := range []struct {
+		name       string
+		secretPath string
+		configPath string
+		want       model.CollectorState
+		detail     string
+	}{
+		{"fifo secret", fifo, "", model.CollectorSecretUnreadable, "is not a regular file"},
+		{"group-writable secret", gw, "", model.CollectorSecretUnreadable, "is writable by group or others"},
+		{"fifo config", "", fifo, model.CollectorNoClashAPI, "is not a regular file"},
+		{"symlinked config", "", cfgLink, model.CollectorNoClashAPI, "is a symlink"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := tc.configPath
+			if configPath == "" {
+				configPath = writeSingBoxConfig(t, nil)
+			}
+			c, cfg := discoveryCollector(t, configPath)
+			defer c.stop()
+			if tc.secretPath != "" {
+				cfg.Policy.ClashAPIAddr = api.addr()
+				cfg.Policy.SecretPath = tc.secretPath
+			}
+			st := apply(c, cfg)
+			if st.State != tc.want || !strings.Contains(st.Detail, tc.detail) {
+				t.Fatalf("status = %+v, want %s with %q", st, tc.want, tc.detail)
+			}
+			if _, up, _ := pipelineParts(c); up {
+				t.Fatal("a pipeline started on a refused file")
+			}
+		})
+	}
+}
+
+// A rotated secret: the core restarts with a new one, the stream drops and
+// every resubscribe gets 401, and past the grace the node is stream_failing.
+// Once the secret file holds the new secret, the next poll hands it to the
+// client and resubscribes. The node is ready again with the same assembler:
+// no agent restart, no pipeline rebuild.
+func TestRotatedSecretRecoversFromStreamFailingWithoutARestart(t *testing.T) {
+	clock := newFakeClock()
+	api := newSwitchableClashAPI(t, "old-secret")
+	secretPath := filepath.Join(t.TempDir(), "clash.secret")
+	if err := os.WriteFile(secretPath, []byte("old-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	c.now = clock.now
+	cfg.Policy.ClashAPIAddr = api.addr()
+	cfg.Policy.SecretPath = secretPath
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	waitForState(t, c, model.CollectorReady)
+	asm, _, _ := pipelineParts(c)
+
+	api.rotate("new-secret")
+	waitFor(t, "the stream to drop", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return !c.streamOpen && !c.streamDownSince.IsZero()
+	})
+	clock.advance(traceStreamGrace)
+	c.evaluateStream()
+	if got := collectorState(c); got != model.CollectorStreamFailing {
+		t.Fatalf("state past the grace with the old secret = %q, want stream_failing", got)
+	}
+	// A poll before the file changes leaves it failing.
+	c.applyConfig(ctx, cfg)
+	if got := collectorState(c); got != model.CollectorStreamFailing {
+		t.Fatalf("state = %q with the secret unchanged on disk", got)
+	}
+
+	if err := os.WriteFile(secretPath, []byte("new-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.applyConfig(ctx, cfg)
+	waitForState(t, c, model.CollectorReady)
+	if gotAsm, up, _ := pipelineParts(c); !up || gotAsm != asm {
+		t.Fatal("recovering from a rotated secret rebuilt the pipeline")
+	}
+}
+
+// A secret file that changes while the stream is open is left alone: the
+// running core still holds the secret in use, so swapping now would break a
+// working stream. The subscription is not touched.
+func TestChangedSecretLeavesAnOpenStreamAlone(t *testing.T) {
+	api := newSwitchableClashAPI(t, "old-secret")
+	secretPath := filepath.Join(t.TempDir(), "clash.secret")
+	if err := os.WriteFile(secretPath, []byte("old-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	cfg.Policy.ClashAPIAddr = api.addr()
+	cfg.Policy.SecretPath = secretPath
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	waitForState(t, c, model.CollectorReady)
+	_, _, epoch := pipelineParts(c)
+	if err := os.WriteFile(secretPath, []byte("written-before-the-core-restarts"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.applyConfig(ctx, cfg)
+	if _, _, got := pipelineParts(c); got != epoch {
+		t.Fatal("a secret change resubscribed an open stream")
+	}
+	if got := collectorState(c); got != model.CollectorReady {
+		t.Fatalf("state = %q, want ready", got)
+	}
+}
+
+// A config that is not JSON is named, never quoted: the decoder's message
+// carries bytes of the file, and the file carries the secret. Checked in the
+// discovery detail, the secret_unreadable detail and the log line.
+func TestConfigParseErrorNeverQuotesTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"experimental":{"clash_api":{"secret":"s"}}} Zq-leak-7731`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	var logMu sync.Mutex
+	log.SetOutput(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logs.Write(p)
+	}))
+	defer log.SetOutput(os.Stderr)
+
+	c, cfg := discoveryCollector(t, path)
+	c.applyConfig(context.Background(), cfg)
+	want := path + " cannot be parsed as JSON"
+	if st := c.Status(); st.State != model.CollectorNoClashAPI || st.Detail != want {
+		t.Fatalf("discovery status = %+v, want detail %q", st, want)
+	}
+
+	api := newCountingClashAPI(t, "", nil)
+	cfg.Policy.ClashAPIAddr = api.addr() // the secret now falls back to the config
+	c.applyConfig(context.Background(), cfg)
+	defer c.stop()
+	st := c.Status()
+	if st.State != model.CollectorSecretUnreadable || !strings.HasSuffix(st.Detail, want) {
+		t.Fatalf("secret status = %+v, want a detail ending %q", st, want)
+	}
+	logMu.Lock()
+	logged := logs.String()
+	logMu.Unlock()
+	if !strings.Contains(logged, want) {
+		t.Fatalf("log does not name the file: %q", logged)
+	}
+	for _, s := range []string{st.Detail, logged} {
+		if strings.Contains(s, "invalid character") || strings.Contains(s, "'Z'") || strings.Contains(s, "Zq-leak") {
+			t.Fatalf("a parse error quoted the file: %q", s)
+		}
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// A resubscribe that the Clash API accepts and never answers must not leave
+// ready standing: the first-answer deadline turns it into stream_failing.
+func TestHungResubscribeTurnsStreamFailing(t *testing.T) {
+	api := newSwitchableClashAPI(t, "")
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	c.streamOpenTimeout = 100 * time.Millisecond
+	cfg.Policy.ClashAPIAddr = api.addr()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	waitForState(t, c, model.CollectorReady)
+	api.hang.Store(true)
+	cfg.Policy.Level = model.TraceLevelTrace // a level change resubscribes
+	c.applyConfig(ctx, cfg)
+	st := waitForState(t, c, model.CollectorStreamFailing)
+	if !strings.Contains(st.Detail, "no answer within") {
+		t.Fatalf("detail = %q, want the first-answer deadline", st.Detail)
+	}
+}
+
+// LinesPerSec is what sing-box sends, counted before the pre-parse ceiling,
+// so a rate measurement is not capped at four times the budget.
+func TestLinesPerSecCountsLinesOverTheCeiling(t *testing.T) {
+	const n = 200
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = fmt.Sprintf(`{"type":"info","payload":"line %d"}`, i)
+	}
+	api := newCountingClashAPI(t, "", lines)
+	c, cfg := discoveryCollector(t, writeSingBoxConfig(t, nil))
+	cfg.Policy.ClashAPIAddr = api.addr()
+	cfg.Policy.BudgetLinesPerSec = 1 // a ceiling of 4 lines a second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); c.stop() }()
+
+	c.applyConfig(ctx, cfg)
+	waitFor(t, "every line in the rate window", func() bool {
+		st := c.Status()
+		return st != nil && st.LinesPerSec*traceLinesWindow >= n
+	})
+	if got := c.Status().LinesPerSec * traceLinesWindow; got != n {
+		t.Fatalf("lines counted = %v, want %d", got, n)
 	}
 }

@@ -19,12 +19,31 @@ Clash API discovery and collector status:
   same loopback rule the Clash API client enforces (`localhost` or a loopback
   literal, `host:port`, no URL). A policy address still wins. `sb api on` on
   the node is picked up at the next poll without restarting the agent.
+- Only a config that was read and has no usable controller stops a running
+  pipeline. A config that cannot be read or parsed while the collector is
+  recording from it (caught mid-rewrite, say) keeps the pipeline and its open
+  connections; after three such polls in a row the state is `no_clash_api`,
+  saying the stream keeps running, and the next good read is `ready` again.
+- The sing-box config and every Clash API secret file are opened with
+  `O_NOFOLLOW|O_NONBLOCK` and checked on the open descriptor: a regular file,
+  owned by root or the agent's uid, writable by nobody else (a secret file
+  also readable by nobody else), at most 1 MiB. A symlink, FIFO, device,
+  oversized or loosely permitted file is refused with a detail naming the
+  path and the reason, and never blocks the work loop. A config that is not
+  JSON is reported as "<path> cannot be parsed as JSON", never with the
+  decoder's message, which quotes bytes of the file.
+- A rotated secret is picked up without a restart: each poll re-reads it, and
+  when it has changed while the `/logs` stream is down, the client takes it
+  and resubscribes at once. An open stream keeps the secret it is using.
+- A `/logs` subscription that gets no answer within 10 s is ended and retried,
+  so a hung request cannot leave `ready` standing.
 - The metrics beat carries `trace_collector` (lattice-sdk
   `model.CollectorStatus`): `state` is `off`, `ready`, `no_clash_api`,
   `secret_unreadable` or `stream_failing`, with `since`, the address in use
   and where it came from (`policy` or `config`), a detail line of at most 256
   bytes saying why it is not ready (it never carries the secret), whether raw
-  lines are flowing, parsed lines per second over the last 10 s, the budget
+  lines are flowing, lines arriving per second over the last 10 s (counted
+  before the pre-parse ceiling, so the rate is not capped by it), the budget
   in force, and the cumulative shed connections and unparsed lines. The key
   is left out until the collector has applied a policy. A state change beats
   at once (at most one nudged beat per second) instead of waiting for the

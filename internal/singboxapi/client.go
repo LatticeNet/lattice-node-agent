@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +26,14 @@ const (
 	// stops a misbehaving or compromised core from driving the agent out of
 	// memory with an unbounded body.
 	maxUnaryResponseBytes = 32 << 20
+
+	// defaultStreamOpenTimeout bounds how long a /logs subscription may wait
+	// for the response headers. Only the first answer is bounded; once the
+	// peer has accepted, the stream stays open for as long as it lasts. On
+	// loopback sing-box answers in milliseconds, so a request still unanswered
+	// after this is hung, and without the bound a hung subscription would
+	// leave the collector's last state standing forever.
+	defaultStreamOpenTimeout = 10 * time.Second
 )
 
 // Config configures a Client.
@@ -41,13 +50,21 @@ type Config struct {
 	// set Timeout: that field applies to the whole request including the body,
 	// so it would kill the /logs stream. Use the request context instead.
 	HTTPClient *http.Client
+
+	// StreamOpenTimeout bounds the wait for a /logs subscription's first
+	// answer. Zero means defaultStreamOpenTimeout.
+	StreamOpenTimeout time.Duration
 }
 
 // Client talks to one sing-box Clash API over loopback.
 type Client struct {
 	baseURL string
-	secret  string
-	http    *http.Client
+	// secret is the bearer token, swapped whole by SetSecret while the
+	// connection poll and the log stream are using the client.
+	secret atomic.Pointer[string]
+	http   *http.Client
+
+	streamOpenTimeout time.Duration
 
 	// Backoff parameters for StreamLogsWithRetry. They are fields rather than
 	// constants so tests can compress a reconnect sequence into milliseconds.
@@ -82,15 +99,36 @@ func New(cfg Config) (*Client, error) {
 			},
 		}
 	}
-	return &Client{
+	openTimeout := cfg.StreamOpenTimeout
+	if openTimeout <= 0 {
+		openTimeout = defaultStreamOpenTimeout
+	}
+	c := &Client{
 		baseURL:           "http://" + addr,
-		secret:            strings.TrimSpace(cfg.Secret),
 		http:              httpClient,
+		streamOpenTimeout: openTimeout,
 		backoffBase:       time.Second,
 		backoffMax:        30 * time.Second,
 		backoffResetAfter: 30 * time.Second,
 		jitter:            defaultJitter,
-	}, nil
+	}
+	c.SetSecret(cfg.Secret)
+	return c, nil
+}
+
+// SetSecret replaces the bearer token for every later request. A request
+// already in flight keeps the token it was sent with. It exists so a rotated
+// secret can be picked up without rebuilding the client and what hangs off it.
+func (c *Client) SetSecret(secret string) {
+	s := strings.TrimSpace(secret)
+	c.secret.Store(&s)
+}
+
+func (c *Client) bearer() string {
+	if s := c.secret.Load(); s != nil {
+		return *s
+	}
+	return ""
 }
 
 // ValidateLoopbackAddr normalizes and checks a host:port Clash API address.
@@ -207,8 +245,8 @@ func (c *Client) do(ctx context.Context, path string, query url.Values) (*http.R
 	if err != nil {
 		return nil, err
 	}
-	if c.secret != "" {
-		req.Header.Set("Authorization", "Bearer "+c.secret)
+	if secret := c.bearer(); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
 	}
 	req.Header.Set("Accept", "application/json")
 
