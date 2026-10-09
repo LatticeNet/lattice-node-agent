@@ -19,7 +19,7 @@ jobs:
           path: lattice-node-agent
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
+          go-version: '1.26.9'
           check-latest: true
           cache: false
       - name: gofmt
