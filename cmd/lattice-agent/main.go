@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,7 +46,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.10-alpha.4"
+var version = "0.3.10-alpha.5"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -65,7 +66,7 @@ func compatibilityPayload() agentCompatibility {
 		ServerMin:    compatServerMin,
 		DashboardMin: compatDashboardMin,
 		Channel:      compatChannel,
-		Features:     []string{sdNotifyCapability, healthMarkerCapability, witness.Capability},
+		Features:     []string{sdNotifyCapability, healthMarkerCapability, witness.Capability, prober.Capability},
 	}
 }
 
@@ -464,20 +465,7 @@ func main() {
 	sbCaps.refresh(&cfg)
 	beat.setConfig(cfg)
 	if err := health.run(stepHello, func() error {
-		return postAgentJSON(cfg, "/api/agent/hello", map[string]any{
-			"version":              version,
-			"compatibility":        compatibilityPayload(),
-			"capabilities":         payloadCapabilities(cfg),
-			"public_ip":            cfg.PublicIP,
-			"public_ipv6":          cfg.PublicIPv6,
-			"internal_ip":          cfg.InternalIP,
-			"internal_ipv6":        cfg.InternalIPv6,
-			"wireguard_ip":         cfg.WireGuardIP,
-			"wireguard_public_key": cfg.WGPublicKey,
-			"wireguard_endpoint":   cfg.WGEndpoint,
-			"wireguard_port":       cfg.WGPort,
-			"host_facts":           hostfacts.Collect(),
-		}, nil)
+		return postAgentJSON(cfg, "/api/agent/hello", helloPayload(cfg), nil)
 	}); err != nil {
 		log.Fatalf("hello failed: %v", err)
 	}
@@ -743,18 +731,23 @@ func (mm *monitorManager) run(ctx context.Context, m model.Monitor) {
 	}
 }
 
+// monitorChanged reports whether a monitor's probe changed, so its
+// goroutine restarts with the new definition. Fields that only the control
+// plane reads (name, version, alert policy) do not restart it.
 func monitorChanged(a, b model.Monitor) bool {
-	return a.Type != b.Type || a.Target != b.Target ||
-		a.IntervalSec != b.IntervalSec || a.TimeoutSec != b.TimeoutSec
+	return a.Type != b.Type || a.Target != b.Target || a.TargetNode != b.TargetNode ||
+		a.IntervalSec != b.IntervalSec || a.TimeoutSec != b.TimeoutSec ||
+		a.Packets != b.Packets || a.ExpectStatus != b.ExpectStatus ||
+		a.SecretsOrigin != b.SecretsOrigin || !slices.Equal(a.Headers, b.Headers)
 }
 
 // probe runs one probe and queues its result; flushLoop sends it, in a batch
 // when the server has the batch route.
 func (mm *monitorManager) probe(m model.Monitor) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.TimeoutSec+2)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), prober.RunBudget(m)+2*time.Second)
 	defer cancel()
 	res := prober.Probe(ctx, m)
-	debugf(mm.snapshotConfig(), "monitor probe complete: monitor=%s success=%v latency_ms=%.1f error=%t", m.ID, res.Success, res.LatencyMs, res.Error != "")
+	debugf(mm.snapshotConfig(), "monitor probe complete: monitor=%s success=%v latency_ms=%.1f sent=%d lost=%d reason=%s error=%t", m.ID, res.Success, res.LatencyMs, res.Sent, res.Lost, res.Reason, res.Error != "")
 	mm.results.push(res)
 }
 
@@ -894,6 +887,28 @@ func (cfg agentConfig) taskSandboxOptions() taskexec.SandboxOptions {
 	}
 }
 
+// helloPayload builds the hello body. probe_methods and probe_refusals
+// (design 29 D11) say which monitor kinds this host lets the agent run.
+func helloPayload(cfg agentConfig) map[string]any {
+	probeMethods, probeRefusals := prober.Facts()
+	return map[string]any{
+		"version":              version,
+		"compatibility":        compatibilityPayload(),
+		"capabilities":         payloadCapabilities(cfg),
+		"probe_methods":        probeMethods,
+		"probe_refusals":       probeRefusals,
+		"public_ip":            cfg.PublicIP,
+		"public_ipv6":          cfg.PublicIPv6,
+		"internal_ip":          cfg.InternalIP,
+		"internal_ipv6":        cfg.InternalIPv6,
+		"wireguard_ip":         cfg.WireGuardIP,
+		"wireguard_public_key": cfg.WGPublicKey,
+		"wireguard_endpoint":   cfg.WGEndpoint,
+		"wireguard_port":       cfg.WGPort,
+		"host_facts":           hostfacts.Collect(),
+	}
+}
+
 func reportMetrics(cfg agentConfig) error {
 	return postAgentJSON(cfg, "/api/agent/metrics", metricsPayload(cfg), nil)
 }
@@ -904,11 +919,14 @@ func metricsPayload(cfg agentConfig) map[string]any {
 	m := metrics.Collect()
 	facts := hostfacts.Collect()
 	sandbox := taskexec.SandboxProfileWithOptions(cfg.AllowExec, cfg.AllowRoot, os.Geteuid(), cfg.taskSandboxOptions())
+	probeMethods, probeRefusals := prober.Facts()
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return map[string]any{
-		"version":       version,
-		"compatibility": compatibilityPayload(),
-		"capabilities":  payloadCapabilities(cfg),
+		"version":        version,
+		"compatibility":  compatibilityPayload(),
+		"capabilities":   payloadCapabilities(cfg),
+		"probe_methods":  probeMethods,
+		"probe_refusals": probeRefusals,
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,
