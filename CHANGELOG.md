@@ -5,12 +5,13 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## Unreleased
+## 0.3.10-alpha.5 (2026-10-16)
 
 Design 29, slice M2a (monitoring paths), the agent half of the wire
 contract in design 29 D11. Pins lattice-sdk
-v0.2.24-0.20261016120438-f2689021eb38. The version constant is unchanged;
-the release names this section.
+v0.2.24-0.20261016120438-f2689021eb38. No compatibility floor moves: the
+server decodes agent bodies without rejecting unknown fields, so an older
+server ignores the new facts and results fields.
 
 Probe methods and facts:
 
