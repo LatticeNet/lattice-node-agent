@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/LatticeNet/lattice-node-agent/internal/beacon"
 	"github.com/LatticeNet/lattice-node-agent/internal/guardreality"
 	"github.com/LatticeNet/lattice-node-agent/internal/hostfacts"
 	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
@@ -66,7 +67,7 @@ func compatibilityPayload() agentCompatibility {
 		ServerMin:    compatServerMin,
 		DashboardMin: compatDashboardMin,
 		Channel:      compatChannel,
-		Features:     []string{sdNotifyCapability, healthMarkerCapability, witness.Capability, prober.Capability},
+		Features:     []string{sdNotifyCapability, healthMarkerCapability, witness.Capability, prober.Capability, beacon.Capability},
 	}
 }
 
@@ -100,14 +101,21 @@ func capabilitiesFor(linechainReady bool) []string {
 }
 
 type agentConfig struct {
-	Server              string
-	NodeID              string
-	Token               string
-	Interval            time.Duration
-	ReportGuardReality  bool
-	AllowExec           bool
-	AllowRoot           bool
-	NoExec              bool
+	Server             string
+	NodeID             string
+	Token              string
+	Interval           time.Duration
+	ReportGuardReality bool
+	AllowExec          bool
+	AllowRoot          bool
+	NoExec             bool
+	// NoBeacon is the node veto of design 29 D3: the beacon responder never
+	// binds, whatever the server's configuration says. The beacon client
+	// only sends and keeps running.
+	NoBeacon bool
+	// Beacon is the node's beacon responder and client. It holds path keys
+	// in memory only; nil only in tests that build a bare config.
+	Beacon              *beacon.Node
 	TaskCgroupRoot      string
 	TaskCgroupMemoryMax string
 	TaskCgroupPidsMax   string
@@ -247,6 +255,7 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
+	flag.BoolVar(&cfg.NoBeacon, "no-beacon", os.Getenv("LATTICE_NO_BEACON") == "1", "never open the measurement beacon's UDP socket, whatever the server configures (node veto; beacon checks from this node still run)")
 	flag.StringVar(&cfg.TaskCgroupRoot, "task-cgroup-root", os.Getenv("LATTICE_TASK_CGROUP_ROOT"), "Linux cgroup v2 root for per-task caps; use \"auto\" for the agent service cgroup or leave empty to disable")
 	flag.StringVar(&cfg.TaskCgroupMemoryMax, "task-cgroup-memory-max", env("LATTICE_TASK_CGROUP_MEMORY_MAX", taskexec.DefaultCgroupMemoryMax), "memory.max value for per-task cgroups when -task-cgroup-root is set")
 	flag.StringVar(&cfg.TaskCgroupPidsMax, "task-cgroup-pids-max", env("LATTICE_TASK_CGROUP_PIDS_MAX", taskexec.DefaultCgroupPidsMax), "pids.max value for per-task cgroups when -task-cgroup-root is set")
@@ -358,6 +367,12 @@ func main() {
 		cfg.AllowExec = false
 		cfg.AllowTerminal = false
 	}
+	// The beacon veto is fixed here, before anything could bind: the
+	// responder built with it never opens a socket.
+	cfg.Beacon = beacon.NewNode(cfg.NoBeacon)
+	if cfg.NoBeacon {
+		log.Printf("beacon: -no-beacon set; the responder will not listen whatever the server configures")
+	}
 	if cfg.UpdateNFTDomainSet {
 		if err := updateNFTDomainSet(context.Background(), nftDomainSetConfig{
 			Host: cfg.NFTDomainHost, Family: cfg.NFTFamily, Table: cfg.NFTTable, Set: cfg.NFTSet, Set6: cfg.NFTSet6,
@@ -434,6 +449,7 @@ func main() {
 	// progress only, is armed once recovery has finished.
 	refreshIPs(&cfg)
 	beat := newHeartbeat(cfg, health)
+	cfg.Beacon.SetOnChange(beat.nudgeNow)
 	recoverThenSupervise(health, beat, func() error {
 		return requireLinechainRecovered(context.Background(), linechainManager, taskResults, cfg.NodeID)
 	}, func() { time.Sleep(cfg.Interval) }, func() {
@@ -642,6 +658,7 @@ func main() {
 	worker.shutdown(taskShutdownGrace, taskShutdownReportGrace)
 	stopMonitorFlush()
 	monitors.drain(monitorResultShutdownGrace)
+	cfg.Beacon.Close()
 }
 
 var guardManagedSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -744,11 +761,28 @@ func monitorChanged(a, b model.Monitor) bool {
 // probe runs one probe and queues its result; flushLoop sends it, in a batch
 // when the server has the batch route.
 func (mm *monitorManager) probe(m model.Monitor) {
-	ctx, cancel := context.WithTimeout(context.Background(), prober.RunBudget(m)+2*time.Second)
+	cfg := mm.snapshotConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), monitorRunBudget(m)+2*time.Second)
 	defer cancel()
-	res := prober.Probe(ctx, m)
-	debugf(mm.snapshotConfig(), "monitor probe complete: monitor=%s success=%v latency_ms=%.1f sent=%d lost=%d reason=%s error=%t", m.ID, res.Success, res.LatencyMs, res.Sent, res.Lost, res.Reason, res.Error != "")
+	res := runProbe(ctx, cfg.Beacon, m)
+	debugf(cfg, "monitor probe complete: monitor=%s success=%v latency_ms=%.1f sent=%d lost=%d reason=%s error=%t", m.ID, res.Success, res.LatencyMs, res.Sent, res.Lost, res.Reason, res.Error != "")
 	mm.results.push(res)
+}
+
+// runProbe runs one check: beacon checks through the node's beacon client,
+// every other kind through the prober.
+func runProbe(ctx context.Context, node *beacon.Node, m model.Monitor) model.MonitorResult {
+	if m.Type == model.MonitorTypeBeacon && node != nil {
+		return node.Probe(ctx, m)
+	}
+	return prober.Probe(ctx, m)
+}
+
+func monitorRunBudget(m model.Monitor) time.Duration {
+	if m.Type == model.MonitorTypeBeacon {
+		return beacon.RunBudget(m)
+	}
+	return prober.RunBudget(m)
 }
 
 func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
@@ -836,6 +870,13 @@ func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
 	}
 
 	applyIPConfigOverride(cfg, remote.IPConfig)
+
+	// The beacon's path keys go straight to the node beacon, which holds
+	// them in memory only and wipes the decoded copies; they are never kept
+	// in agentConfig, which debug lines read.
+	if cfg.Beacon != nil {
+		cfg.Beacon.Apply(remote.Beacon)
+	}
 }
 
 // applyIPConfigOverride lets a server-pushed NodeIPConfig take precedence over
@@ -887,16 +928,37 @@ func (cfg agentConfig) taskSandboxOptions() taskexec.SandboxOptions {
 	}
 }
 
+// probeFacts is probe_methods and probe_refusals: the prober's kinds as
+// the host allows them, and beacon, whose client needs nothing from the
+// host and runs under -no-beacon too.
+func probeFacts() ([]string, map[string]string) {
+	methods, refusals := prober.Facts()
+	methods = append(methods, model.MonitorTypeBeacon)
+	slices.Sort(methods)
+	return slices.Compact(methods), refusals
+}
+
+// beaconFacts is the "beacon" key of hello and heartbeat bodies (design 29
+// D12).
+func (cfg agentConfig) beaconFacts() model.BeaconFacts {
+	if cfg.Beacon == nil {
+		return beacon.IdleFacts(cfg.NoBeacon)
+	}
+	return cfg.Beacon.Facts()
+}
+
 // helloPayload builds the hello body. probe_methods and probe_refusals
-// (design 29 D11) say which monitor kinds this host lets the agent run.
+// (design 29 D11) say which monitor kinds this host lets the agent run;
+// beacon (D12) is the state of the beacon responder.
 func helloPayload(cfg agentConfig) map[string]any {
-	probeMethods, probeRefusals := prober.Facts()
+	probeMethods, probeRefusals := probeFacts()
 	return map[string]any{
 		"version":              version,
 		"compatibility":        compatibilityPayload(),
 		"capabilities":         payloadCapabilities(cfg),
 		"probe_methods":        probeMethods,
 		"probe_refusals":       probeRefusals,
+		"beacon":               cfg.beaconFacts(),
 		"public_ip":            cfg.PublicIP,
 		"public_ipv6":          cfg.PublicIPv6,
 		"internal_ip":          cfg.InternalIP,
@@ -919,7 +981,7 @@ func metricsPayload(cfg agentConfig) map[string]any {
 	m := metrics.Collect()
 	facts := hostfacts.Collect()
 	sandbox := taskexec.SandboxProfileWithOptions(cfg.AllowExec, cfg.AllowRoot, os.Geteuid(), cfg.taskSandboxOptions())
-	probeMethods, probeRefusals := prober.Facts()
+	probeMethods, probeRefusals := probeFacts()
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
 	return map[string]any{
 		"version":        version,
@@ -927,6 +989,7 @@ func metricsPayload(cfg agentConfig) map[string]any {
 		"capabilities":   payloadCapabilities(cfg),
 		"probe_methods":  probeMethods,
 		"probe_refusals": probeRefusals,
+		"beacon":         cfg.beaconFacts(),
 		"agent_runtime": agentRuntimePayload{
 			AllowExec:             cfg.AllowExec,
 			AllowRootExec:         cfg.AllowRoot,

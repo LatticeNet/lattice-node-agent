@@ -5,6 +5,75 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
+## Unreleased
+
+Design 29, slice M2b (monitoring paths), the agent half of the measurement
+beacon: the responder of D3 and the client, against the wire contract in
+design 29 D12. Pins lattice-sdk v0.2.24-0.20261016144248-9807b34bfd82, whose
+package `beacon` holds the wire format and the responder's decision core; the
+agent re-implements none of it. No compatibility floor moves: an older server
+sends no `beacon` in the config pull, which the agent reads as "responder
+off, no keys", and ignores the new `beacon` facts.
+
+Responder:
+
+- Off until a config pull carries `beacon.responder`; a pull without it closes
+  the socket. The agent binds exactly `bind:port` over UDP. The bind address
+  must be an IPv4 literal of a class `beacon.ParseIPv4` allows (never
+  `0.0.0.0`, loopback, link-local, multicast or reserved) and the port 1024 to
+  65535; anything else is refused without a bind. A bound address is never
+  the wildcard, so replies leave from the address requests arrived on.
+- Reads into a 128-byte buffer. Before authentication a CPU guard counts
+  datagrams in a fixed array of 1024 buckets keyed by a seeded hash of the
+  sender (at most 1000 a second per bucket) and 20000 a second in all; past
+  the global budget the loop stops reading until the next second, so the
+  kernel drops the excess. Anything not exactly 96 bytes is dropped, then
+  `beacon.Responder.Handle` decides in the contract's order. A reply is never
+  longer than its request. The drop path allocates nothing.
+- A panic while deciding a datagram drops that datagram and is counted; the
+  loop and the agent go on.
+- Circuit breaker: when at least 54 of the last 60 seconds each dropped 1000
+  datagrams or more (or spent the guard's global budget), the oldest of them
+  included, the socket closes for 5 minutes and the facts read
+  `circuit_open`. The next pull after the cooldown binds again.
+- A bind failure reads `bind_failed` with a short error (at most 200 bytes)
+  and is retried once a minute on the same address and port only, never on
+  another port.
+- `-no-beacon` (`LATTICE_NO_BEACON=1`, kept by the installer like
+  `LATTICE_NO_EXEC`) is fixed at startup and checked before anything else:
+  the responder never binds, whatever the server sends, and reports
+  `refusal: "refused_by_node"`, state `refused`.
+- Path keys from the pull are held in memory only, and the decoded copies are
+  wiped once taken. No log line, debug line, fact, error or result carries a
+  key, and the package writes no file; tests pin both.
+
+Facts:
+
+- Hello and every heartbeat carry the top-level `beacon` key: `responder`
+  (always true), `refusal`, `state` (`off`, `listening`, `bind_failed`,
+  `circuit_open`, `refused`), `bind`, `port`, `epoch` (newest in the applied
+  table), `sources` (source ids in it), `last_auth_at` and `error`. A state
+  change sends a heartbeat at once.
+- `probe_methods` lists `beacon` on every agent, `-no-beacon` included: the
+  client only sends.
+- `-compat-json` lists the feature `beacon-v1`.
+
+Client (monitor kind `beacon`):
+
+- A check must name `target_node`; its `target` must be an endpoint
+  `beacon.ParseEndpoint` accepts, or the run reports `destination_refused`
+  with nothing sent. Without a path key for the target the run reports
+  `beacon_no_key` with `sent` zero.
+- One connected UDP socket per run, `packets` requests (zero reads as 5, at
+  most 10) 200 ms apart, each with a fresh random nonce and waiting
+  `timeout_sec`. RTTs come from the monotonic clock. A reply counts only if it
+  verifies under the path key and carries the nonce and sequence of a request
+  still waiting.
+- Results carry `sent`, `lost` and `rtts_ms` (the ok replies) like icmp. A run
+  with no ok reply carries `beacon_not_listening` when the socket read or
+  wrote `ECONNREFUSED`, else `beacon_stale`, `beacon_unknown_epoch` or
+  `beacon_rate_limited` from a signed reply; plain loss carries no reason.
+
 ## 0.3.10-alpha.5 (2026-10-16)
 
 Design 29, slice M2a (monitoring paths), the agent half of the wire
