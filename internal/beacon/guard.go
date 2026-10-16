@@ -91,7 +91,9 @@ const (
 	// breaker answers a flood that costs the host real CPU, not one a few
 	// hundred kilobytes a second can raise. Datagrams the guard refused for
 	// their bucket do not count: one address over its share is the guard
-	// working, and must not be able to close the socket alone.
+	// working, so one host below the global budget cannot close the socket
+	// alone. One host that spends the global budget (20000 a second) can,
+	// as any flood at that rate can.
 	breakerDropsPerSecond = guardGlobalPerSecond / 4
 	// breakerWindowSeconds and breakerHotSeconds: the breaker opens when
 	// the hot seconds of the last breakerWindowSeconds number at least

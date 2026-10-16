@@ -568,7 +568,8 @@ func (l *loop) process(now time.Time, pkt []byte, from netip.AddrPort) (n int) {
 		return 0
 	case guardBucketFull:
 		// One address over its share is the guard doing its job; the
-		// breaker does not count it, so one host cannot close the socket.
+		// breaker does not count it, so one host below the global budget
+		// cannot close the socket.
 		l.guardDrops.Add(1)
 		l.breaker.record(mono, false)
 		return 0

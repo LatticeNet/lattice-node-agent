@@ -29,7 +29,10 @@ func testClient(t *testing.T, local netip.AddrPort, epoch uint32) (*Client, *[]n
 	keys.Set(&model.AgentBeaconConfig{SourceID: testSource, Keys: []model.BeaconPathKey{{TargetNode: "t1", Epoch: epoch, Key: append([]byte(nil), k[:]...)}}})
 	c := NewClient(keys)
 	c.spacing = 10 * time.Millisecond
-	c.wait = 300 * time.Millisecond
+	// A run ends as soon as every request is answered, so a generous wait
+	// costs only the loss tests a second and keeps a loaded machine from
+	// turning a slow reply into a lost one.
+	c.wait = time.Second
 	var dialed []netip.AddrPort
 	c.dial = func(ctx context.Context, ep netip.AddrPort) (clientConn, error) {
 		dialed = append(dialed, ep)
