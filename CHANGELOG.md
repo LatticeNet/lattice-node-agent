@@ -9,7 +9,7 @@ match it.
 
 Design 29, slice M2b (monitoring paths), the agent half of the measurement
 beacon: the responder of D3 and the client, against the wire contract in
-design 29 D12. Pins lattice-sdk v0.2.24-0.20261016144248-9807b34bfd82, whose
+design 29 D12. Pins lattice-sdk v0.2.24-0.20261016152819-8805e6f57d03, whose
 package `beacon` holds the wire format and the responder's decision core; the
 agent re-implements none of it. No compatibility floor moves: an older server
 sends no `beacon` in the config pull, which the agent reads as "responder
