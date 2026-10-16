@@ -185,11 +185,11 @@ func (p *prober) runEchoes(ctx context.Context, conn icmpConn, target netip.Addr
 		if next == planned && (replied == sent || !now.Before(final)) {
 			return runErr
 		}
+		// While echoes remain to send, wake for the next one; each echo's
+		// own wait is enforced by matchReply. Then wait for the last one.
 		deadline := final
 		if next < planned {
-			if sendAt := start.Add(time.Duration(next) * p.spacing); final.IsZero() || sendAt.Before(deadline) {
-				deadline = sendAt
-			}
+			deadline = start.Add(time.Duration(next) * p.spacing)
 		}
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			return fmt.Errorf("read: %w", err)
@@ -198,6 +198,7 @@ func (p *prober) runEchoes(ctx context.Context, conn icmpConn, target netip.Addr
 		recvAt := time.Now()
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
+				readErrs = 0
 				continue
 			}
 			if readErrs++; readErrs >= maxReadErrors || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {

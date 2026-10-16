@@ -202,9 +202,9 @@ func TestDestinationTargetNodeBypass(t *testing.T) {
 	}
 }
 
-// IPv6 forms that embed or reach IPv4 space are judged by the IPv4 address
-// they carry, or refused outright, beyond the shared rule; a zone does not
-// change the verdict.
+// Reserved IPv4 ranges and IPv6 forms that embed or reach IPv4 space are
+// refused beyond the shared rule; a transition form is judged by the IPv4
+// address it carries, and a zone does not change the verdict.
 func TestDestinationRefusesTransitionForms(t *testing.T) {
 	refused := []string{
 		"64:ff9b::a9fe:a9fe",       // NAT64 of 169.254.169.254
@@ -233,6 +233,16 @@ func TestDestinationRefusesTransitionForms(t *testing.T) {
 		"2002::",                   // 6to4 of 0.0.0.0
 		"::ffff:0:0",               // IPv4-translated 0.0.0.0
 		"::ffff:0:ffff:ffff",       // IPv4-translated broadcast
+		"192.0.0.1",                // IETF protocol assignments
+		"192.0.0.255",              // top of 192.0.0.0/24
+		"198.18.0.1",               // benchmarking
+		"198.19.255.254",           // top of 198.18.0.0/15
+		"240.0.0.1",                // reserved
+		"250.1.2.3",                // inside 240.0.0.0/4
+		"::ffff:198.18.0.1",        // mapped benchmarking
+		"64:ff9b::c612:1",          // NAT64 of 198.18.0.1
+		"2002:f000:1::",            // 6to4 of 240.0.0.1
+		"::ffff:0:c000:1",          // IPv4-translated 192.0.0.1
 	}
 	for _, raw := range refused {
 		p, _, d := fakeNetProber(nil)
@@ -247,6 +257,10 @@ func TestDestinationRefusesTransitionForms(t *testing.T) {
 		"2001:4860::8888",  // global, outside Teredo's /32
 		"2606:4700::1111",  // global
 		"::ffff:0:808:808", // IPv4-translated 8.8.8.8
+		"192.0.1.1",        // just past 192.0.0.0/24
+		"198.17.255.255",   // just below 198.18.0.0/15
+		"198.20.0.1",       // just past 198.18.0.0/15
+		"8.8.8.8",          // public
 	}
 	for _, raw := range allowed {
 		if destinationRefused(netip.MustParseAddr(raw)) {

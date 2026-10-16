@@ -36,6 +36,7 @@ type fakeICMP struct {
 	mu       sync.Mutex
 	deadline time.Time
 	sent     int
+	reads    int
 }
 
 func newFakeICMP(answer func(seq int, data []byte) []fakePacket) *fakeICMP {
@@ -69,6 +70,7 @@ func (f *fakeICMP) WriteTo(b []byte, _ net.Addr) (int, error) {
 
 func (f *fakeICMP) ReadFrom(b []byte) (int, net.Addr, error) {
 	f.mu.Lock()
+	f.reads++
 	if len(f.readErrs) > 0 {
 		err := f.readErrs[0]
 		f.readErrs = f.readErrs[1:]
@@ -407,6 +409,14 @@ func TestICMPReplyPastItsOwnWaitIsLost(t *testing.T) {
 	res := p.probe(context.Background(), icmpMonitor(2))
 	if res.Sent != 2 || res.Lost != 1 || len(res.RTTsMs) != 1 || !res.Success {
 		t.Fatalf("echo 0 answered at 250 ms with a 150 ms wait must be lost: %+v", res)
+	}
+	// A wait shorter than the spacing must not turn the loop into a spin
+	// on a read deadline in the past.
+	conn.mu.Lock()
+	reads := conn.reads
+	conn.mu.Unlock()
+	if reads > 20 {
+		t.Fatalf("the run read %d times for 2 echoes; it is spinning", reads)
 	}
 }
 

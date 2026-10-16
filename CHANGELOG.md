@@ -49,13 +49,14 @@ Destinations, for tcp, http and icmp:
   rule; http never takes `target_node`, so an http check carrying one is
   judged like any other. The probe dials only the judged addresses, in
   resolver order, with no second lookup and no proxy from the environment.
-- The agent also refuses IPv6 forms that embed or reach IPv4 space and that
-  the shared rule does not judge yet: NAT64 (`64:ff9b::/96`), 6to4
-  (`2002::/16`) and IPv4-translated (`::ffff:0:0:0/96`) addresses are
-  judged by the IPv4 address they carry, and local-use NAT64
-  (`64:ff9b:1::/48`), IPv4-compatible (`::/96`), site-local (`fec0::/10`)
-  and Teredo (`2001::/32`) are refused outright. A zone never changes the
-  verdict.
+- The agent also refuses what the shared rule does not judge yet: the
+  reserved IPv4 ranges `192.0.0.0/24`, `198.18.0.0/15` and `240.0.0.0/4`;
+  NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`) and IPv4-translated
+  (`::ffff:0:0:0/96`) addresses, judged by the IPv4 address they carry;
+  and local-use NAT64 (`64:ff9b:1::/48`), IPv4-compatible (`::/96`),
+  site-local (`fec0::/10`) and Teredo (`2001::/32`), refused outright. A
+  zone never changes the verdict. This layer goes once the SDK rule covers
+  the same addresses.
 
 http:
 

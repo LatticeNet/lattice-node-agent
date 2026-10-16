@@ -79,10 +79,16 @@ func asciiHost(host string) (string, error) {
 	return host, nil
 }
 
-// IPv6 forms that carry or reach IPv4 space, which
-// model.MonitorDestinationRefused does not judge yet. The agent refuses
-// them as well, failing closed, until the shared rule covers them.
+// Addresses model.MonitorDestinationRefused does not judge yet: reserved
+// IPv4 ranges, and IPv6 forms that carry or reach IPv4 space. The agent
+// refuses them as well, failing closed, until the shared rule covers them;
+// then this layer goes.
 var (
+	reservedIPv4 = []netip.Prefix{
+		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments, RFC 6890
+		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking, RFC 2544
+		netip.MustParsePrefix("240.0.0.0/4"),   // reserved, RFC 1112
+	}
 	// Judged by the IPv4 address they embed.
 	nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")    // RFC 6052, last 32 bits
 	ipv4Translated = netip.MustParsePrefix("::ffff:0:0:0/96") // RFC 2765, last 32 bits
@@ -96,19 +102,19 @@ var (
 )
 
 // destinationRefused is the shared rule, model.MonitorDestinationRefused,
-// plus the IPv6 transition forms above. A zone never changes the verdict.
+// plus the ranges and forms above. An IPv6 transition address is judged by
+// the IPv4 address it embeds, by this same rule. A zone never changes the
+// verdict.
 func destinationRefused(addr netip.Addr) bool {
 	addr = addr.Unmap().WithZone("")
 	if model.MonitorDestinationRefused(addr) {
 		return true
 	}
-	if !addr.Is6() {
-		return false
+	if addr.Is4() {
+		return inAnyPrefix(reservedIPv4, addr)
 	}
-	for _, prefix := range transitionDeny {
-		if prefix.Contains(addr) {
-			return true
-		}
+	if inAnyPrefix(transitionDeny, addr) {
+		return true
 	}
 	b := addr.As16()
 	var embedded [4]byte
@@ -120,7 +126,16 @@ func destinationRefused(addr netip.Addr) bool {
 	default:
 		return false
 	}
-	return model.MonitorDestinationRefused(netip.AddrFrom4(embedded))
+	return destinationRefused(netip.AddrFrom4(embedded))
+}
+
+func inAnyPrefix(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // minDialSlice is the least time one address of several gets, as
