@@ -9,7 +9,7 @@ match it.
 
 Design 29, slice M2a (monitoring paths), the agent half of the wire
 contract in design 29 D11. Pins lattice-sdk
-v0.2.24-0.20261016114243-c9739fa61357. The version constant is unchanged;
+v0.2.24-0.20261016120438-f2689021eb38. The version constant is unchanged;
 the release names this section.
 
 Probe methods and facts:
@@ -43,8 +43,9 @@ Destinations, for tcp, http and icmp:
 
 - The target is resolved once and every address is judged with
   `model.MonitorDestinationRefused` (loopback, link-local, metadata,
-  multicast, private, carrier-grade NAT, reserved, benchmarking,
-  unspecified, broadcast, and the IPv6 transition forms below). One
+  multicast, private, carrier-grade NAT, reserved, benchmarking, the 6to4
+  relay anycast range, IPv6 discard-only, unspecified, broadcast, and the
+  IPv6 transition forms below). One
   refused address refuses the run with reason `destination_refused` and
   nothing is dialed. A tcp or icmp check with `target_node` set skips the
   rule; http never takes `target_node`, so an http check carrying one is

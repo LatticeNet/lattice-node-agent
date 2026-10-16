@@ -2,6 +2,7 @@ package prober
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,15 @@ func TestProbeTCPSuccess(t *testing.T) {
 	}
 	if res.Sent != 0 || res.Lost != 0 || res.RTTsMs != nil || res.Reason != "" {
 		t.Fatalf("a single-probe run carries no packet fields or reason: %+v", res)
+	}
+	wire, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"cert_not_after", "sent", "lost", "rtts_ms", "reason"} {
+		if strings.Contains(string(wire), `"`+key+`"`) {
+			t.Fatalf("a tcp result carries %s on the wire: %s", key, wire)
+		}
 	}
 }
 

@@ -203,7 +203,7 @@ func TestDestinationTargetNodeBypass(t *testing.T) {
 }
 
 // Reserved IPv4 ranges and IPv6 forms that embed or reach IPv4 space are
-// refused (model.MonitorDestinationRefused, from lattice-sdk c9739fa) on
+// refused (model.MonitorDestinationRefused, from lattice-sdk c9739fa and f268902) on
 // the probe path, before any dial; a transition form is judged by the IPv4
 // address it carries, and a zone does not change the verdict.
 func TestDestinationRefusesTransitionForms(t *testing.T) {
@@ -244,6 +244,10 @@ func TestDestinationRefusesTransitionForms(t *testing.T) {
 		"64:ff9b::c612:1",          // NAT64 of 198.18.0.1
 		"2002:f000:1::",            // 6to4 of 240.0.0.1
 		"::ffff:0:c000:1",          // IPv4-translated 192.0.0.1
+		"192.88.99.1",              // 6to4 relay anycast
+		"64:ff9b::c058:6301",       // NAT64 of 192.88.99.1
+		"100::1",                   // discard-only
+		"100::ffff:ffff:ffff:ffff", // top of 100::/64
 	}
 	for _, raw := range refused {
 		p, _, d := fakeNetProber(nil)
@@ -259,6 +263,8 @@ func TestDestinationRefusesTransitionForms(t *testing.T) {
 		"2606:4700::1111",  // global
 		"::ffff:0:808:808", // IPv4-translated 8.8.8.8
 		"192.0.1.1",        // just past 192.0.0.0/24
+		"192.88.100.1",     // just past 192.88.99.0/24
+		"100:0:0:1::1",     // just past 100::/64
 		"198.17.255.255",   // just below 198.18.0.0/15
 		"198.20.0.1",       // just past 198.18.0.0/15
 		"8.8.8.8",          // public
