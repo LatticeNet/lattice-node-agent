@@ -333,7 +333,7 @@ func TestReceiveLoopRecoversFromPanics(t *testing.T) {
 	if err := core.SetTable([]wire.TableEntry{{SourceID: testSource, Epoch: testEpoch, Key: pathKeyFor(testSource, testEpoch)}}); err != nil {
 		t.Fatal(err)
 	}
-	l := newLoop(conn, panicCore{core})
+	l := newLoop(conn, panicCore{core}, t0)
 	clock := &fakeClock{t: t0.Add(time.Minute)}
 	done := make(chan stopReason, 1)
 	go func() {
@@ -367,7 +367,7 @@ func TestCircuitBreakerClosesTheSocketForACooldown(t *testing.T) {
 	var binds atomic.Int32
 	r := NewResponder(false)
 	r.now = clock.now
-	r.sleep = func(time.Duration) {}
+	r.sleep = func(time.Duration, <-chan struct{}) {}
 	r.listen = func(netip.AddrPort) (packetConn, error) {
 		binds.Add(1)
 		c := newFakeConn()
@@ -432,7 +432,7 @@ func TestCircuitBreakerHoldsBelowAMinuteOrTheThreshold(t *testing.T) {
 		perSec  int
 	}{
 		{"58 seconds above the threshold", 58, breakerDropsPerSecond + 1},
-		{"three minutes below it", 180, breakerDropsPerSecond - 1},
+		{"two minutes below it", 120, breakerDropsPerSecond - 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			l := newTestLoop(t, t0)
@@ -478,5 +478,176 @@ func TestBindErrorIsShort(t *testing.T) {
 	got := bindError(netip.MustParseAddrPort("192.0.2.10:45000"), err)
 	if got != "bind udp 192.0.2.10:45000: bind: address already in use" {
 		t.Fatalf("%q", got)
+	}
+}
+
+// A pull that lands after Close binds nothing, and the facts read off.
+func TestApplyAfterCloseBindsNothing(t *testing.T) {
+	r, l, _ := listeningResponder(t, nil)
+	r.Close()
+	if f := r.Facts(); f.State != model.BeaconAgentOff || f.Bind != "" {
+		t.Fatalf("facts after close: %+v", f)
+	}
+	cfg := responderConfig(freeUDPPort(t))
+	r.Apply(cfg)
+	if len(l.calls()) != 1 {
+		t.Fatalf("Apply after Close bound again: %d binds", len(l.calls()))
+	}
+	if !bytes.Equal(cfg.Table[0].Key, make([]byte, wire.KeyLen)) {
+		t.Fatal("a refused pull's key was not wiped")
+	}
+}
+
+// A breaker trip that ends a loop after Apply already moved the socket
+// still starts the cooldown and closes the replacement.
+func TestBreakerTripDuringASwapClosesTheReplacement(t *testing.T) {
+	clock := &fakeClock{t: t0}
+	var conns []*fakeConn
+	r := NewResponder(false)
+	r.now = clock.now
+	r.listen = func(netip.AddrPort) (packetConn, error) {
+		c := newFakeConn()
+		conns = append(conns, c)
+		return c, nil
+	}
+	r.Apply(responderConfig(45000))
+	r.mu.Lock()
+	old := r.cur
+	r.mu.Unlock()
+	r.Apply(responderConfig(45001)) // the swap: old is closed, a new socket listens
+	<-old.done
+	r.loopEnded(old, stopBreaker, nil)
+	f := r.Facts()
+	if f.State != model.BeaconAgentCircuitOpen || !conns[1].isClosed() {
+		t.Fatalf("facts %+v, replacement closed %v", f, conns[1].isClosed())
+	}
+	clock.set(t0.Add(time.Minute))
+	r.Apply(responderConfig(45001))
+	if len(conns) != 2 || r.Facts().State != model.BeaconAgentCircuitOpen {
+		t.Fatalf("rebound during the cooldown: %d sockets, %+v", len(conns), r.Facts())
+	}
+	r.Close()
+}
+
+// errConn fails every read with a socket error that is not a close.
+type errConn struct{ *fakeConn }
+
+func (c errConn) ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error) {
+	select {
+	case <-c.closed:
+		return 0, netip.AddrPort{}, net.ErrClosed
+	default:
+		return 0, netip.AddrPort{}, &net.OpError{Op: "read", Net: "udp", Err: syscall.ENOBUFS}
+	}
+}
+
+// A socket whose reads keep failing closes after maxReadErrors, reads
+// bind_failed with the error, and is bound again on the same address after
+// bindRetryInterval.
+func TestSocketReadErrorsCloseAndRetry(t *testing.T) {
+	clock := &fakeClock{t: t0}
+	var binds atomic.Int32
+	r := NewResponder(false)
+	r.now = clock.now
+	r.sleep = func(time.Duration, <-chan struct{}) {}
+	r.listen = func(netip.AddrPort) (packetConn, error) {
+		binds.Add(1)
+		return errConn{newFakeConn()}, nil
+	}
+	r.Apply(responderConfig(45000))
+	waitFor(t, func() bool { return r.Facts().State == model.BeaconAgentBindFailed })
+	if f := r.Facts(); !strings.Contains(f.Error, "socket failed") || f.Port != 45000 {
+		t.Fatalf("facts %+v", f)
+	}
+	r.Apply(responderConfig(45000))
+	if binds.Load() != 1 {
+		t.Fatalf("rebound inside the retry interval: %d", binds.Load())
+	}
+	clock.set(t0.Add(bindRetryInterval + time.Second))
+	r.Apply(responderConfig(45000))
+	if binds.Load() != 2 {
+		t.Fatalf("not rebound after the interval: %d", binds.Load())
+	}
+	r.Close()
+}
+
+// Apply, Facts and Close from several goroutines against a live socket
+// with traffic: the race detector judges the lock discipline.
+func TestResponderConcurrentUse(t *testing.T) {
+	r, l, addr := listeningResponder(t, nil)
+	port := int(l.calls()[0].Port())
+	stop := make(chan struct{})
+	done := make(chan struct{}, 3)
+	pkts := make([][]byte, 256)
+	for i := range pkts {
+		pkts[i] = signedRequest(t, testSource, testEpoch, time.Now(), byte(i))
+	}
+	go func() {
+		// Traffic without t: errors after Close are expected here.
+		defer func() { done <- struct{}{} }()
+		c, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(addr))
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 128)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = c.Write(pkts[i%len(pkts)])
+			_ = c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+			_, _ = c.Read(buf)
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			r.Apply(responderConfig(port))
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = r.Facts()
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	r.Close()
+	close(stop)
+	for range 3 {
+		<-done
+	}
+	if f := r.Facts(); f.State != model.BeaconAgentOff {
+		t.Fatalf("facts after close: %+v", f)
+	}
+}
+
+// The pause the guard takes when the global budget is spent ends at once
+// when the socket closes.
+func TestCloseWakesAPausedLoop(t *testing.T) {
+	quit := make(chan struct{})
+	woke := make(chan struct{})
+	go func() {
+		sleepOrQuit(time.Hour, quit)
+		close(woke)
+	}()
+	close(quit)
+	select {
+	case <-woke:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pause did not end on quit")
 	}
 }

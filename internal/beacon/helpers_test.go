@@ -122,6 +122,7 @@ func listeningResponder(t *testing.T, now func() time.Time) (*Responder, *loopba
 	l := &loopbackListener{}
 	r := NewResponder(false)
 	r.listen = l.listen
+	r.refuseSource = allowLoopback
 	if now != nil {
 		r.now = now
 	}
@@ -253,5 +254,11 @@ func newTestLoop(t testing.TB, start time.Time) *loop {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return newLoop(nil, core)
+	return newLoop(nil, core, start)
+}
+
+// allowLoopback is the sender rule with loopback allowed, for responders
+// that tests reach over 127.0.0.1.
+func allowLoopback(from netip.AddrPort) bool {
+	return !from.Addr().IsLoopback() && sourceRefused(from)
 }

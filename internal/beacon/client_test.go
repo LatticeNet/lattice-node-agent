@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -190,15 +191,82 @@ func TestClientJudgesReplies(t *testing.T) {
 	})
 }
 
-// A connected socket that reads ECONNREFUSED means nothing listens at the
-// endpoint: beacon_not_listening.
+// A connected socket that reads ECONNREFUSED for more than one request,
+// or for the only one, means nothing listens at the endpoint:
+// beacon_not_listening. The requests go at the production spacing, since
+// kernels rate-limit port-unreachable replies to closer ones.
 func TestClientReportsNotListening(t *testing.T) {
-	closed := netip.MustParseAddrPort("127.0.0.1:" + strconv.Itoa(freeUDPPort(t)))
-	c, _ := testClient(t, closed, testEpoch)
-	c.wait = 2 * time.Second
-	res := c.Probe(context.Background(), beaconCheck(3))
-	if res.Success || res.Reason != model.PathReasonBeaconNotListening || res.Sent == 0 || res.Lost != res.Sent {
-		t.Fatalf("result %+v", res)
+	for _, packets := range []int{3, 1} {
+		closed := netip.MustParseAddrPort("127.0.0.1:" + strconv.Itoa(freeUDPPort(t)))
+		c, _ := testClient(t, closed, testEpoch)
+		c.spacing = model.MonitorPacketSpacingMs * time.Millisecond
+		c.wait = time.Second
+		res := c.Probe(context.Background(), beaconCheck(packets))
+		if res.Success || res.Reason != model.PathReasonBeaconNotListening || res.Sent == 0 || res.Lost != res.Sent {
+			t.Fatalf("%d packets: result %+v", packets, res)
+		}
+	}
+}
+
+// refusingConn reports ECONNREFUSED on its first read, as a forged or
+// stray port-unreachable would, and is otherwise the real socket.
+type refusingConn struct {
+	clientConn
+	refused bool
+}
+
+func (c *refusingConn) Read(b []byte) (int, error) {
+	if !c.refused {
+		c.refused = true
+		return 0, &net.OpError{Op: "read", Net: "udp", Err: syscall.ECONNREFUSED}
+	}
+	return c.clientConn.Read(b)
+}
+
+// One port-unreachable does not end a run: the authentic replies still
+// measure it, and without any reply a single refusal among several
+// requests reads as plain loss, not beacon_not_listening.
+func TestClientTreatsOneRefusalAsSoft(t *testing.T) {
+	_, _, local := listeningResponder(t, nil)
+	c, _ := testClient(t, local, testEpoch)
+	c.dial = func(ctx context.Context, _ netip.AddrPort) (clientConn, error) {
+		conn, err := dialUDP4(ctx, local)
+		if err != nil {
+			return nil, err
+		}
+		return &refusingConn{clientConn: conn}, nil
+	}
+	if res := c.Probe(context.Background(), beaconCheck(3)); !res.Success || res.Lost != 0 || res.Reason != "" {
+		t.Fatalf("healthy path with one refusal: %+v", res)
+	}
+	silent := fakeTarget(t, pathKeyFor(testSource, testEpoch), func(wire.Request, int) [][]byte { return nil })
+	c.dial = func(ctx context.Context, _ netip.AddrPort) (clientConn, error) {
+		conn, err := dialUDP4(ctx, silent)
+		if err != nil {
+			return nil, err
+		}
+		return &refusingConn{clientConn: conn}, nil
+	}
+	if res := c.Probe(context.Background(), beaconCheck(3)); res.Success || res.Reason != "" || res.Lost != 3 {
+		t.Fatalf("silent path with one refusal: %+v", res)
+	}
+}
+
+// A run whose context ends says it was cut short.
+func TestClientRunCutShort(t *testing.T) {
+	_, _, local := listeningResponder(t, nil)
+	c, _ := testClient(t, local, testEpoch)
+	conn, err := dialUDP4(context.Background(), local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, pk, _ := c.keys.lookup("t1")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	out := c.run(ctx, conn, testSource, &pk, make([]request, 3), time.Second)
+	if out.err == nil || !strings.Contains(out.err.Error(), "cut short") {
+		t.Fatalf("outcome %+v", out)
 	}
 }
 
@@ -281,10 +349,10 @@ func TestKeyringSetWipesAndValidates(t *testing.T) {
 			t.Fatalf("malformed entry for %q kept", target)
 		}
 	}
-	held := keys.keys
+	held := keys.keys["t1"]
 	keys.Set(nil)
-	if len(held) != 0 {
-		t.Fatal("the replaced map still holds keys")
+	if held.key != (wire.Key{}) {
+		t.Fatal("the replaced key was not wiped where it lived")
 	}
 	if _, _, ok := keys.lookup("t1"); ok {
 		t.Fatal("a nil config left a key")

@@ -84,9 +84,14 @@ type Responder struct {
 	listen     func(netip.AddrPort) (packetConn, error)
 	newHandler func(start time.Time) handler
 	now        func() time.Time
-	sleep      func(time.Duration)
+	// sleep waits d or until quit closes.
+	sleep func(d time.Duration, quit <-chan struct{})
+	// refuseSource reports a sender no reply may go to (sourceRefused;
+	// tests on loopback relax it).
+	refuseSource func(netip.AddrPort) bool
 
 	mu           sync.Mutex
+	closed       bool
 	onChange     func()
 	state        string
 	addr         netip.AddrPort // bound, or the last one tried
@@ -99,11 +104,13 @@ type Responder struct {
 	cur          *socket
 }
 
-// socket is one bound socket and the loop that serves it.
+// socket is one bound socket and the loop that serves it. quit closes
+// with the socket, so a loop paused by the guard wakes at once.
 type socket struct {
 	conn packetConn
 	core handler
 	loop *loop
+	quit chan struct{}
 	done chan struct{}
 }
 
@@ -116,10 +123,29 @@ func NewResponder(noBeacon bool) *Responder {
 		newHandler: func(start time.Time) handler {
 			return wire.NewResponder(start)
 		},
-		now:   time.Now,
-		sleep: time.Sleep,
-		state: model.BeaconAgentOff,
+		now:          time.Now,
+		sleep:        sleepOrQuit,
+		refuseSource: sourceRefused,
+		state:        model.BeaconAgentOff,
 	}
+}
+
+func sleepOrQuit(d time.Duration, quit <-chan struct{}) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-quit:
+	}
+}
+
+// sourceRefused reports a sender no reply may ever go to: a port of zero,
+// or an address of a class wire.AddressRefused names (anything but IPv4,
+// 0.0.0.0/8, loopback, link-local, multicast, 240.0.0.0/4 and broadcast).
+// Go enables SO_BROADCAST on every UDP socket, so without this a request
+// claiming 255.255.255.255 as its source would draw a broadcast reply.
+func sourceRefused(from netip.AddrPort) bool {
+	return from.Port() == 0 || wire.AddressRefused(from.Addr().Unmap())
 }
 
 // SetOnChange sets a function called, outside the responder's lock, after
@@ -180,6 +206,11 @@ func (r *Responder) Apply(cfg *model.BeaconResponderConfig) {
 		return
 	}
 	r.mu.Lock()
+	if r.closed {
+		// A pull that lands while the agent stops binds nothing.
+		r.mu.Unlock()
+		return
+	}
 	before := r.factsLocked()
 	r.applyLocked(cfg)
 	after := r.factsLocked()
@@ -241,7 +272,8 @@ func (r *Responder) applyLocked(cfg *model.BeaconResponderConfig) {
 			r.setLocked(model.BeaconAgentOff, addr, err.Error())
 			return
 		}
-		sk := &socket{conn: conn, core: core, loop: newLoop(conn, core), done: make(chan struct{})}
+		sk := &socket{conn: conn, core: core, loop: newLoop(conn, core, now), quit: make(chan struct{}), done: make(chan struct{})}
+		sk.loop.refuseSource = r.refuseSource
 		r.cur = sk
 		go r.serve(sk)
 		log.Printf("beacon: listening on udp %s for %d source ids", addr, sources)
@@ -272,47 +304,67 @@ func (r *Responder) closeLocked() {
 	if t := r.cur.core.LastAuthenticated(); t.After(r.lastAuth) {
 		r.lastAuth = t
 	}
+	close(r.cur.quit)
 	_ = r.cur.conn.Close()
 	log.Printf("beacon: socket on udp %s closed", r.addr)
 	r.cur = nil
 }
 
-// Close closes the socket for good, as the agent stops.
+// Close closes the socket for good, as the agent stops; a later Apply binds
+// nothing.
 func (r *Responder) Close() {
 	r.mu.Lock()
+	r.closed = true
 	sk := r.cur
 	r.closeLocked()
+	if !r.noBeacon {
+		r.setLocked(model.BeaconAgentOff, netip.AddrPort{}, "")
+	}
 	r.mu.Unlock()
 	if sk != nil {
 		<-sk.done
 	}
 }
 
-// serve runs one socket's loop and records why it ended when the socket
-// was not closed by Apply.
+// serve runs one socket's loop and records why it ended.
 func (r *Responder) serve(sk *socket) {
 	defer close(sk.done)
-	stop, err := sk.loop.serve(r.now, r.sleep)
+	stop, err := sk.loop.serve(r.now, func(d time.Duration) { r.sleep(d, sk.quit) })
+	r.loopEnded(sk, stop, err)
+}
+
+// loopEnded records why a socket's loop ended. A breaker trip starts the
+// cooldown even when Apply has already replaced the socket, and closes the
+// replacement too, so a new address cannot open straight into the flood
+// that closed the old one.
+func (r *Responder) loopEnded(sk *socket, stop stopReason, err error) {
 	r.mu.Lock()
-	if r.cur != sk {
+	now := r.now()
+	if stop == stopBreaker {
+		r.circuitUntil = now.Add(breakerCooldown)
+	}
+	switch {
+	case r.cur == sk:
+		if t := sk.core.LastAuthenticated(); t.After(r.lastAuth) {
+			r.lastAuth = t
+		}
+		close(sk.quit)
+		_ = sk.conn.Close()
+		r.cur = nil
+	case stop == stopBreaker && r.cur != nil:
+		r.closeLocked()
+	default:
+		// Apply or Close closed this socket and the state says so.
 		r.mu.Unlock()
 		return
 	}
-	if t := sk.core.LastAuthenticated(); t.After(r.lastAuth) {
-		r.lastAuth = t
-	}
-	_ = sk.conn.Close()
-	r.cur = nil
-	now := r.now()
-	switch stop {
-	case stopBreaker:
-		r.circuitUntil = now.Add(breakerCooldown)
+	if stop == stopBreaker {
 		r.setLocked(model.BeaconAgentCircuitOpen, r.addr, fmt.Sprintf("circuit breaker open: datagrams dropped in %d of the last %d seconds; the socket stays closed for %s", sk.loop.breaker.hotSeconds(), breakerWindowSeconds, breakerCooldown))
 		log.Printf("beacon: circuit breaker opened on udp %s after a minute of dropped datagrams; closed for %s", r.addr, breakerCooldown)
-	default:
+	} else {
 		r.lastBind = now
-		r.setLocked(model.BeaconAgentBindFailed, r.addr, "socket failed: "+errText(err))
-		log.Printf("beacon: socket on udp %s failed: %v", r.addr, errText(err))
+		r.setLocked(model.BeaconAgentBindFailed, r.addr, "socket failed: "+stopError(err))
+		log.Printf("beacon: socket on udp %s failed: %s", r.addr, stopError(err))
 	}
 	onChange := r.onChange
 	r.mu.Unlock()
@@ -321,7 +373,7 @@ func (r *Responder) serve(sk *socket) {
 	}
 }
 
-func errText(err error) string {
+func stopError(err error) string {
 	if err == nil {
 		return "closed"
 	}
@@ -420,25 +472,35 @@ const (
 // loop is the receive loop of one socket. Every field but the counters is
 // owned by the loop's goroutine.
 type loop struct {
-	conn    packetConn
-	core    handler
-	guard   guard
-	breaker breaker
-	buf     [wire.ReadBufferLen]byte
-	out     [wire.ReplyLen]byte
+	conn packetConn
+	core handler
+	// base is when the loop started; the guard and the breaker count from
+	// it on the monotonic clock.
+	base         time.Time
+	refuseSource func(netip.AddrPort) bool
+	guard        guard
+	breaker      breaker
+	buf          [wire.ReadBufferLen]byte
+	out          [wire.ReplyLen]byte
 
 	// Counters, read by tests and never sent anywhere.
-	verdicts   [verdictSlots]atomic.Uint64
-	guardDrops atomic.Uint64
-	panics     atomic.Uint64
-	replies    atomic.Uint64
+	verdicts    [verdictSlots]atomic.Uint64
+	guardDrops  atomic.Uint64
+	sourceDrops atomic.Uint64
+	panics      atomic.Uint64
+	replies     atomic.Uint64
 }
 
 // verdictSlots covers every wire.Verdict value.
 const verdictSlots = 16
 
-func newLoop(conn packetConn, core handler) *loop {
-	return &loop{conn: conn, core: core, guard: newGuard()}
+func newLoop(conn packetConn, core handler, base time.Time) *loop {
+	return &loop{conn: conn, core: core, base: base, refuseSource: sourceRefused, guard: newGuard()}
+}
+
+// mono is how long after the loop started now is, never negative.
+func (l *loop) mono(now time.Time) int64 {
+	return max(int64(now.Sub(l.base)), 0)
 }
 
 // serve reads datagrams until the socket closes, the breaker opens, reads
@@ -473,39 +535,52 @@ func (l *loop) serve(now func() time.Time, sleep func(time.Duration)) (stop stop
 		if l.breaker.open() {
 			return stopBreaker, nil
 		}
-		if nowNs := t.UnixNano(); l.guard.full(nowNs) {
+		if mono := l.mono(t); l.guard.full(mono) {
 			// Stop reading until the next second: the kernel drops the
 			// excess, which costs this process nothing.
-			l.breaker.saturate(nowNs)
-			sleep(time.Duration(int64(time.Second) - nowNs%int64(time.Second)))
+			l.breaker.saturate(mono)
+			sleep(time.Duration(int64(time.Second) - mono%int64(time.Second)))
 		}
 	}
 }
 
 // process decides one datagram received at now from from and returns the
 // length of the reply it wrote into l.out, zero for none. The order is the
-// guard, then the length, then wire.Responder.Handle, which checks framing,
-// source id and epoch before any HMAC, then the tag, then freshness,
-// replay and rate. A reply is never longer than the datagram it answers. A
-// panic drops the datagram and is counted; it never reaches the agent.
-// Nothing here allocates.
+// guard, then the sender (no reply ever goes to a broadcast, multicast,
+// loopback or port-zero address), then the length, then
+// wire.Responder.Handle, which checks framing, source id and epoch before
+// any HMAC, then the tag, then freshness, replay and rate. A reply is never
+// longer than the datagram it answers. A panic drops the datagram and is
+// counted; it never reaches the agent. Nothing here allocates.
 func (l *loop) process(now time.Time, pkt []byte, from netip.AddrPort) (n int) {
-	nowNs := now.UnixNano()
+	mono := l.mono(now)
 	defer func() {
 		if p := recover(); p != nil {
 			l.panics.Add(1)
-			l.breaker.record(nowNs, true)
+			l.breaker.record(mono, true)
 			n = 0
 		}
 	}()
-	if l.guard.allow(from.Addr(), nowNs) != guardAllow {
+	switch l.guard.allow(from.Addr(), mono) {
+	case guardGlobalFull:
 		l.guardDrops.Add(1)
-		l.breaker.record(nowNs, true)
+		l.breaker.saturate(mono)
+		return 0
+	case guardBucketFull:
+		// One address over its share is the guard doing its job; the
+		// breaker does not count it, so one host cannot close the socket.
+		l.guardDrops.Add(1)
+		l.breaker.record(mono, false)
+		return 0
+	}
+	if l.refuseSource(from) {
+		l.sourceDrops.Add(1)
+		l.breaker.record(mono, true)
 		return 0
 	}
 	if len(pkt) != wire.RequestLen {
 		l.verdicts[wire.DropLength].Add(1)
-		l.breaker.record(nowNs, true)
+		l.breaker.record(mono, true)
 		return 0
 	}
 	n, v := l.core.Handle(now, pkt, l.out[:])
@@ -513,9 +588,9 @@ func (l *loop) process(now time.Time, pkt []byte, from netip.AddrPort) (n int) {
 		l.verdicts[v].Add(1)
 	}
 	if n <= 0 || n > len(pkt) || n > len(l.out) || !v.Replied() {
-		l.breaker.record(nowNs, true)
+		l.breaker.record(mono, true)
 		return 0
 	}
-	l.breaker.record(nowNs, false)
+	l.breaker.record(mono, false)
 	return n
 }

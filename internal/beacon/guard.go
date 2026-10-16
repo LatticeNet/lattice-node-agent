@@ -9,21 +9,28 @@ import (
 
 // The pre-authentication CPU guard and the circuit breaker of design 29 D3.
 // Both are owned by one receive loop and are not safe for concurrent use.
+// Both count time in nanoseconds since the loop started, on the monotonic
+// clock, so a wall-clock step neither empties nor stretches a second.
 
 const (
-	// guardGlobalPerSecond is the most datagrams one second hands to
-	// Handle. Past it the receive loop stops reading until the next second,
-	// so the kernel drops the excess and the rest of the agent keeps its
-	// CPU.
+	// guardGlobalPerSecond is the most datagrams the receive loop reads in
+	// one second, whoever sends them. Past it the loop stops reading until
+	// the next second, so the kernel drops the excess and the rest of the
+	// agent keeps its CPU. Every datagram read counts, because reading is
+	// most of what a datagram costs; a flood at this rate from any number
+	// of addresses therefore pauses the loop for every source, which is the
+	// price of a bounded CPU.
 	guardGlobalPerSecond = 20000
 	// guardBuckets is the size of the counter array the guard indexes by a
 	// seeded hash of the sender's address. It is fixed: the guard never
 	// keeps a map keyed by addresses an attacker chooses.
 	guardBuckets = 1024
-	// guardPerBucketPerSecond is the most datagrams one bucket hands to
-	// Handle in one second, so one flooding address cannot take the whole
-	// global budget. A real source sends a few requests a second and the
-	// responder answers at most 20 a second per source id.
+	// guardPerBucketPerSecond is the most datagrams of one bucket that reach
+	// Handle in one second. Below the global budget, one flooding address
+	// therefore spends at most this much of the HMAC work and leaves the
+	// rest to other senders; it cannot stop the global budget from being
+	// spent by a flood at that rate. A real source sends a few requests a
+	// second and the responder answers at most 20 a second per source id.
 	guardPerBucketPerSecond = 1000
 )
 
@@ -79,8 +86,13 @@ func (g *guard) full(nowNs int64) bool {
 
 const (
 	// breakerDropsPerSecond makes a second hot: at least this many
-	// datagrams dropped in it, or the guard's global budget spent.
-	breakerDropsPerSecond = 1000
+	// datagrams dropped after the guard let them through, or the guard's
+	// global budget spent. It is a quarter of the global budget, so the
+	// breaker answers a flood that costs the host real CPU, not one a few
+	// hundred kilobytes a second can raise. Datagrams the guard refused for
+	// their bucket do not count: one address over its share is the guard
+	// working, and must not be able to close the socket alone.
+	breakerDropsPerSecond = guardGlobalPerSecond / 4
 	// breakerWindowSeconds and breakerHotSeconds: the breaker opens when
 	// the hot seconds of the last breakerWindowSeconds number at least
 	// breakerHotSeconds and the oldest of them was hot, so it opens on a
@@ -95,6 +107,7 @@ const (
 
 // breaker watches drops per second and opens after a minute of them.
 type breaker struct {
+	started   bool
 	sec       int64  // the second drops counts
 	drops     uint32 // drops in sec
 	saturated bool   // the guard's global budget ran out in sec
@@ -106,10 +119,10 @@ type breaker struct {
 // advance closes every second before nowSec. A clock that steps back keeps
 // counting into the current second.
 func (b *breaker) advance(nowSec int64) {
-	if nowSec <= b.sec {
+	if b.started && nowSec <= b.sec {
 		return
 	}
-	if b.sec != 0 {
+	if b.started {
 		var bit uint64
 		if b.isHot() {
 			bit = 1
@@ -121,7 +134,7 @@ func (b *breaker) advance(nowSec int64) {
 			b.hot <<= uint(gap)
 		}
 	}
-	b.sec, b.drops, b.saturated = nowSec, 0, false
+	b.started, b.sec, b.drops, b.saturated = true, nowSec, 0, false
 }
 
 func (b *breaker) isHot() bool {

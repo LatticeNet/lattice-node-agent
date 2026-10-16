@@ -70,9 +70,13 @@ func TestSocketDropPathAllocatesNothing(t *testing.T) {
 	to := server.LocalAddr().(*net.UDPAddr).AddrPort()
 	l := newTestLoop(t, t0)
 	l.conn = server
+	l.refuseSource = allowLoopback
 	pkt := signedRequest(t, 9, testEpoch, time.Now(), 1) // unknown source
 	allocs := testing.AllocsPerRun(200, func() {
 		if _, err := client.WriteToUDPAddrPort(pkt, to); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			t.Fatal(err)
 		}
 		n, from, err := l.conn.ReadFromUDPAddrPort(l.buf[:])
@@ -183,5 +187,76 @@ func TestBreakerWindow(t *testing.T) {
 	d.record(t0.Add(-time.Hour).UnixNano(), true)
 	if d.drops != 2 {
 		t.Fatalf("drops %d", d.drops)
+	}
+}
+
+// One address flooding below the global budget spends only its bucket's
+// share: other senders are still answered in the same second, and its
+// refusals do not count toward the breaker.
+func TestSingleAddressFloodLeavesOthersServed(t *testing.T) {
+	l := newTestLoop(t, t0)
+	now := t0.Add(10 * time.Minute)
+	flooder := netip.MustParseAddrPort("203.0.113.66:9")
+	junk := make([]byte, wire.RequestLen)
+	for i := range 3 * guardPerBucketPerSecond {
+		l.process(now.Add(time.Duration(i)), junk, flooder)
+	}
+	if got := l.guardDrops.Load(); got != 2*guardPerBucketPerSecond {
+		t.Fatalf("guard refused %d of the flood", got)
+	}
+	if n := l.process(now.Add(time.Millisecond), signedRequest(t, testSource, testEpoch, now, 1), sourceAddr); n != wire.ReplyLen {
+		t.Fatalf("a real source in the flooded second: %d bytes", n)
+	}
+	if l.breaker.drops != guardPerBucketPerSecond {
+		t.Fatalf("breaker counted %d drops; only the flood's share that reached Handle counts", l.breaker.drops)
+	}
+	// A minute of it from one host never opens the breaker.
+	m := newTestLoop(t, t0)
+	for sec := range 61 {
+		for i := range 3 * guardPerBucketPerSecond {
+			m.process(t0.Add(time.Duration(sec)*time.Second+time.Duration(i)*time.Microsecond), junk, flooder)
+		}
+		if m.breaker.open() {
+			t.Fatalf("one host opened the breaker at second %d", sec)
+		}
+	}
+}
+
+// No reply goes to a sender that is not a unicast host, even for a signed,
+// fresh request, and that drop allocates nothing.
+func TestNoReplyToBroadcastMulticastLoopbackOrPortZero(t *testing.T) {
+	now := t0.Add(10 * time.Minute)
+	l := newTestLoop(t, t0)
+	for i, from := range []string{"255.255.255.255:9", "224.0.0.1:9", "239.1.2.3:9", "127.0.0.1:9", "0.0.0.1:9", "169.254.169.254:9", "240.0.0.1:9", "198.51.100.7:0"} {
+		pkt := signedRequest(t, testSource, testEpoch, now, byte(i+1))
+		if n := l.process(now, pkt, netip.MustParseAddrPort(from)); n != 0 {
+			t.Fatalf("%s: replied %d bytes", from, n)
+		}
+	}
+	if got := l.sourceDrops.Load(); got != 8 {
+		t.Fatalf("%d sender drops", got)
+	}
+	pkt := signedRequest(t, testSource, testEpoch, now, 99)
+	bcast := netip.MustParseAddrPort("255.255.255.255:9")
+	if allocs := testing.AllocsPerRun(1000, func() { l.process(now, pkt, bcast) }); allocs != 0 {
+		t.Fatalf("%.1f allocations", allocs)
+	}
+	// A private sender, as a NAT source may be, is answered.
+	if n := l.process(now, pkt, netip.MustParseAddrPort("10.0.0.5:40000")); n != wire.ReplyLen {
+		t.Fatalf("private sender: %d bytes", n)
+	}
+}
+
+// The guard and the breaker count from the loop's start with time.Sub,
+// which reads the monotonic clock when both times carry it (as the loop's
+// start and every time.Now do), and never go below zero.
+func TestLoopCountsFromItsStart(t *testing.T) {
+	start := time.Now()
+	l := newTestLoop(t, start)
+	if got := l.mono(start.Add(1500 * time.Millisecond)); got != int64(1500*time.Millisecond) {
+		t.Fatalf("1.5 s after the start reads %d", got)
+	}
+	if got := l.mono(start.Add(-time.Hour)); got != 0 {
+		t.Fatalf("a time before the start reads %d", got)
 	}
 }

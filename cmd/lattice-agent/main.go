@@ -255,7 +255,7 @@ func main() {
 	// -no-exec is a hard kill switch: it disables task execution entirely,
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
-	flag.BoolVar(&cfg.NoBeacon, "no-beacon", os.Getenv("LATTICE_NO_BEACON") == "1", "never open the measurement beacon's UDP socket, whatever the server configures (node veto; beacon checks from this node still run)")
+	flag.BoolVar(&cfg.NoBeacon, "no-beacon", envVeto("LATTICE_NO_BEACON"), "never open the measurement beacon's UDP socket, whatever the server configures (node veto; beacon checks from this node still run)")
 	flag.StringVar(&cfg.TaskCgroupRoot, "task-cgroup-root", os.Getenv("LATTICE_TASK_CGROUP_ROOT"), "Linux cgroup v2 root for per-task caps; use \"auto\" for the agent service cgroup or leave empty to disable")
 	flag.StringVar(&cfg.TaskCgroupMemoryMax, "task-cgroup-memory-max", env("LATTICE_TASK_CGROUP_MEMORY_MAX", taskexec.DefaultCgroupMemoryMax), "memory.max value for per-task cgroups when -task-cgroup-root is set")
 	flag.StringVar(&cfg.TaskCgroupPidsMax, "task-cgroup-pids-max", env("LATTICE_TASK_CGROUP_PIDS_MAX", taskexec.DefaultCgroupPidsMax), "pids.max value for per-task cgroups when -task-cgroup-root is set")
@@ -926,6 +926,17 @@ func (cfg agentConfig) taskSandboxOptions() taskexec.SandboxOptions {
 		Cgroup:      cfg.taskCgroupConfig(),
 		WorkdirRoot: cfg.TaskWorkRoot,
 	}
+}
+
+// envVeto reads a node veto from the environment. It fails closed: any
+// value but empty, 0, false, no or off, in any case, sets the veto, so a
+// typo such as LATTICE_NO_BEACON=yes cannot leave a port open.
+func envVeto(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "", "0", "false", "no", "off":
+		return false
+	}
+	return true
 }
 
 // probeFacts is probe_methods and probe_refusals: the prober's kinds as

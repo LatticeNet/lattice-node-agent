@@ -23,7 +23,8 @@ import (
 type Keyring struct {
 	mu       sync.RWMutex
 	sourceID uint32
-	keys     map[string]pathKey
+	// keys holds pointers so a replaced key can be wiped where it lives.
+	keys map[string]*pathKey
 }
 
 type pathKey struct {
@@ -46,9 +47,9 @@ func (k *Keyring) GoString() string { return k.String() }
 // config without keys, leaves it holding none. An entry with no target, a
 // zero epoch or a key that is not wire.KeyLen bytes is skipped; when a
 // target appears twice the newest epoch wins. Set wipes the key bytes of
-// cfg.Keys once it has taken them.
+// cfg.Keys once it has taken them, and the keys it replaces.
 func (k *Keyring) Set(cfg *model.AgentBeaconConfig) {
-	next := map[string]pathKey{}
+	next := map[string]*pathKey{}
 	var source uint32
 	if cfg != nil {
 		source = cfg.SourceID
@@ -57,11 +58,13 @@ func (k *Keyring) Set(cfg *model.AgentBeaconConfig) {
 			if target == "" || e.Epoch == 0 || len(e.Key) != wire.KeyLen {
 				continue
 			}
-			if have, ok := next[target]; ok && have.epoch >= e.Epoch {
-				continue
+			if have, ok := next[target]; ok {
+				if have.epoch >= e.Epoch {
+					continue
+				}
+				clear(have.key[:])
 			}
-			var pk pathKey
-			pk.epoch = e.Epoch
+			pk := &pathKey{epoch: e.Epoch}
 			copy(pk.key[:], e.Key)
 			next[target] = pk
 		}
@@ -73,9 +76,10 @@ func (k *Keyring) Set(cfg *model.AgentBeaconConfig) {
 	old := k.keys
 	k.sourceID, k.keys = source, next
 	k.mu.Unlock()
-	for target, pk := range old {
+	for _, pk := range old {
+		// A probe running now holds its own copy (lookup), so wiping the
+		// replaced key here cannot change a run in flight.
 		clear(pk.key[:])
-		delete(old, target)
 	}
 }
 
@@ -87,7 +91,7 @@ func (k *Keyring) lookup(target string) (uint32, pathKey, bool) {
 	if !ok || k.sourceID == 0 {
 		return 0, pathKey{}, false
 	}
-	return k.sourceID, pk, true
+	return k.sourceID, *pk, true
 }
 
 // clientConn is the part of a connected UDP socket a run uses;
@@ -224,16 +228,18 @@ func (c *Client) Probe(ctx context.Context, m model.Monitor) model.MonitorResult
 
 // runOutcome is what a run learned besides its replies.
 type runOutcome struct {
-	refused bool        // the socket read or wrote ECONNREFUSED
-	status  wire.Status // the last non-ok status a signed reply carried
-	named   bool        // status is set
-	err     error       // the error that cut the run short
+	refusals int         // reads or writes that met ECONNREFUSED
+	status   wire.Status // the last non-ok status a signed reply carried
+	named    bool        // status is set
+	err      error       // the error that cut the run short
 }
 
 // run sends the requests on their schedule and reads replies in one
 // goroutine until every sent request was answered or the last one's wait
-// ran out. A request the socket will not send ends the sending there; one
-// that met ECONNREFUSED ends the run, since nothing listens at the target.
+// ran out. A request the socket will not send ends the sending there.
+// ECONNREFUSED is counted and the run goes on: one port-unreachable, which
+// an off-path host that guessed the socket's port can forge, must not end
+// a run whose authentic replies are still on their way.
 func (c *Client) run(ctx context.Context, conn clientConn, sourceID uint32, pk *pathKey, reqs []request, timeout time.Duration) runOutcome {
 	var out runOutcome
 	var pkt [wire.RequestLen]byte
@@ -243,7 +249,8 @@ func (c *Client) run(ctx context.Context, conn clientConn, sourceID uint32, pk *
 	var final time.Time
 	next, sent, answered, readErrs := 0, 0, 0, 0
 	for {
-		if ctx.Err() != nil {
+		if err := ctx.Err(); err != nil {
+			out.err = fmt.Errorf("run cut short: %w", err)
 			return out
 		}
 		now := time.Now()
@@ -256,11 +263,14 @@ func (c *Client) run(ctx context.Context, conn clientConn, sourceID uint32, pk *
 				r.sentAt = time.Now()
 				_, err = conn.Write(pkt[:])
 			}
+			if err != nil && refused(err) {
+				// The socket reported an earlier port-unreachable and did
+				// not send this request; the schedule goes on.
+				out.refusals++
+				next++
+				continue
+			}
 			if err != nil {
-				if refused(err) {
-					out.refused = true
-					return out
-				}
 				out.err = fmt.Errorf("send: %w", err)
 				planned = next
 				continue
@@ -289,8 +299,7 @@ func (c *Client) run(ctx context.Context, conn clientConn, sourceID uint32, pk *
 			case errors.Is(err, os.ErrDeadlineExceeded):
 				readErrs = 0
 			case refused(err):
-				out.refused = true
-				return out
+				out.refusals++
 			default:
 				if readErrs++; readErrs >= 3 || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 					out.err = fmt.Errorf("read: %w", err)
@@ -361,7 +370,10 @@ func fillResult(res *model.MonitorResult, reqs []request, out runOutcome) {
 		return
 	}
 	switch {
-	case out.refused:
+	case out.refusals >= 2 || (out.refusals == 1 && res.Sent <= 1):
+		// A port-unreachable for more than one request, or for the only
+		// one: a single refusal among several requests may be forged or
+		// transient and reads as plain loss.
 		res.Reason = model.PathReasonBeaconNotListening
 		res.Error = fmt.Sprintf("nothing listens at the beacon endpoint: the target refused the datagrams (port unreachable) after %d sent", res.Sent)
 	case out.named:

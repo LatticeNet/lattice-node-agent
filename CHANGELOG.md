@@ -24,25 +24,34 @@ Responder:
   65535; anything else is refused without a bind. A bound address is never
   the wildcard, so replies leave from the address requests arrived on.
 - Reads into a 128-byte buffer. Before authentication a CPU guard counts
-  datagrams in a fixed array of 1024 buckets keyed by a seeded hash of the
-  sender (at most 1000 a second per bucket) and 20000 a second in all; past
-  the global budget the loop stops reading until the next second, so the
-  kernel drops the excess. Anything not exactly 96 bytes is dropped, then
+  every datagram read, 20000 a second in all, and lets at most 1000 a second
+  of one bucket (a fixed array of 1024, keyed by a seeded hash of the
+  sender) reach the decision; past the global budget the loop stops reading
+  until the next second, so the kernel drops the excess. The guard counts on
+  the monotonic clock from the socket's start. No reply goes to a sender of
+  a class `beacon.AddressRefused` names (broadcast, multicast, loopback and
+  the rest) or to port zero, since Go enables `SO_BROADCAST` on every UDP
+  socket. Anything not exactly 96 bytes is dropped, then
   `beacon.Responder.Handle` decides in the contract's order. A reply is never
   longer than its request. The drop path allocates nothing.
 - A panic while deciding a datagram drops that datagram and is counted; the
   loop and the agent go on.
-- Circuit breaker: when at least 54 of the last 60 seconds each dropped 1000
-  datagrams or more (or spent the guard's global budget), the oldest of them
-  included, the socket closes for 5 minutes and the facts read
-  `circuit_open`. The next pull after the cooldown binds again.
+- Circuit breaker: when at least 54 of the last 60 seconds each dropped 5000
+  datagrams or more after the guard (a quarter of its global budget) or spent
+  that budget, the oldest of them included, the socket closes for 5 minutes
+  and the facts read `circuit_open`. Datagrams the guard refused for their
+  bucket do not count, so one host cannot close the socket below the global
+  budget. A trip that lands while a pull moves the socket closes the new one
+  too. The next pull after the cooldown binds again.
 - A bind failure reads `bind_failed` with a short error (at most 200 bytes)
   and is retried once a minute on the same address and port only, never on
   another port.
 - `-no-beacon` (`LATTICE_NO_BEACON=1`, kept by the installer like
   `LATTICE_NO_EXEC`) is fixed at startup and checked before anything else:
   the responder never binds, whatever the server sends, and reports
-  `refusal: "refused_by_node"`, state `refused`.
+  `refusal: "refused_by_node"`, state `refused`. The variable fails closed:
+  any value but empty, `0`, `false`, `no` or `off` sets the veto.
+- A pull that lands after the agent began to stop binds nothing.
 - Path keys from the pull are held in memory only, and the decoded copies are
   wiped once taken. No log line, debug line, fact, error or result carries a
   key, and the package writes no file; tests pin both.
@@ -70,9 +79,12 @@ Client (monitor kind `beacon`):
   verifies under the path key and carries the nonce and sequence of a request
   still waiting.
 - Results carry `sent`, `lost` and `rtts_ms` (the ok replies) like icmp. A run
-  with no ok reply carries `beacon_not_listening` when the socket read or
-  wrote `ECONNREFUSED`, else `beacon_stale`, `beacon_unknown_epoch` or
-  `beacon_rate_limited` from a signed reply; plain loss carries no reason.
+  with no ok reply carries `beacon_not_listening` when the socket met
+  `ECONNREFUSED` for more than one request (or for the only one), else
+  `beacon_stale`, `beacon_unknown_epoch` or `beacon_rate_limited` from a
+  signed reply; plain loss carries no reason. A refusal does not end the run,
+  so one forged or stray port-unreachable cannot cut short a run whose
+  authentic replies are on their way.
 
 ## 0.3.10-alpha.5 (2026-10-16)
 

@@ -68,6 +68,7 @@ func TestKeysNeverReachLogsFactsOrResults(t *testing.T) {
 	node := NewNode(false)
 	l := &loopbackListener{}
 	node.responder.listen = l.listen
+	node.responder.refuseSource = allowLoopback
 	node.client.spacing = 0
 	cfg := &model.AgentBeaconConfig{
 		SourceID:  testSource,

@@ -126,3 +126,17 @@ func TestBeaconKeysStayOutOfLogsDebugAndReports(t *testing.T) {
 		t.Fatal("the decoded pull still holds the keys")
 	}
 }
+
+// The beacon veto fails closed: only an explicit off value leaves the
+// responder allowed.
+func TestEnvVetoFailsClosed(t *testing.T) {
+	for value, want := range map[string]bool{
+		"": false, "0": false, "false": false, "FALSE": false, "no": false, "off": false, " 0 ": false,
+		"1": true, "true": true, "TRUE": true, "yes": true, "on": true, "2": true, "ture": true,
+	} {
+		t.Setenv("LATTICE_NO_BEACON", value)
+		if got := envVeto("LATTICE_NO_BEACON"); got != want {
+			t.Fatalf("LATTICE_NO_BEACON=%q: veto %v, want %v", value, got, want)
+		}
+	}
+}
