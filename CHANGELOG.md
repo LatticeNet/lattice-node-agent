@@ -5,6 +5,67 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
+## Unreleased
+
+Design 29, slice M2a (monitoring paths), the agent half of the wire
+contract in design 29 D11. Pins lattice-sdk
+v0.2.24-0.20261016105341-41ac9e8834cc. The version constant is unchanged;
+the release names this section.
+
+Probe methods and facts:
+
+- Hello and every heartbeat carry `probe_methods` (`http`, `tcp`, and `icmp`
+  when the host allows it) and `probe_refusals` (`{"icmp":
+  "icmp_not_permitted"}` when the kernel refuses unprivileged echo sockets,
+  which on Linux means `net.ipv4.ping_group_range` excludes every group of
+  the agent, root included). The agent asks the kernel at startup, again
+  every ten minutes, and at once when a run is refused.
+- `-compat-json` lists the feature `probe-methods-v1`.
+- A check of a kind this agent does not run (`beacon`, `tls`, anything
+  unknown) reports reason `agent_too_old` instead of a failure.
+
+icmp:
+
+- Unprivileged `udp4` echo sockets, no `CAP_NET_RAW`. `packets` echoes
+  (zero reads as 5, at most 10) 200 ms apart, each waiting `timeout_sec`.
+  Every echo carries a 32-byte payload, a fixed marker and 16 fresh random
+  bytes; a reply counts only if it is an echo reply from the target address
+  carrying an outstanding echo's whole payload, inside that echo's wait.
+- Results carry `sent`, `lost` and `rtts_ms` (replied echoes in send order);
+  `latency_ms` is their median and `success` means at least one reply. A
+  refused socket reports `icmp_not_permitted` with `sent` zero.
+
+Destinations, for tcp, http and icmp:
+
+- The target is resolved once and every address is judged with
+  `model.MonitorDestinationRefused` (loopback, link-local, metadata,
+  multicast, private, carrier-grade NAT, unspecified, broadcast). One
+  refused address refuses the run with reason `destination_refused` and
+  nothing is dialed. A check with `target_node` set skips the rule. The
+  probe dials only the judged addresses, in resolver order, with no second
+  lookup and no proxy from the environment.
+
+http:
+
+- GET only; redirects are never followed and a 3xx is judged against
+  `expect_status` (default `200-399`). Latency is the time to the response
+  headers; the body is closed unread.
+- Request headers from the check are sent. Secret headers are sent only over
+  https to exactly `secrets_origin`; otherwise the run reports
+  `destination_refused` and sends nothing. Headers the agent's stack owns
+  (`Host`, `Proxy-*` and the rest of the contract's list) are refused.
+- Error text drops the URL's user info, query and fragment and every header
+  value.
+
+Other:
+
+- A monitor restarts when `target_node`, `packets`, `expect_status`,
+  `headers` or `secrets_origin` change, not only its kind, target, interval
+  or timeout.
+- A run's deadline covers its echo spacing, and a monitor without a timeout
+  now gets the five seconds the prober always used instead of being cut at
+  two.
+
 ## 0.3.10-alpha.4 (unreleased)
 
 Prerelease. Changes since v0.3.10-alpha.3. Design 26, slice R1: the trace
