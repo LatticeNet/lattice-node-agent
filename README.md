@@ -360,6 +360,11 @@ missing checksum manifest aborts the install before the binary is written.
   `LATTICE_LOG_STATE_DIR`.
 - `LATTICE_NO_EXEC=1` is the hard kill switch and overrides execution/terminal
   enablement.
+- `LATTICE_NO_BEACON=1` (`-no-beacon`) is the node veto on the measurement
+  beacon of design 29: the agent never opens the beacon's UDP socket, whatever
+  the server configures, and reports `refused_by_node`. Beacon checks this node
+  runs against other nodes are not affected; they only send. The variable fails
+  closed: any value other than empty, `0`, `false`, `no` or `off` sets the veto.
 - `LATTICE_AGENT_RUN_USER` / `LATTICE_AGENT_RUN_GROUP` configure an optional
   non-root systemd service identity during install or reconfigure.
 - `LATTICE_AGENT_ALLOW_TERMINAL=1` enables audited browser terminal sessions.
