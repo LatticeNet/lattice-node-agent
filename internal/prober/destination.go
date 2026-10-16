@@ -21,8 +21,8 @@ type destinationError struct{ msg string }
 func (e *destinationError) Error() string { return e.msg }
 
 // resolveTarget resolves host once (an IP literal is not looked up) and
-// judges every address it got with destinationRefused, unless the control
-// plane resolved the target from a node (nodeTarget). One refused address
+// judges every address it got with model.MonitorDestinationRefused, unless
+// the control plane resolved the target from a node (nodeTarget). One refused address
 // refuses the run, so a name cannot smuggle a private address past the
 // rule beside a public one. The run then dials only the addresses returned
 // here; nothing looks the name up again.
@@ -54,7 +54,7 @@ func (p *prober) resolveTarget(ctx context.Context, host string, nodeTarget bool
 		return addrs, nil
 	}
 	for _, addr := range addrs {
-		if destinationRefused(addr) {
+		if model.MonitorDestinationRefused(addr) {
 			if literal {
 				return nil, &destinationError{msg: fmt.Sprintf("destination refused: %s is not a public address", addr)}
 			}
@@ -77,65 +77,6 @@ func asciiHost(host string) (string, error) {
 		}
 	}
 	return host, nil
-}
-
-// Addresses model.MonitorDestinationRefused does not judge yet: reserved
-// IPv4 ranges, and IPv6 forms that carry or reach IPv4 space. The agent
-// refuses them as well, failing closed, until the shared rule covers them;
-// then this layer goes.
-var (
-	reservedIPv4 = []netip.Prefix{
-		netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments, RFC 6890
-		netip.MustParsePrefix("198.18.0.0/15"), // benchmarking, RFC 2544
-		netip.MustParsePrefix("240.0.0.0/4"),   // reserved, RFC 1112
-	}
-	// Judged by the IPv4 address they embed.
-	nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")    // RFC 6052, last 32 bits
-	ipv4Translated = netip.MustParsePrefix("::ffff:0:0:0/96") // RFC 2765, last 32 bits
-	sixToFour      = netip.MustParsePrefix("2002::/16")       // RFC 3056, bits 16 to 47
-	transitionDeny = []netip.Prefix{
-		netip.MustParsePrefix("64:ff9b:1::/48"), // local-use NAT64, RFC 8215
-		netip.MustParsePrefix("::/96"),          // IPv4-compatible, deprecated
-		netip.MustParsePrefix("fec0::/10"),      // site-local, deprecated
-		netip.MustParsePrefix("2001::/32"),      // Teredo
-	}
-)
-
-// destinationRefused is the shared rule, model.MonitorDestinationRefused,
-// plus the ranges and forms above. An IPv6 transition address is judged by
-// the IPv4 address it embeds, by this same rule. A zone never changes the
-// verdict.
-func destinationRefused(addr netip.Addr) bool {
-	addr = addr.Unmap().WithZone("")
-	if model.MonitorDestinationRefused(addr) {
-		return true
-	}
-	if addr.Is4() {
-		return inAnyPrefix(reservedIPv4, addr)
-	}
-	if inAnyPrefix(transitionDeny, addr) {
-		return true
-	}
-	b := addr.As16()
-	var embedded [4]byte
-	switch {
-	case nat64WellKnown.Contains(addr), ipv4Translated.Contains(addr):
-		copy(embedded[:], b[12:16])
-	case sixToFour.Contains(addr):
-		copy(embedded[:], b[2:6])
-	default:
-		return false
-	}
-	return destinationRefused(netip.AddrFrom4(embedded))
-}
-
-func inAnyPrefix(prefixes []netip.Prefix, addr netip.Addr) bool {
-	for _, prefix := range prefixes {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
 }
 
 // minDialSlice is the least time one address of several gets, as

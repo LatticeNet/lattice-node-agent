@@ -9,7 +9,7 @@ match it.
 
 Design 29, slice M2a (monitoring paths), the agent half of the wire
 contract in design 29 D11. Pins lattice-sdk
-v0.2.24-0.20261016112120-da0390e10a30. The version constant is unchanged;
+v0.2.24-0.20261016114243-c9739fa61357. The version constant is unchanged;
 the release names this section.
 
 Probe methods and facts:
@@ -43,20 +43,18 @@ Destinations, for tcp, http and icmp:
 
 - The target is resolved once and every address is judged with
   `model.MonitorDestinationRefused` (loopback, link-local, metadata,
-  multicast, private, carrier-grade NAT, unspecified, broadcast). One
+  multicast, private, carrier-grade NAT, reserved, benchmarking,
+  unspecified, broadcast, and the IPv6 transition forms below). One
   refused address refuses the run with reason `destination_refused` and
   nothing is dialed. A tcp or icmp check with `target_node` set skips the
   rule; http never takes `target_node`, so an http check carrying one is
   judged like any other. The probe dials only the judged addresses, in
   resolver order, with no second lookup and no proxy from the environment.
-- The agent also refuses what the shared rule does not judge yet: the
-  reserved IPv4 ranges `192.0.0.0/24`, `198.18.0.0/15` and `240.0.0.0/4`;
-  NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`) and IPv4-translated
-  (`::ffff:0:0:0/96`) addresses, judged by the IPv4 address they carry;
-  and local-use NAT64 (`64:ff9b:1::/48`), IPv4-compatible (`::/96`),
-  site-local (`fec0::/10`) and Teredo (`2001::/32`), refused outright. A
-  zone never changes the verdict. This layer goes once the SDK rule covers
-  the same addresses.
+- Under that rule NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`) and
+  IPv4-translated (`::ffff:0:0:0/96`) addresses are judged by the IPv4
+  address they carry, and local-use NAT64 (`64:ff9b:1::/48`),
+  IPv4-compatible (`::/96`), site-local (`fec0::/10`) and Teredo
+  (`2001::/32`) are refused outright. A zone never changes the verdict.
 
 http:
 

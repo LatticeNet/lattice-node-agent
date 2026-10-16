@@ -203,7 +203,8 @@ func TestDestinationTargetNodeBypass(t *testing.T) {
 }
 
 // Reserved IPv4 ranges and IPv6 forms that embed or reach IPv4 space are
-// refused beyond the shared rule; a transition form is judged by the IPv4
+// refused (model.MonitorDestinationRefused, from lattice-sdk c9739fa) on
+// the probe path, before any dial; a transition form is judged by the IPv4
 // address it carries, and a zone does not change the verdict.
 func TestDestinationRefusesTransitionForms(t *testing.T) {
 	refused := []string{
@@ -263,7 +264,7 @@ func TestDestinationRefusesTransitionForms(t *testing.T) {
 		"8.8.8.8",          // public
 	}
 	for _, raw := range allowed {
-		if destinationRefused(netip.MustParseAddr(raw)) {
+		if model.MonitorDestinationRefused(netip.MustParseAddr(raw)) {
 			t.Fatalf("%s is public and was refused", raw)
 		}
 	}
