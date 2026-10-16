@@ -5,7 +5,7 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## Unreleased
+## 0.3.10-alpha.6 (2026-10-16)
 
 Design 29, slice M2b (monitoring paths), the agent half of the measurement
 beacon: the responder of D3 and the client, against the wire contract in
