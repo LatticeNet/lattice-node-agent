@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -27,6 +28,8 @@ type fakePacket struct {
 // fakeICMP is an echo socket whose replies a test scripts per echo.
 type fakeICMP struct {
 	answer   func(seq int, data []byte) []fakePacket
+	writeErr func(seq int) error // nil, or the error a send of seq gets
+	readErrs []error             // returned by the next reads, in order
 	inbox    chan fakePacket
 	closed   chan struct{}
 	once     sync.Once
@@ -45,6 +48,11 @@ func (f *fakeICMP) WriteTo(b []byte, _ net.Addr) (int, error) {
 		return 0, err
 	}
 	body := msg.Body.(*icmp.Echo)
+	if f.writeErr != nil {
+		if err := f.writeErr(body.Seq); err != nil {
+			return 0, err
+		}
+	}
 	f.mu.Lock()
 	f.sent++
 	f.mu.Unlock()
@@ -61,6 +69,12 @@ func (f *fakeICMP) WriteTo(b []byte, _ net.Addr) (int, error) {
 
 func (f *fakeICMP) ReadFrom(b []byte) (int, net.Addr, error) {
 	f.mu.Lock()
+	if len(f.readErrs) > 0 {
+		err := f.readErrs[0]
+		f.readErrs = f.readErrs[1:]
+		f.mu.Unlock()
+		return 0, nil, err
+	}
 	wait := time.Until(f.deadline)
 	f.mu.Unlock()
 	timer := time.NewTimer(max(wait, 0))
@@ -175,20 +189,22 @@ func TestICMPRejectsPartialPayloads(t *testing.T) {
 // RTTs come in send order, only for echoes that came back; LatencyMs is
 // their median and lost echoes are counted.
 func TestICMPMultiPacketCountsAndMedian(t *testing.T) {
-	delays := map[int]time.Duration{0: 90 * time.Millisecond, 2: 5 * time.Millisecond, 3: 45 * time.Millisecond}
+	delays := map[int]time.Duration{0: 300 * time.Millisecond, 2: 20 * time.Millisecond, 3: 150 * time.Millisecond}
 	conn := newFakeICMP(func(seq int, data []byte) []fakePacket {
 		if d, ok := delays[seq]; ok {
 			return []fakePacket{reply(seq, data, d)}
 		}
 		return nil
 	})
-	res := fakeICMPProber(conn).probe(context.Background(), icmpMonitor(5))
+	p := fakeICMPProber(conn)
+	p.echoWait = time.Second
+	res := p.probe(context.Background(), icmpMonitor(5))
 	if res.Sent != 5 || res.Lost != 2 || len(res.RTTsMs) != 3 || conn.sentCount() != 5 {
 		t.Fatalf("want sent 5 lost 2 and three RTTs, got %+v (socket saw %d)", res, conn.sentCount())
 	}
 	r := res.RTTsMs
 	if !(r[0] > r[2] && r[2] > r[1]) {
-		t.Fatalf("RTTs %v are not in send order (90, 5, 45 ms)", r)
+		t.Fatalf("RTTs %v are not in send order (300, 20, 150 ms)", r)
 	}
 	if res.LatencyMs != r[2] {
 		t.Fatalf("latency %v is not the median of %v", res.LatencyMs, r)
@@ -373,5 +389,112 @@ func TestICMPRealSocketRefusesLoopbackWithoutNode(t *testing.T) {
 	res := p.probe(context.Background(), model.Monitor{Type: model.MonitorTypeICMP, Target: "127.0.0.1", TimeoutSec: 1})
 	if res.Reason != model.PathReasonDestinationRefused || opened {
 		t.Fatalf("want %s without a socket, got %+v opened=%v", model.PathReasonDestinationRefused, res, opened)
+	}
+}
+
+// A reply that lands after its own echo's wait but while the run is still
+// waiting for a later echo does not count.
+func TestICMPReplyPastItsOwnWaitIsLost(t *testing.T) {
+	conn := newFakeICMP(func(seq int, data []byte) []fakePacket {
+		if seq == 0 {
+			return []fakePacket{reply(seq, data, 250*time.Millisecond)}
+		}
+		return []fakePacket{reply(seq, data, 10*time.Millisecond)}
+	})
+	p := fakeICMPProber(conn)
+	p.spacing = 200 * time.Millisecond
+	p.echoWait = 150 * time.Millisecond
+	res := p.probe(context.Background(), icmpMonitor(2))
+	if res.Sent != 2 || res.Lost != 1 || len(res.RTTsMs) != 1 || !res.Success {
+		t.Fatalf("echo 0 answered at 250 ms with a 150 ms wait must be lost: %+v", res)
+	}
+}
+
+// An echo the kernel will not send never left: it is neither sent nor
+// lost, sending stops there, and the run does not wait out its budget.
+func TestICMPSendErrorEndsSending(t *testing.T) {
+	unreachable := &os.SyscallError{Syscall: "sendto", Err: syscall.ENETUNREACH}
+
+	conn := newFakeICMP(func(int, []byte) []fakePacket { return nil })
+	conn.writeErr = func(int) error { return unreachable }
+	p := fakeICMPProber(conn)
+	p.echoWait = 2 * time.Second
+	start := time.Now()
+	res := p.probe(context.Background(), icmpMonitor(5))
+	if res.Sent != 0 || res.Lost != 0 || res.Success || res.Reason != "" {
+		t.Fatalf("no echo left: want sent 0 and a failure, got %+v", res)
+	}
+	if !strings.Contains(res.Error, "network is unreachable") {
+		t.Fatalf("error %q does not say why", res.Error)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("a run that sent nothing waited %s", took)
+	}
+
+	conn = newFakeICMP(func(seq int, data []byte) []fakePacket { return []fakePacket{reply(seq, data, time.Millisecond)} })
+	conn.writeErr = func(seq int) error {
+		if seq >= 2 {
+			return unreachable
+		}
+		return nil
+	}
+	p = fakeICMPProber(conn)
+	p.echoWait = 2 * time.Second
+	start = time.Now()
+	res = p.probe(context.Background(), icmpMonitor(5))
+	if res.Sent != 2 || res.Lost != 0 || len(res.RTTsMs) != 2 || !res.Success {
+		t.Fatalf("two echoes left and came back: want sent 2 lost 0, got %+v", res)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the run waited %s after every sent echo came back", took)
+	}
+}
+
+// One read error is transient and the run goes on; a socket that keeps
+// failing ends the run with the error instead of spinning.
+func TestICMPReadErrors(t *testing.T) {
+	transient := &os.SyscallError{Syscall: "recvfrom", Err: syscall.EINTR}
+	conn := newFakeICMP(func(seq int, data []byte) []fakePacket { return []fakePacket{reply(seq, data, 5*time.Millisecond)} })
+	conn.readErrs = []error{transient}
+	res := fakeICMPProber(conn).probe(context.Background(), icmpMonitor(3))
+	if res.Sent != 3 || res.Lost != 0 || !res.Success {
+		t.Fatalf("one read error lost replies: %+v", res)
+	}
+
+	conn = newFakeICMP(func(int, []byte) []fakePacket { return nil })
+	conn.readErrs = []error{transient, transient, transient, transient}
+	p := fakeICMPProber(conn)
+	p.echoWait = 2 * time.Second
+	start := time.Now()
+	res = p.probe(context.Background(), icmpMonitor(1))
+	if res.Success || res.Sent != 1 || !strings.Contains(res.Error, "interrupted system call") {
+		t.Fatalf("a failing socket: want a failure naming the read error, got %+v", res)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("a failing socket held the run for %s", took)
+	}
+}
+
+// blockingResolver never answers; only its context ends a lookup.
+type blockingResolver struct{}
+
+func (blockingResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A run is bounded by its own deadline even when the caller's context has
+// none: a lookup that never answers ends with the run's budget.
+func TestICMPRunHasItsOwnDeadline(t *testing.T) {
+	p := fakeICMPProber(newFakeICMP(nil))
+	p.resolver = blockingResolver{}
+	p.echoWait = 100 * time.Millisecond
+	start := time.Now()
+	res := p.probe(context.Background(), model.Monitor{Type: model.MonitorTypeICMP, Target: "slow.example", Packets: 1, TimeoutSec: 1})
+	if res.Success || res.Sent != 0 || res.Error == "" {
+		t.Fatalf("want a failure with nothing sent, got %+v", res)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("run took %s; its bound is the wait plus a second", took)
 	}
 }

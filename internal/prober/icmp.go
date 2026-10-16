@@ -77,6 +77,10 @@ func (p *prober) probeICMP(ctx context.Context, m model.Monitor, timeout time.Du
 	if p.echoWait > 0 {
 		timeout = p.echoWait
 	}
+	// The run's own bound: every echo's spacing and wait, and a second of
+	// slack for a name lookup and scheduling.
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(icmpPackets(m)-1)*p.spacing+timeout+time.Second)
+	defer cancel()
 	target, err := p.icmpTarget(ctx, m)
 	if err != nil {
 		var refused *destinationError
@@ -110,8 +114,8 @@ func (p *prober) probeICMP(ctx context.Context, m model.Monitor, timeout time.Du
 			return
 		}
 	}
-	sendErr := p.runEchoes(ctx, conn, target, echoes, timeout)
-	fillICMPResult(res, echoes, sendErr)
+	runErr := p.runEchoes(ctx, conn, target, echoes, timeout)
+	fillICMPResult(res, echoes, runErr)
 }
 
 // icmpTarget resolves and judges the target and picks its IPv4 address;
@@ -136,20 +140,30 @@ func (p *prober) icmpTarget(ctx context.Context, m model.Monitor) (netip.Addr, e
 	return netip.Addr{}, fmt.Errorf("icmp target %s has no IPv4 address", host)
 }
 
-// runEchoes sends every echo on its schedule and reads replies in one
-// goroutine until every echo replied or the last one's wait ran out. It
-// returns the first send error.
+// maxReadErrors is how many read errors in a row end a run; one is
+// tolerated as transient, a socket that keeps failing is not spun on.
+const maxReadErrors = 3
+
+// runEchoes sends the echoes on their schedule and reads replies in one
+// goroutine until every sent echo replied or the last one's wait ran out.
+// An echo the kernel will not send ends the sending there: it never left,
+// so it is neither sent nor lost, and the run waits only for the echoes
+// already out. It returns the error that cut the run short, if any.
 func (p *prober) runEchoes(ctx context.Context, conn icmpConn, target netip.Addr, echoes []echo, timeout time.Duration) error {
 	dst := &net.UDPAddr{IP: target.AsSlice()}
 	id := os.Getpid() & 0xffff
 	buf := make([]byte, icmpReadBuffer)
 	start := time.Now()
-	final := start.Add(time.Duration(len(echoes)-1)*p.spacing + timeout)
-	var sendErr error
-	next, replied := 0, 0
+	planned := len(echoes)
+	var final time.Time // the wait of the last echo sent
+	var runErr error
+	next, sent, replied, readErrs := 0, 0, 0, 0
 	for {
+		if ctx.Err() != nil {
+			return runErr
+		}
 		now := time.Now()
-		if next < len(echoes) && !now.Before(start.Add(time.Duration(next)*p.spacing)) {
+		if next < planned && !now.Before(start.Add(time.Duration(next)*p.spacing)) {
 			e := &echoes[next]
 			msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: id, Seq: next, Data: e.payload[:]}}
 			wire, err := msg.Marshal(nil)
@@ -157,27 +171,28 @@ func (p *prober) runEchoes(ctx context.Context, conn icmpConn, target netip.Addr
 				e.sentAt = time.Now()
 				_, err = conn.WriteTo(wire, dst)
 			}
+			if err != nil {
+				runErr = fmt.Errorf("send: %w", err)
+				planned = next
+				continue
+			}
 			e.sent = true
-			if err != nil && sendErr == nil {
-				sendErr = err
-			}
-			if end := e.sentAt.Add(timeout); end.After(final) {
-				final = end
-			}
+			sent++
+			final = e.sentAt.Add(timeout)
 			next++
 			continue
 		}
-		if (next == len(echoes) && replied == next) || !now.Before(final) || ctx.Err() != nil {
-			return sendErr
+		if next == planned && (replied == sent || !now.Before(final)) {
+			return runErr
 		}
 		deadline := final
-		if next < len(echoes) {
-			if sendAt := start.Add(time.Duration(next) * p.spacing); sendAt.Before(deadline) {
+		if next < planned {
+			if sendAt := start.Add(time.Duration(next) * p.spacing); final.IsZero() || sendAt.Before(deadline) {
 				deadline = sendAt
 			}
 		}
 		if err := conn.SetReadDeadline(deadline); err != nil {
-			return sendErr
+			return fmt.Errorf("read: %w", err)
 		}
 		n, peer, err := conn.ReadFrom(buf)
 		recvAt := time.Now()
@@ -185,8 +200,12 @@ func (p *prober) runEchoes(ctx context.Context, conn icmpConn, target netip.Addr
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
-			return sendErr
+			if readErrs++; readErrs >= maxReadErrors || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				return fmt.Errorf("read: %w", err)
+			}
+			continue
 		}
+		readErrs = 0
 		if matchReply(buf[:n], peer, target, echoes, recvAt, timeout) {
 			replied++
 		}
@@ -240,7 +259,9 @@ func peerAddr(peer net.Addr) netip.Addr {
 	return addr.Unmap()
 }
 
-func fillICMPResult(res *model.MonitorResult, echoes []echo, sendErr error) {
+// fillICMPResult reports the echoes that left. An error that cut the run
+// short explains a run with no reply; a run with a reply is a success.
+func fillICMPResult(res *model.MonitorResult, echoes []echo, runErr error) {
 	for _, e := range echoes {
 		if !e.sent {
 			continue
@@ -256,8 +277,8 @@ func fillICMPResult(res *model.MonitorResult, echoes []echo, sendErr error) {
 		res.LatencyMs = median(res.RTTsMs)
 		return
 	}
-	if sendErr != nil {
-		res.Error = "icmp echo: " + sendErr.Error()
+	if runErr != nil {
+		res.Error = fmt.Sprintf("icmp echo after %d sent: %v", res.Sent, runErr)
 		return
 	}
 	res.Error = fmt.Sprintf("no reply to %d icmp echoes", res.Sent)

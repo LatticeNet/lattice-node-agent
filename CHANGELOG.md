@@ -34,6 +34,10 @@ icmp:
 - Results carry `sent`, `lost` and `rtts_ms` (replied echoes in send order);
   `latency_ms` is their median and `success` means at least one reply. A
   refused socket reports `icmp_not_permitted` with `sent` zero.
+- An echo the kernel will not send (no route, a local firewall) never left:
+  sending stops there, it is neither sent nor lost, and the run waits only
+  for the echoes already out. One read error is tolerated; three in a row
+  end the run with the error.
 
 Destinations, for tcp, http and icmp:
 
@@ -41,15 +45,25 @@ Destinations, for tcp, http and icmp:
   `model.MonitorDestinationRefused` (loopback, link-local, metadata,
   multicast, private, carrier-grade NAT, unspecified, broadcast). One
   refused address refuses the run with reason `destination_refused` and
-  nothing is dialed. A check with `target_node` set skips the rule. The
-  probe dials only the judged addresses, in resolver order, with no second
-  lookup and no proxy from the environment.
+  nothing is dialed. A tcp or icmp check with `target_node` set skips the
+  rule; http never takes `target_node`, so an http check carrying one is
+  judged like any other. The probe dials only the judged addresses, in
+  resolver order, with no second lookup and no proxy from the environment.
+- The agent also refuses IPv6 forms that embed or reach IPv4 space and that
+  the shared rule does not judge yet: NAT64 (`64:ff9b::/96`), 6to4
+  (`2002::/16`) and IPv4-translated (`::ffff:0:0:0/96`) addresses are
+  judged by the IPv4 address they carry, and local-use NAT64
+  (`64:ff9b:1::/48`), IPv4-compatible (`::/96`), site-local (`fec0::/10`)
+  and Teredo (`2001::/32`) are refused outright. A zone never changes the
+  verdict.
 
 http:
 
 - GET only; redirects are never followed and a 3xx is judged against
   `expect_status` (default `200-399`). Latency is the time to the response
   headers; the body is closed unread.
+- An internationalized host is looked up and dialed in punycode, as
+  net/http sends it.
 - Request headers from the check are sent. Secret headers are sent only over
   https to exactly `secrets_origin`; otherwise the run reports
   `destination_refused` and sends nothing. Headers the agent's stack owns

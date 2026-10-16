@@ -5,10 +5,12 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"golang.org/x/net/ipv4"
 )
 
 // fakeResolver answers lookups from a table and counts them.
@@ -175,11 +177,12 @@ func TestDestinationAllowsPublicLiteral(t *testing.T) {
 	}
 }
 
-// A target the control plane resolved from a node (target_node) skips the
-// private-range rule: nodes reach each other over private networks.
+// A tcp or icmp target the control plane resolved from a node
+// (target_node) skips the private-range rule: nodes reach each other over
+// private networks. http never takes target_node (TestHTTPIgnoresTargetNode).
 func TestDestinationTargetNodeBypass(t *testing.T) {
-	for _, host := range []string{"10.1.2.3", "100.64.0.1", "127.0.0.1"} {
-		p, _, d := fakeNetProber(nil)
+	for _, host := range []string{"10.1.2.3", "100.64.0.1", "127.0.0.1", "wg.example"} {
+		p, _, d := fakeNetProber(map[string][]string{"wg.example": {"10.8.0.2"}})
 		m := monitorFor(model.MonitorTypeTCP, host)
 		m.TargetNode = testNode
 		if res := p.probe(context.Background(), m); !res.Success {
@@ -189,14 +192,65 @@ func TestDestinationTargetNodeBypass(t *testing.T) {
 			t.Fatalf("%s with target_node: want one dial, got %v", host, d.addresses())
 		}
 	}
-	p, _, d := fakeNetProber(map[string][]string{"wg.example": {"10.8.0.2"}})
-	m := monitorFor(model.MonitorTypeHTTP, "wg.example")
-	m.TargetNode = testNode
-	res := p.probe(context.Background(), m)
-	if res.Reason == model.PathReasonDestinationRefused {
-		t.Fatalf("a node target resolving to a private address was refused: %+v", res)
+	conn := newFakeICMP(func(seq int, data []byte) []fakePacket {
+		return []fakePacket{{from: netip.MustParseAddr("10.1.2.3"), wire: wireMessage(ipv4.ICMPTypeEchoReply, seq, data)}}
+	})
+	p := fakeICMPProber(conn)
+	m := model.Monitor{Type: model.MonitorTypeICMP, Target: "10.1.2.3", TargetNode: testNode, Packets: 2, TimeoutSec: 1}
+	if res := p.probe(context.Background(), m); !res.Success || res.Sent != 2 || res.Lost != 0 {
+		t.Fatalf("icmp to a node's private address: want 2 of 2, got %+v", res)
 	}
-	if got := d.addresses(); len(got) != 1 || got[0] != "10.8.0.2:80" {
-		t.Fatalf("dialed %v, want the resolved node address", got)
+}
+
+// IPv6 forms that embed or reach IPv4 space are judged by the IPv4 address
+// they carry, or refused outright, beyond the shared rule; a zone does not
+// change the verdict.
+func TestDestinationRefusesTransitionForms(t *testing.T) {
+	refused := []string{
+		"64:ff9b::a9fe:a9fe",       // NAT64 of 169.254.169.254
+		"64:ff9b::a00:1",           // NAT64 of 10.0.0.1
+		"64:ff9b::7f00:1",          // NAT64 of 127.0.0.1
+		"2002:7f00:1::",            // 6to4 of 127.0.0.1
+		"2002:a9fe:a9fe::1",        // 6to4 of 169.254.169.254
+		"::7f00:1",                 // IPv4-compatible
+		"::808:808",                // IPv4-compatible, even of a public address
+		"::ffff:0:a00:1",           // IPv4-translated 10.0.0.1
+		"fec0::1",                  // site-local
+		"2001:0:4136:e378::1",      // Teredo
+		"64:ff9b:1::a00:1",         // local-use NAT64
+		"64:ff9b::a9fe:a9fe%eth0",  // a zone does not hide it
+		"2002:7f00:1::%lo",         // nor here
+		"fd00:ec2::254%eth0",       // nor on the shared rule
+		"::ffff:169.254.169.254",   // mapped metadata
+		"[64:ff9b::a9fe:a9fe]",     // bracketed
+		"64:FF9B::A9FE:A9FE",       // upper case
+		"0:0:0:0:0:ffff:7f00:0001", // mapped loopback, long form
+		"2002:c0a8:0101::",         // 6to4 of 192.168.1.1
+		"64:ff9b::6440:1",          // NAT64 of 100.64.0.1
+		"64:ff9b::e000:1",          // NAT64 of 224.0.0.1
+		"64:ff9b::ffff:ffff",       // NAT64 of broadcast
+		"64:ff9b::",                // NAT64 of 0.0.0.0
+		"2002::",                   // 6to4 of 0.0.0.0
+		"::ffff:0:0",               // IPv4-translated 0.0.0.0
+		"::ffff:0:ffff:ffff",       // IPv4-translated broadcast
+	}
+	for _, raw := range refused {
+		p, _, d := fakeNetProber(nil)
+		res := p.probe(context.Background(), model.Monitor{Type: model.MonitorTypeTCP, Target: net.JoinHostPort(strings.Trim(raw, "[]"), "443"), TimeoutSec: 1})
+		if res.Reason != model.PathReasonDestinationRefused || len(d.addresses()) != 0 {
+			t.Fatalf("%s: want %s and no dial, got %+v dials %v", raw, model.PathReasonDestinationRefused, res, d.addresses())
+		}
+	}
+	allowed := []string{
+		"64:ff9b::808:808", // NAT64 of 8.8.8.8
+		"2002:808:808::1",  // 6to4 of 8.8.8.8
+		"2001:4860::8888",  // global, outside Teredo's /32
+		"2606:4700::1111",  // global
+		"::ffff:0:808:808", // IPv4-translated 8.8.8.8
+	}
+	for _, raw := range allowed {
+		if destinationRefused(netip.MustParseAddr(raw)) {
+			t.Fatalf("%s is public and was refused", raw)
+		}
 	}
 }

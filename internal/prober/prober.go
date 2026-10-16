@@ -1,8 +1,8 @@
 // Package prober runs one monitor probe and returns a timed result: a TCP
 // connect, an HTTP GET or a run of ICMP echoes (design 29 M2a). Every kind
 // resolves its target once, refuses private and local destinations unless
-// the control plane resolved the target from a node, and dials only an
-// address it judged. A kind this agent does not run is reported with the
+// the control plane resolved a tcp or icmp target from a node, and dials
+// only an address it judged. A kind this agent does not run is reported with the
 // agent_too_old reason, never as a failure.
 package prober
 
@@ -67,7 +67,8 @@ func newProber() *prober {
 var std = newProber()
 
 // Probe runs the monitor once and returns its result. It returns within
-// RunBudget(m) unless ctx ends first.
+// RunBudget(m) and a second of slack for scheduling, or sooner when ctx
+// ends.
 func Probe(ctx context.Context, m model.Monitor) model.MonitorResult {
 	return std.probe(ctx, m)
 }
@@ -191,8 +192,14 @@ func (p *prober) probeHTTP(ctx context.Context, m model.Monitor, timeout time.Du
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	host := u.Hostname()
-	addrs, err := p.resolveTarget(ctx, host, m.TargetNode != "")
+	host, err := asciiHost(u.Hostname())
+	if err != nil {
+		return err
+	}
+	// http never takes target_node (design 29 D11), so a check that
+	// carries one is still judged: only the control plane's resolution of
+	// a node lifts the rule, and it does not resolve http targets.
+	addrs, err := p.resolveTarget(ctx, host, false)
 	if err != nil {
 		return err
 	}
@@ -212,6 +219,10 @@ func (p *prober) probeHTTP(ctx context.Context, m model.Monitor, timeout time.Du
 	req.Header = header
 	resp, err := client.Do(req)
 	if err != nil {
+		var refused *destinationError
+		if errors.As(err, &refused) {
+			return refused
+		}
 		return errors.New(redactHTTPError(err, m))
 	}
 	// Latency is the time to the response headers; the body is never read.

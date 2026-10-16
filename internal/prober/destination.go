@@ -8,8 +8,10 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"golang.org/x/net/idna"
 )
 
 // destinationError marks a run the destination rules refused. It becomes
@@ -19,11 +21,11 @@ type destinationError struct{ msg string }
 func (e *destinationError) Error() string { return e.msg }
 
 // resolveTarget resolves host once (an IP literal is not looked up) and
-// judges every address it got with model.MonitorDestinationRefused, unless
-// the control plane resolved the target from a node (nodeTarget). One
-// refused address refuses the run, so a name cannot smuggle a private
-// address past the rule beside a public one. The run then dials only the
-// addresses returned here; nothing looks the name up again.
+// judges every address it got with destinationRefused, unless the control
+// plane resolved the target from a node (nodeTarget). One refused address
+// refuses the run, so a name cannot smuggle a private address past the
+// rule beside a public one. The run then dials only the addresses returned
+// here; nothing looks the name up again.
 func (p *prober) resolveTarget(ctx context.Context, host string, nodeTarget bool) ([]netip.Addr, error) {
 	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	var addrs []netip.Addr
@@ -32,7 +34,11 @@ func (p *prober) resolveTarget(ctx context.Context, host string, nodeTarget bool
 	if literal {
 		addrs = []netip.Addr{addr}
 	} else {
-		found, err := p.resolver.LookupNetIP(ctx, "ip", host)
+		name, err := asciiHost(host)
+		if err != nil {
+			return nil, err
+		}
+		found, err := p.resolver.LookupNetIP(ctx, "ip", name)
 		if err != nil {
 			return nil, err
 		}
@@ -48,7 +54,7 @@ func (p *prober) resolveTarget(ctx context.Context, host string, nodeTarget bool
 		return addrs, nil
 	}
 	for _, addr := range addrs {
-		if model.MonitorDestinationRefused(addr) {
+		if destinationRefused(addr) {
 			if literal {
 				return nil, &destinationError{msg: fmt.Sprintf("destination refused: %s is not a public address", addr)}
 			}
@@ -56,6 +62,65 @@ func (p *prober) resolveTarget(ctx context.Context, host string, nodeTarget bool
 		}
 	}
 	return addrs, nil
+}
+
+// asciiHost is the form of a host name that is looked up and dialed:
+// punycode for an internationalized name, as net/http dials it.
+func asciiHost(host string) (string, error) {
+	for i := 0; i < len(host); i++ {
+		if host[i] >= utf8.RuneSelf {
+			ascii, err := idna.Lookup.ToASCII(host)
+			if err != nil {
+				return "", fmt.Errorf("target host %q is not a valid name", host)
+			}
+			return ascii, nil
+		}
+	}
+	return host, nil
+}
+
+// IPv6 forms that carry or reach IPv4 space, which
+// model.MonitorDestinationRefused does not judge yet. The agent refuses
+// them as well, failing closed, until the shared rule covers them.
+var (
+	// Judged by the IPv4 address they embed.
+	nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")    // RFC 6052, last 32 bits
+	ipv4Translated = netip.MustParsePrefix("::ffff:0:0:0/96") // RFC 2765, last 32 bits
+	sixToFour      = netip.MustParsePrefix("2002::/16")       // RFC 3056, bits 16 to 47
+	transitionDeny = []netip.Prefix{
+		netip.MustParsePrefix("64:ff9b:1::/48"), // local-use NAT64, RFC 8215
+		netip.MustParsePrefix("::/96"),          // IPv4-compatible, deprecated
+		netip.MustParsePrefix("fec0::/10"),      // site-local, deprecated
+		netip.MustParsePrefix("2001::/32"),      // Teredo
+	}
+)
+
+// destinationRefused is the shared rule, model.MonitorDestinationRefused,
+// plus the IPv6 transition forms above. A zone never changes the verdict.
+func destinationRefused(addr netip.Addr) bool {
+	addr = addr.Unmap().WithZone("")
+	if model.MonitorDestinationRefused(addr) {
+		return true
+	}
+	if !addr.Is6() {
+		return false
+	}
+	for _, prefix := range transitionDeny {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	b := addr.As16()
+	var embedded [4]byte
+	switch {
+	case nat64WellKnown.Contains(addr), ipv4Translated.Contains(addr):
+		copy(embedded[:], b[12:16])
+	case sixToFour.Contains(addr):
+		copy(embedded[:], b[2:6])
+	default:
+		return false
+	}
+	return model.MonitorDestinationRefused(netip.AddrFrom4(embedded))
 }
 
 // minDialSlice is the least time one address of several gets, as

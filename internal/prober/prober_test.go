@@ -61,15 +61,17 @@ func TestProbeTCPFailure(t *testing.T) {
 func TestProbeHTTP(t *testing.T) {
 	ok := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	bad := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	pOK, okURL := servedAsPublic(t, ok)
+	pBad, badURL := servedAsPublic(t, bad)
 
-	if res := Probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: ok.URL, TargetNode: testNode, TimeoutSec: 2}); !res.Success {
+	if res := pOK.probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: okURL, TimeoutSec: 2}); !res.Success {
 		t.Fatalf("expected http success, got %q", res.Error)
 	}
-	res := Probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: bad.URL, TargetNode: testNode, TimeoutSec: 2})
+	res := pBad.probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: badURL, TimeoutSec: 2})
 	if res.Success || !strings.Contains(res.Error, "503") || res.Reason != "" {
 		t.Fatalf("expected http 503 failure, got %+v", res)
 	}
-	res = Probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: bad.URL, TargetNode: testNode, TimeoutSec: 2, ExpectStatus: "500-599"})
+	res = pBad.probe(context.Background(), model.Monitor{Type: model.MonitorTypeHTTP, Target: badURL, TimeoutSec: 2, ExpectStatus: "500-599"})
 	if !res.Success {
 		t.Fatalf("503 is inside expect_status 500-599: %+v", res)
 	}
