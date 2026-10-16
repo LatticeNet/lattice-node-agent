@@ -9,7 +9,7 @@ match it.
 
 Design 29, slice M2a (monitoring paths), the agent half of the wire
 contract in design 29 D11. Pins lattice-sdk
-v0.2.24-0.20261016105341-41ac9e8834cc. The version constant is unchanged;
+v0.2.24-0.20261016112120-da0390e10a30. The version constant is unchanged;
 the release names this section.
 
 Probe methods and facts:
