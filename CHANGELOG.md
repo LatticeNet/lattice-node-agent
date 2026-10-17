@@ -5,6 +5,52 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
+## Unreleased
+
+Design 31, slice S4: the agent fetches the binary of its open agent update in
+the background, before the update's task runs, so the task finds the file on
+disk and its download budget no longer decides whether a slow node can update.
+No SDK pin moves: the config block and the report are defined here and in
+lattice-server. No compatibility floor moves: a server that predates S4 sends
+no `agent_update` block in the config pull, which this agent reads as "neither
+fetch nor remove anything", and the update runs through its task as before.
+
+- The config pull's `agent_update.prefetch` names one file by approval id,
+  version, platform, digests and sizes, never by URL. The agent fetches it
+  from its own enrolled server at `/api/agent/prefetch-binary/...` with its
+  node token, one download at a time, with no deadline, resuming from the
+  bytes on disk with `Range` and `If-Range` on the pinned digest, also after
+  a restart. A response that delivers nothing for two minutes is dropped and
+  resumed later; a failure is retried after a backoff from 30 s doubling to
+  15 minutes.
+- It writes exactly the file the update script continues:
+  `.lattice-agent-download-<digest>` (the compressed digest for a compressed
+  plan) beside the binary the script replaces, a regular file of the agent's
+  user, mode 0600, never through a symlink or a second hard link, and never
+  past the named size. The finished file is held to its digest and discarded
+  if it fails. The agent writes only when the script would resolve its target
+  to the agent's own executable, and only in a directory no user but root can
+  change.
+- A free-space check runs before anything is created: the download, three
+  copies of the binary for the update itself, and 256 MiB spare must fit, or
+  the prefetch is refused and reported.
+- Every task holds the prefetch: the download stops and its file is closed
+  before the task starts, and nothing resumes until the next config pull after
+  the task.
+- Kept downloads whose digest the config's `keep` list does not name are
+  removed from beside the agent, which also clears what earlier attempts left
+  when a policy moved on. A directory is left alone; a symlink is removed as a
+  name.
+- Prefetch is skipped, and reported as refused with the reason, when the
+  agent does not run as root, cannot run tasks, runs the target version
+  already, or runs on another platform.
+- `-no-prefetch` (`LATTICE_NO_PREFETCH`, fail-closed like `LATTICE_NO_BEACON`,
+  also passed through by the installer) is the node veto: nothing is fetched
+  or removed.
+- The heartbeat carries `prefetch` (approval id, digest, bytes, size, state
+  `fetching`, `waiting`, `complete` or `refused`, and a reason) while the
+  server names a file.
+
 ## 0.3.10-alpha.6 (2026-10-16)
 
 Design 29, slice M2b (monitoring paths), the agent half of the measurement
