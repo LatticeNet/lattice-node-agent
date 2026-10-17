@@ -5,7 +5,7 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
-## Unreleased
+## 0.3.10-alpha.7 (2026-10-17)
 
 Design 31, slice S4: the agent fetches the binary of its open agent update in
 the background, before the update's task runs, so the task finds the file on
