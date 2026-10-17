@@ -10,10 +10,13 @@ match it.
 Design 31, slice S4: the agent fetches the binary of its open agent update in
 the background, before the update's task runs, so the task finds the file on
 disk and its download budget no longer decides whether a slow node can update.
-No SDK pin moves: the config block and the report are defined here and in
-lattice-server. No compatibility floor moves: a server that predates S4 sends
-no `agent_update` block in the config pull, which this agent reads as "neither
-fetch nor remove anything", and the update runs through its task as before.
+Pins lattice-sdk v0.2.24-0.20261017194014-a3de5f71b589 (lattice-sdk #33),
+whose model holds the config block (`AgentConfig.AgentUpdate`) and the
+report (`AgentPrefetchFacts`); nothing else between the previous pin and it
+changes what the agent does. No compatibility floor moves: a server that
+predates S4 sends no `agent_update` block in the config pull, which this
+agent reads as "neither fetch nor remove anything", and the update runs
+through its task as before.
 
 - The config pull's `agent_update.prefetch` names one file by approval id,
   version, platform, digests and sizes, never by URL. The agent fetches it

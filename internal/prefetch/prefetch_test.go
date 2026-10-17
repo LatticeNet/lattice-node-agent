@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 const testToken = "node-token-secret"
@@ -35,9 +37,9 @@ type testServer struct {
 	behave func(n int, w http.ResponseWriter, r *http.Request) bool
 }
 
-func newTestServer(t *testing.T, data []byte, target Target) *testServer {
+func newTestServer(t *testing.T, data []byte, target model.AgentUpdatePrefetch) *testServer {
 	t.Helper()
-	ts := &testServer{data: data, digest: target.served(), path: RoutePrefix + target.objectPath()}
+	ts := &testServer{data: data, digest: servedDigest(target), path: RoutePrefix + objectPath(target)}
 	ts.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ts.mu.Lock()
 		n := len(ts.requests)
@@ -106,7 +108,7 @@ type fixture struct {
 	dir    string
 	exe    string
 	data   []byte
-	target Target
+	target model.AgentUpdatePrefetch
 	ts     *testServer
 	now    atomic.Int64
 	free   atomic.Uint64
@@ -136,7 +138,7 @@ func newFixture(t *testing.T, size int, compressed bool) *fixture {
 		t.Fatal(err)
 	}
 	data := testData(size)
-	target := Target{
+	target := model.AgentUpdatePrefetch{
 		ApprovalID: "approval-1", Version: "0.3.10-alpha.7", OS: "linux", Arch: "amd64",
 		SHA256: digestOf(data), Size: int64(len(data)), BinarySize: int64(len(data)),
 		InstallPath: defaultInstallPath,
@@ -163,19 +165,19 @@ func newFixture(t *testing.T, size int, compressed bool) *fixture {
 }
 
 func (f *fixture) partial() string {
-	return filepath.Join(f.dir, PartialPrefix+f.target.served())
+	return filepath.Join(f.dir, PartialPrefix+servedDigest(f.target))
 }
 
-func (f *fixture) config() *Config {
+func (f *fixture) config() *model.AgentUpdateConfig {
 	t := f.target
-	return &Config{Prefetch: &t, Keep: []string{f.target.SHA256, f.target.served()}}
+	return &model.AgentUpdateConfig{Prefetch: &t, Keep: []string{f.target.SHA256, servedDigest(f.target)}}
 }
 
 func (f *fixture) advance(d time.Duration) { f.now.Add(int64(d)) }
 
 // waitState waits until the prefetcher reports state with no download in
 // flight.
-func waitState(t *testing.T, p *Prefetcher, state string) *Facts {
+func waitState(t *testing.T, p *Prefetcher, state string) *model.AgentPrefetchFacts {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -220,12 +222,12 @@ func TestPrefetchResumesVerifiesAndLeavesTheScriptsFile(t *testing.T) {
 			f.ts.behave = cutAfter(f.ts, 0, cut)
 			p := New(f.opts)
 			p.Update(f.config())
-			facts := waitState(t, p, StateWaiting)
+			facts := waitState(t, p, model.AgentPrefetchWaiting)
 			kept, _ := os.ReadFile(f.partial())
 			if facts.Bytes != int64(cut) || len(kept) != cut || !bytes.Equal(kept, f.data[:cut]) {
 				t.Fatalf("a cut download must keep what arrived: facts %+v, %d bytes on disk", facts, len(kept))
 			}
-			if facts.ApprovalID != "approval-1" || facts.SHA256 != f.target.served() || facts.Size != int64(len(f.data)) {
+			if facts.ApprovalID != "approval-1" || facts.SHA256 != servedDigest(f.target) || facts.Size != int64(len(f.data)) {
 				t.Fatalf("facts %+v", facts)
 			}
 			p.Close()
@@ -233,14 +235,14 @@ func TestPrefetchResumesVerifiesAndLeavesTheScriptsFile(t *testing.T) {
 			// The agent restarts; the new process continues the same file.
 			again := New(f.opts)
 			again.Update(f.config())
-			facts = waitState(t, again, StateComplete)
+			facts = waitState(t, again, model.AgentPrefetchComplete)
 			if facts.Bytes != int64(len(f.data)) {
 				t.Fatalf("facts %+v", facts)
 			}
 			requireScriptFile(t, f.partial(), f.data)
 			seen := f.ts.seen()
 			if len(seen) != 2 || seen[0].Header.Get("Range") != "" ||
-				seen[1].Header.Get("Range") != fmt.Sprintf("bytes=%d-", cut) || seen[1].Header.Get("If-Range") != `"`+f.target.served()+`"` {
+				seen[1].Header.Get("Range") != fmt.Sprintf("bytes=%d-", cut) || seen[1].Header.Get("If-Range") != `"`+servedDigest(f.target)+`"` {
 				t.Fatalf("the second attempt must ask for the rest of the pinned file: %d requests", len(seen))
 			}
 			for _, r := range seen {
@@ -253,7 +255,7 @@ func TestPrefetchResumesVerifiesAndLeavesTheScriptsFile(t *testing.T) {
 			again.Update(f.config())
 			third := New(f.opts)
 			third.Update(f.config())
-			waitState(t, third, StateComplete)
+			waitState(t, third, model.AgentPrefetchComplete)
 			if n := len(f.ts.seen()); n != 2 {
 				t.Fatalf("a complete file must not be fetched again: %d requests", n)
 			}
@@ -272,7 +274,7 @@ func TestPrefetchHoldsTheFileToItsDigest(t *testing.T) {
 	}
 	p := New(f.opts)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	requireScriptFile(t, f.partial(), f.data)
 	if seen := f.ts.seen(); len(seen) != 1 || seen[0].Header.Get("Range") != "" {
 		t.Fatalf("a full-length wrong file must be fetched whole: %d requests", len(seen))
@@ -282,7 +284,7 @@ func TestPrefetchHoldsTheFileToItsDigest(t *testing.T) {
 	g.ts.data = wrong
 	q := New(g.opts)
 	q.Update(g.config())
-	facts := waitState(t, q, StateWaiting)
+	facts := waitState(t, q, model.AgentPrefetchWaiting)
 	if !strings.Contains(facts.Reason, "did not match its digest") {
 		t.Fatalf("facts %+v", facts)
 	}
@@ -296,7 +298,7 @@ func TestPrefetchHoldsTheFileToItsDigest(t *testing.T) {
 func TestPrefetchNeverWritesPastTheNamedSize(t *testing.T) {
 	f := newFixture(t, 32<<10, false)
 	f.ts.behave = func(_ int, w http.ResponseWriter, r *http.Request) bool {
-		w.Header().Set("ETag", `"`+f.target.served()+`"`)
+		w.Header().Set("ETag", `"`+servedDigest(f.target)+`"`)
 		w.WriteHeader(http.StatusOK)
 		w.Write(f.data)
 		w.Write(bytes.Repeat([]byte{'x'}, 1<<20))
@@ -304,7 +306,7 @@ func TestPrefetchNeverWritesPastTheNamedSize(t *testing.T) {
 	}
 	p := New(f.opts)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	requireScriptFile(t, f.partial(), f.data)
 }
 
@@ -312,7 +314,7 @@ func TestPrefetchNeverWritesPastTheNamedSize(t *testing.T) {
 // request ends, so a test can stop a download in flight.
 func blockingServer(f *fixture, started chan<- struct{}, ended *atomic.Int32) func(int, http.ResponseWriter, *http.Request) bool {
 	return func(_ int, w http.ResponseWriter, r *http.Request) bool {
-		w.Header().Set("ETag", `"`+f.target.served()+`"`)
+		w.Header().Set("ETag", `"`+servedDigest(f.target)+`"`)
 		start := 0
 		if rng := r.Header.Get("Range"); rng != "" {
 			fmt.Sscanf(rng, "bytes=%d-", &start)
@@ -343,9 +345,9 @@ func TestPrefetchStopsWhenTheApprovalDisappears(t *testing.T) {
 			p := New(f.opts)
 			p.Update(f.config())
 			awaitStarted(t, started)
-			cfg := &Config{Keep: []string{}}
+			cfg := &model.AgentUpdateConfig{Keep: []string{}}
 			if kept {
-				cfg.Keep = []string{f.target.served()}
+				cfg.Keep = []string{servedDigest(f.target)}
 			}
 			p.Update(cfg)
 			deadline := time.Now().Add(5 * time.Second)
@@ -417,7 +419,7 @@ func TestPrefetchHoldHandsTheFileToTheTask(t *testing.T) {
 	}
 	f.ts.behave = nil
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	seen := f.ts.seen()
 	if len(seen) != 2 || seen[1].Header.Get("Range") != "bytes=1024-" {
 		t.Fatalf("the next pull must resume the file: %d requests", len(seen))
@@ -432,7 +434,7 @@ func TestPrefetchRespectsTheFreeSpaceBound(t *testing.T) {
 	f.free.Store(need - 1)
 	p := New(f.opts)
 	p.Update(f.config())
-	facts := waitState(t, p, StateRefused)
+	facts := waitState(t, p, model.AgentPrefetchRefused)
 	if !strings.Contains(facts.Reason, "bytes free beside the agent") || facts.Bytes != 0 {
 		t.Fatalf("facts %+v", facts)
 	}
@@ -447,7 +449,7 @@ func TestPrefetchRespectsTheFreeSpaceBound(t *testing.T) {
 	}
 	f.advance(firstBackoff)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 }
 
 // The node veto stops everything: no request, no file, and no removal of a
@@ -462,7 +464,7 @@ func TestPrefetchVetoFetchesAndRemovesNothing(t *testing.T) {
 	p := New(f.opts)
 	p.Update(f.config())
 	facts := p.Facts()
-	if facts == nil || facts.State != StateRefused || !strings.Contains(facts.Reason, "-no-prefetch") {
+	if facts == nil || facts.State != model.AgentPrefetchRefused || !strings.Contains(facts.Reason, "-no-prefetch") {
 		t.Fatalf("facts %+v", facts)
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -484,27 +486,27 @@ func TestPrefetchVetoFetchesAndRemovesNothing(t *testing.T) {
 func TestPrefetchRefusesWhatItCannotUse(t *testing.T) {
 	cases := map[string]struct {
 		opts   func(o *Options)
-		target func(t *Target)
+		target func(t *model.AgentUpdatePrefetch)
 		reason string
 	}{
 		"not root":            {opts: func(o *Options) { o.Root = false }, reason: "does not run as root"},
 		"no task execution":   {opts: func(o *Options) { o.CanRunUpdate = false }, reason: "task execution is disabled"},
-		"another arch":        {target: func(t *Target) { t.Arch = "arm64" }, reason: "this agent runs on linux/amd64"},
-		"the running version": {target: func(t *Target) { t.Version = "v0.3.10-alpha.6" }, reason: "already runs"},
-		"a custom install path elsewhere": {target: func(t *Target) { t.InstallPath = "/srv/other/lattice-agent" },
+		"another arch":        {target: func(t *model.AgentUpdatePrefetch) { t.Arch = "arm64" }, reason: "this agent runs on linux/amd64"},
+		"the running version": {target: func(t *model.AgentUpdatePrefetch) { t.Version = "v0.3.10-alpha.6" }, reason: "already runs"},
+		"a custom install path elsewhere": {target: func(t *model.AgentUpdatePrefetch) { t.InstallPath = "/srv/other/lattice-agent" },
 			reason: "not over this agent's own binary"},
-		"a relative install path":    {target: func(t *Target) { t.InstallPath = "lattice-agent" }, reason: "clean absolute path"},
-		"an unclean install path":    {target: func(t *Target) { t.InstallPath = "/opt/lattice/../lattice-agent" }, reason: "clean absolute path"},
-		"a version with a separator": {target: func(t *Target) { t.Version = "../../x" }, reason: "plain version"},
-		"a version naming a host":    {target: func(t *Target) { t.Version = "x@evil.example" }, reason: "plain version"},
-		"an uppercase digest":        {target: func(t *Target) { t.SHA256 = strings.ToUpper(t.SHA256) }, reason: "lowercase hex"},
-		"a short compressed digest":  {target: func(t *Target) { t.CompressedSHA256 = "abc" }, reason: "compressed sha256"},
-		"an oversized file":          {target: func(t *Target) { t.Size = maxFileBytes + 1 }, reason: "sizes must be"},
-		"an uncompressed size mismatch": {target: func(t *Target) {
+		"a relative install path":    {target: func(t *model.AgentUpdatePrefetch) { t.InstallPath = "lattice-agent" }, reason: "clean absolute path"},
+		"an unclean install path":    {target: func(t *model.AgentUpdatePrefetch) { t.InstallPath = "/opt/lattice/../lattice-agent" }, reason: "clean absolute path"},
+		"a version with a separator": {target: func(t *model.AgentUpdatePrefetch) { t.Version = "../../x" }, reason: "plain version"},
+		"a version naming a host":    {target: func(t *model.AgentUpdatePrefetch) { t.Version = "x@evil.example" }, reason: "plain version"},
+		"an uppercase digest":        {target: func(t *model.AgentUpdatePrefetch) { t.SHA256 = strings.ToUpper(t.SHA256) }, reason: "lowercase hex"},
+		"a short compressed digest":  {target: func(t *model.AgentUpdatePrefetch) { t.CompressedSHA256 = "abc" }, reason: "compressed sha256"},
+		"an oversized file":          {target: func(t *model.AgentUpdatePrefetch) { t.Size = maxFileBytes + 1 }, reason: "sizes must be"},
+		"an uncompressed size mismatch": {target: func(t *model.AgentUpdatePrefetch) {
 			t.CompressedSHA256 = ""
 			t.BinarySize = t.Size + 1
 		}, reason: "size of the binary"},
-		"an approval id with a separator": {target: func(t *Target) { t.ApprovalID = "a/b" }, reason: "approval id"},
+		"an approval id with a separator": {target: func(t *model.AgentUpdatePrefetch) { t.ApprovalID = "a/b" }, reason: "approval id"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -518,7 +520,7 @@ func TestPrefetchRefusesWhatItCannotUse(t *testing.T) {
 			p := New(f.opts)
 			p.Update(f.config())
 			facts := p.Facts()
-			if facts == nil || facts.State != StateRefused || !strings.Contains(facts.Reason, tc.reason) {
+			if facts == nil || facts.State != model.AgentPrefetchRefused || !strings.Contains(facts.Reason, tc.reason) {
 				t.Fatalf("facts %+v, want a refusal naming %q", facts, tc.reason)
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -547,7 +549,7 @@ func TestPrefetchNeverFollowsARedirect(t *testing.T) {
 		}
 		p := New(f.opts)
 		p.Update(f.config())
-		facts := waitState(t, p, StateWaiting)
+		facts := waitState(t, p, model.AgentPrefetchWaiting)
 		if !strings.Contains(facts.Reason, "redirect") {
 			t.Fatalf("%d: facts %+v", code, facts)
 		}
@@ -570,7 +572,7 @@ func TestPrefetchSendsTheCredentialOnlyToItsServer(t *testing.T) {
 	f := newFixture(t, 16<<10, true)
 	p := New(f.opts)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	seen := f.ts.seen()
 	if len(seen) != 1 {
 		t.Fatalf("%d requests", len(seen))
@@ -603,7 +605,7 @@ func TestPrefetchRefusesAResponseForOtherBytes(t *testing.T) {
 		},
 		"another range start": func(f *fixture) func(int, http.ResponseWriter, *http.Request) bool {
 			return func(_ int, w http.ResponseWriter, r *http.Request) bool {
-				w.Header().Set("ETag", `"`+f.target.served()+`"`)
+				w.Header().Set("ETag", `"`+servedDigest(f.target)+`"`)
 				w.Header().Set("Content-Range", fmt.Sprintf("bytes 10-%d/%d", len(f.data)-1, len(f.data)))
 				w.WriteHeader(http.StatusPartialContent)
 				w.Write(f.data[10:])
@@ -612,7 +614,7 @@ func TestPrefetchRefusesAResponseForOtherBytes(t *testing.T) {
 		},
 		"another total": func(f *fixture) func(int, http.ResponseWriter, *http.Request) bool {
 			return func(_ int, w http.ResponseWriter, r *http.Request) bool {
-				w.Header().Set("ETag", `"`+f.target.served()+`"`)
+				w.Header().Set("ETag", `"`+servedDigest(f.target)+`"`)
 				w.Header().Set("Content-Range", fmt.Sprintf("bytes 100-%d/%d", len(f.data)-1, len(f.data)+5))
 				w.WriteHeader(http.StatusPartialContent)
 				w.Write(f.data[100:])
@@ -629,7 +631,7 @@ func TestPrefetchRefusesAResponseForOtherBytes(t *testing.T) {
 			f.ts.behave = behave(f)
 			p := New(f.opts)
 			p.Update(f.config())
-			waitState(t, p, StateWaiting)
+			waitState(t, p, model.AgentPrefetchWaiting)
 			got, _ := os.ReadFile(f.partial())
 			if !bytes.Equal(got, f.data[:100]) {
 				t.Fatalf("the kept bytes must be left as they were: %d bytes", len(got))
@@ -673,7 +675,7 @@ func TestPrefetchPrunesDownloadsNoOpenUpdateNames(t *testing.T) {
 	if !exists(stale) || !exists(link) {
 		t.Fatal("an older server's config must prune nothing")
 	}
-	p.Update(&Config{Keep: []string{strings.Repeat("b", 64)}})
+	p.Update(&model.AgentUpdateConfig{Keep: []string{strings.Repeat("b", 64)}})
 	if exists(stale) || exists(link) || !exists(keptByKeep) || !exists(dirName) || !exists(other) {
 		t.Fatalf("stale %v link %v keep %v dir %v other %v", exists(stale), exists(link), exists(keptByKeep), exists(dirName), exists(other))
 	}
@@ -706,7 +708,7 @@ func TestPrefetchNeverWritesThroughTheName(t *testing.T) {
 			}
 			p := New(f.opts)
 			p.Update(f.config())
-			waitState(t, p, StateComplete)
+			waitState(t, p, model.AgentPrefetchComplete)
 			if b, _ := os.ReadFile(victim); string(b) != "victim" {
 				t.Fatalf("the %s's target was written: %q", kind, b)
 			}
@@ -755,7 +757,7 @@ func TestPrefetchRefusesADirectoryOthersCanWrite(t *testing.T) {
 			p := New(f.opts)
 			p.Update(f.config())
 			facts := p.Facts()
-			if facts == nil || facts.State != StateRefused || !strings.Contains(facts.Reason, "can be changed by a user other than root") {
+			if facts == nil || facts.State != model.AgentPrefetchRefused || !strings.Contains(facts.Reason, "can be changed by a user other than root") {
 				t.Fatalf("facts %+v", facts)
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -773,7 +775,7 @@ func TestPrefetchTreatsAFewBytesAsNoProgress(t *testing.T) {
 	f.ts.behave = cutAfter(f.ts, 0, minProgress-1)
 	p := New(f.opts)
 	p.Update(f.config())
-	waitState(t, p, StateWaiting)
+	waitState(t, p, model.AgentPrefetchWaiting)
 	f.advance(progressRetry)
 	p.Update(f.config())
 	time.Sleep(20 * time.Millisecond)
@@ -782,7 +784,7 @@ func TestPrefetchTreatsAFewBytesAsNoProgress(t *testing.T) {
 	}
 	f.advance(firstBackoff)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	requireScriptFile(t, f.partial(), f.data)
 }
 
@@ -795,7 +797,7 @@ func TestPrefetchBacksOffAfterAFailure(t *testing.T) {
 	}
 	p := New(f.opts)
 	p.Update(f.config())
-	waitState(t, p, StateWaiting)
+	waitState(t, p, model.AgentPrefetchWaiting)
 	for i, wait := range []time.Duration{firstBackoff, 2 * firstBackoff} {
 		p.Update(f.config())
 		time.Sleep(20 * time.Millisecond)
@@ -808,7 +810,7 @@ func TestPrefetchBacksOffAfterAFailure(t *testing.T) {
 		for len(f.ts.seen()) != i+2 && time.Now().Before(deadline) {
 			time.Sleep(5 * time.Millisecond)
 		}
-		waitState(t, p, StateWaiting)
+		waitState(t, p, model.AgentPrefetchWaiting)
 	}
 }
 
@@ -847,7 +849,7 @@ func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
 		if n != 0 {
 			return false
 		}
-		w.Header().Set("ETag", `"`+f.target.served()+`"`)
+		w.Header().Set("ETag", `"`+servedDigest(f.target)+`"`)
 		w.Header().Set("Content-Length", fmt.Sprint(len(f.data)))
 		w.WriteHeader(http.StatusOK)
 		w.Write(f.data[:minProgress])
@@ -857,7 +859,7 @@ func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
 	}
 	p := New(f.opts)
 	p.Update(f.config())
-	facts := waitState(t, p, StateWaiting)
+	facts := waitState(t, p, model.AgentPrefetchWaiting)
 	if !strings.Contains(facts.Reason, "no bytes for 150ms") || facts.Bytes != minProgress {
 		t.Fatalf("facts %+v", facts)
 	}
@@ -868,7 +870,7 @@ func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
 	}
 	f.advance(progressRetry)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	requireScriptFile(t, f.partial(), f.data)
 	if seen := f.ts.seen(); len(seen) != 2 || seen[1].Header.Get("Range") != fmt.Sprintf("bytes=%d-", minProgress) {
 		t.Fatalf("the stalled download must be continued: %d requests", len(seen))
@@ -884,7 +886,7 @@ func TestPrefetchReplacesADirectoryAtItsName(t *testing.T) {
 	}
 	p := New(f.opts)
 	p.Update(f.config())
-	waitState(t, p, StateComplete)
+	waitState(t, p, model.AgentPrefetchComplete)
 	requireScriptFile(t, f.partial(), f.data)
 }
 

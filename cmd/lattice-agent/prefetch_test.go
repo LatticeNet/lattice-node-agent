@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/LatticeNet/lattice-node-agent/internal/prefetch"
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // recordingHolder stands in for the prefetcher and records, in one log with
@@ -64,8 +65,8 @@ func TestTaskWorkerHoldsPrefetchWhileTasksRun(t *testing.T) {
 	}
 }
 
-// The config pull keeps the SDK's fields and reads the prefetch block beside
-// them; a server that predates prefetch sends none, which is nil.
+// The config pull reads the prefetch block with the SDK's other fields; a
+// server that predates prefetch sends none, which is nil.
 func TestAgentConfigCarriesThePrefetchBlock(t *testing.T) {
 	oldClient := httpClient
 	t.Cleanup(func() { httpClient = oldClient })
@@ -91,7 +92,7 @@ func TestAgentConfigCarriesThePrefetchBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := prefetch.Target{ApprovalID: "ap-1", Version: "0.3.10-alpha.7", OS: "linux", Arch: "amd64", SHA256: digest, Size: 10, BinarySize: 10, InstallPath: "/opt/lattice/node-agent/lattice-agent"}
+	want := model.AgentUpdatePrefetch{ApprovalID: "ap-1", Version: "0.3.10-alpha.7", OS: "linux", Arch: "amd64", SHA256: digest, Size: 10, BinarySize: 10, InstallPath: "/opt/lattice/node-agent/lattice-agent"}
 	if got.AgentUpdate == nil || got.AgentUpdate.Prefetch == nil || *got.AgentUpdate.Prefetch != want || len(got.AgentUpdate.Keep) != 1 {
 		t.Fatalf("prefetch block: %+v", got.AgentUpdate)
 	}
@@ -107,7 +108,7 @@ func TestMetricsPayloadCarriesThePrefetchReport(t *testing.T) {
 		t.Fatal("no report before the server names a file")
 	}
 	digest := strings.Repeat("b", 64)
-	cfg.Prefetch.Update(&prefetch.Config{Prefetch: &prefetch.Target{
+	cfg.Prefetch.Update(&model.AgentUpdateConfig{Prefetch: &model.AgentUpdatePrefetch{
 		ApprovalID: "ap-1", Version: "0.3.10-alpha.7", OS: "linux", Arch: "amd64", SHA256: digest,
 		Size: 10, BinarySize: 10, InstallPath: "/opt/lattice/node-agent/lattice-agent",
 	}, Keep: []string{digest}})

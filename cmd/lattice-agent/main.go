@@ -504,7 +504,7 @@ func main() {
 	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 		debugf(cfg, "agent config fetch failed: %v", err)
 	} else {
-		applyAgentConfig(&cfg, agentCfg.AgentConfig)
+		applyAgentConfig(&cfg, agentCfg)
 		cfg.Prefetch.Update(agentCfg.AgentUpdate)
 	}
 	beat.setConfig(cfg)
@@ -591,7 +591,9 @@ func main() {
 				debugf(cfg, "agent config fetch failed: %v", err)
 				return err
 			}
-			applyAgentConfig(&cfg, agentCfg.AgentConfig)
+			applyAgentConfig(&cfg, agentCfg)
+			// The agent update prefetch (design 31, S4); nil from a server
+			// that predates it, which leaves everything on disk alone.
 			cfg.Prefetch.Update(agentCfg.AgentUpdate)
 			monitors.setConfig(cfg)
 			logTailers.setConfig(cfg)
@@ -824,33 +826,23 @@ func fetchMonitors(cfg agentConfig) ([]model.Monitor, error) {
 	return monitors, nil
 }
 
-// agentConfigResponse is the config pull: the SDK's agent config and, beside
-// it, the agent update prefetch block of design 31 S4. A server that
-// predates prefetch sends no block, which leaves AgentUpdate nil. The block
-// is defined in this repository and in lattice-server rather than in the
-// SDK; the JSON is the same either way.
-type agentConfigResponse struct {
-	model.AgentConfig
-	AgentUpdate *prefetch.Config `json:"agent_update,omitempty"`
-}
-
-func fetchAgentConfig(cfg agentConfig) (agentConfigResponse, error) {
+func fetchAgentConfig(cfg agentConfig) (model.AgentConfig, error) {
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/agent/config?node_id=%s", cfg.Server, url.QueryEscape(cfg.NodeID)), nil)
 	if err != nil {
-		return agentConfigResponse{}, err
+		return model.AgentConfig{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return agentConfigResponse{}, err
+		return model.AgentConfig{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return agentConfigResponse{}, agentHTTPError(resp, "fetch agent config")
+		return model.AgentConfig{}, agentHTTPError(resp, "fetch agent config")
 	}
-	var out agentConfigResponse
+	var out model.AgentConfig
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return agentConfigResponse{}, err
+		return model.AgentConfig{}, err
 	}
 	return out, nil
 }

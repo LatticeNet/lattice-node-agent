@@ -43,6 +43,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // PartialPrefix names the download the update script keeps beside the
@@ -93,14 +95,6 @@ const (
 	maxReason = 200
 )
 
-// States reported in Facts.
-const (
-	StateFetching = "fetching"
-	StateComplete = "complete"
-	StateWaiting  = "waiting"
-	StateRefused  = "refused"
-)
-
 var (
 	approvalIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	versionRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+:-]{0,63}$`)
@@ -109,51 +103,23 @@ var (
 	errRedirect = errors.New("the server answered with a redirect, which prefetch never follows")
 )
 
-// Target is the file the server names: the agent_update.prefetch block of
-// the config pull. Size is the size of the file fetched, the compressed one
-// when CompressedSHA256 is set; BinarySize is that of the binary the update
-// installs.
-type Target struct {
-	ApprovalID       string `json:"approval_id"`
-	Version          string `json:"version"`
-	OS               string `json:"os"`
-	Arch             string `json:"arch"`
-	SHA256           string `json:"sha256"`
-	CompressedSHA256 string `json:"compressed_sha256,omitempty"`
-	Size             int64  `json:"size"`
-	BinarySize       int64  `json:"binary_size"`
-	InstallPath      string `json:"install_path"`
-}
+// The wire types are lattice-sdk's: the config pull's agent_update block
+// is model.AgentUpdateConfig, the file it names model.AgentUpdatePrefetch
+// (Size is the size of the file fetched, the compressed one when
+// CompressedSHA256 is set; BinarySize that of the binary the update
+// installs), and the heartbeat's report model.AgentPrefetchFacts.
 
-// Config is the agent_update block of the config pull. A server that serves
-// prefetch always sends it; Keep lists the digests of every pending or
-// approved update of this node, running ones included.
-type Config struct {
-	Prefetch *Target  `json:"prefetch,omitempty"`
-	Keep     []string `json:"keep"`
-}
-
-// Facts is what the agent reports in its heartbeat while the server names a
-// file: which file, how much of it is on disk, and what the agent is doing
-// about it.
-type Facts struct {
-	ApprovalID string `json:"approval_id"`
-	SHA256     string `json:"sha256"`
-	Bytes      int64  `json:"bytes"`
-	Size       int64  `json:"size"`
-	State      string `json:"state"`
-	Reason     string `json:"reason,omitempty"`
-}
-
-// served is the digest of the bytes fetched and the name of their file.
-func (t Target) served() string {
+// servedDigest is the digest of the bytes fetched and the name of their
+// file.
+func servedDigest(t model.AgentUpdatePrefetch) string {
 	if t.CompressedSHA256 != "" {
 		return t.CompressedSHA256
 	}
 	return t.SHA256
 }
 
-func (t Target) validate() error {
+// validateTarget holds every field the server names to the shape it sends.
+func validateTarget(t model.AgentUpdatePrefetch) error {
 	switch {
 	case !approvalIDRe.MatchString(t.ApprovalID):
 		return errors.New("approval id is not a plain identifier")
@@ -176,7 +142,7 @@ func (t Target) validate() error {
 // objectPath is the server's object path for the file:
 // version/os/arch/sha256, with /<compressed sha256>.gz for the compressed
 // form. Every part was validated, so none can hold a separator.
-func (t Target) objectPath() string {
+func objectPath(t model.AgentUpdatePrefetch) string {
 	p := url.PathEscape(t.Version) + "/" + t.OS + "/" + t.Arch + "/" + t.SHA256
 	if t.CompressedSHA256 != "" {
 		p += "/" + t.CompressedSHA256 + ".gz"
@@ -245,7 +211,7 @@ type Prefetcher struct {
 
 	mu     sync.Mutex
 	known  bool
-	cfg    Config
+	cfg    model.AgentUpdateConfig
 	held   int
 	closed bool
 	run    *fetchRun
@@ -321,12 +287,12 @@ func New(opts Options) *Prefetcher {
 // block, an older server: nothing is fetched and nothing is removed. While a
 // task holds the prefetcher the config is kept and acted on only once an
 // update arrives after the task.
-func (p *Prefetcher) Update(cfg *Config) {
+func (p *Prefetcher) Update(cfg *model.AgentUpdateConfig) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if cfg == nil {
 		p.known = false
-		p.cfg = Config{}
+		p.cfg = model.AgentUpdateConfig{}
 	} else {
 		p.known = true
 		p.cfg = *cfg
@@ -372,21 +338,21 @@ func (p *Prefetcher) Close() {
 
 // Facts is the heartbeat's "prefetch" value, nil while the server names no
 // file.
-func (p *Prefetcher) Facts() *Facts {
+func (p *Prefetcher) Facts() *model.AgentPrefetchFacts {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	t := p.cfg.Prefetch
 	if !p.known || t == nil || p.state == "" {
 		return nil
 	}
-	facts := &Facts{
-		ApprovalID: boundReason(t.ApprovalID, 64), SHA256: boundReason(t.served(), 64),
+	facts := &model.AgentPrefetchFacts{
+		ApprovalID: boundReason(t.ApprovalID, 64), SHA256: boundReason(servedDigest(*t), 64),
 		Bytes: p.bytes, Size: t.Size, State: p.state, Reason: p.reason,
 	}
 	if p.key != p.keyLocked() {
 		// The download of the file named before is still stopping; nothing
 		// of it describes the file named now.
-		facts.Bytes, facts.State, facts.Reason = 0, StateWaiting, "switching to the file the server names now"
+		facts.Bytes, facts.State, facts.Reason = 0, model.AgentPrefetchWaiting, "switching to the file the server names now"
 	} else if p.run != nil {
 		facts.Bytes = p.progress.Load()
 	}
@@ -399,7 +365,7 @@ func (p *Prefetcher) keyLocked() string {
 	if !p.known || t == nil {
 		return ""
 	}
-	return t.ApprovalID + "|" + t.served() + "|" + t.InstallPath
+	return t.ApprovalID + "|" + servedDigest(*t) + "|" + t.InstallPath
 }
 
 // kickLocked decides what to do with the current config: prune, refuse,
@@ -426,13 +392,13 @@ func (p *Prefetcher) kickLocked() {
 	}
 	if p.opts.Veto {
 		if t != nil {
-			p.setLocked(StateRefused, "the node vetoes prefetch (-no-prefetch)", 0)
+			p.setLocked(model.AgentPrefetchRefused, "the node vetoes prefetch (-no-prefetch)", 0)
 		}
 		return
 	}
 	if !p.opts.Root {
 		if t != nil {
-			p.setLocked(StateRefused, "the agent does not run as root, and the update continues only a download root owns", 0)
+			p.setLocked(model.AgentPrefetchRefused, "the agent does not run as root, and the update continues only a download root owns", 0)
 		}
 		return
 	}
@@ -452,32 +418,32 @@ func (p *Prefetcher) kickLocked() {
 		return
 	}
 	if !p.opts.CanRunUpdate {
-		p.setLocked(StateRefused, "task execution is disabled on this node, so no update can use the file", 0)
+		p.setLocked(model.AgentPrefetchRefused, "task execution is disabled on this node, so no update can use the file", 0)
 		return
 	}
-	if err := t.validate(); err != nil {
-		p.setLocked(StateRefused, "the server named a file this agent does not fetch: "+err.Error(), 0)
+	if err := validateTarget(*t); err != nil {
+		p.setLocked(model.AgentPrefetchRefused, "the server named a file this agent does not fetch: "+err.Error(), 0)
 		return
 	}
 	if t.OS != p.opts.GOOS || t.Arch != p.opts.GOARCH {
-		p.setLocked(StateRefused, fmt.Sprintf("the file is for %s/%s and this agent runs on %s/%s", t.OS, t.Arch, p.opts.GOOS, p.opts.GOARCH), 0)
+		p.setLocked(model.AgentPrefetchRefused, fmt.Sprintf("the file is for %s/%s and this agent runs on %s/%s", t.OS, t.Arch, p.opts.GOOS, p.opts.GOARCH), 0)
 		return
 	}
 	if strings.TrimPrefix(t.Version, "v") == strings.TrimPrefix(p.opts.AgentVersion, "v") {
-		p.setLocked(StateRefused, "this agent already runs version "+t.Version, 0)
+		p.setLocked(model.AgentPrefetchRefused, "this agent already runs version "+t.Version, 0)
 		return
 	}
 	dir, ok := ScriptDir(t.InstallPath, p.opts.Executable)
 	if !ok {
-		p.setLocked(StateRefused, "the update installs to "+boundReason(t.InstallPath, 80)+", not over this agent's own binary, and prefetch writes only beside that", 0)
+		p.setLocked(model.AgentPrefetchRefused, "the update installs to "+boundReason(t.InstallPath, 80)+", not over this agent's own binary, and prefetch writes only beside that", 0)
 		return
 	}
 	if dirErr != nil {
-		p.setLocked(StateRefused, dirErr.Error(), 0)
+		p.setLocked(model.AgentPrefetchRefused, dirErr.Error(), 0)
 		return
 	}
-	path := filepath.Join(dir, PartialPrefix+t.served())
-	if p.state == StateComplete && p.verified.matches(path) {
+	path := filepath.Join(dir, PartialPrefix+servedDigest(*t))
+	if p.state == model.AgentPrefetchComplete && p.verified.matches(path) {
 		return
 	}
 	if p.opts.Now().Before(p.retryAt) {
@@ -487,7 +453,7 @@ func (p *Prefetcher) kickLocked() {
 	run := &fetchRun{key: key, cancel: cancel, done: make(chan struct{})}
 	p.run = run
 	p.progress.Store(p.bytes)
-	p.setLocked(StateFetching, "", p.bytes)
+	p.setLocked(model.AgentPrefetchFetching, "", p.bytes)
 	go p.fetch(ctx, run, *t, path)
 }
 
@@ -496,7 +462,7 @@ func (p *Prefetcher) setLocked(state, reason string, bytes int64) {
 	changed := state != p.state || reason != p.reason
 	p.state, p.reason, p.bytes = state, reason, bytes
 	if changed {
-		if state == StateRefused || state == StateWaiting {
+		if state == model.AgentPrefetchRefused || state == model.AgentPrefetchWaiting {
 			p.opts.Logf("agent update prefetch %s: %s", state, reason)
 		} else {
 			p.opts.Logf("agent update prefetch %s", state)
@@ -511,7 +477,7 @@ func (p *Prefetcher) setLocked(state, reason string, bytes int64) {
 // names: the files earlier attempts left when a policy moved on or an
 // operator rejected a plan. A directory is left alone, and a symlink is
 // removed as a name, never followed.
-func (p *Prefetcher) pruneLocked(dir string, t *Target) {
+func (p *Prefetcher) pruneLocked(dir string, t *model.AgentUpdatePrefetch) {
 	keep := map[string]bool{}
 	for i, digest := range p.cfg.Keep {
 		if i >= maxKeep {
@@ -521,9 +487,9 @@ func (p *Prefetcher) pruneLocked(dir string, t *Target) {
 			keep[digest] = true
 		}
 	}
-	if t != nil && t.validate() == nil {
+	if t != nil && validateTarget(*t) == nil {
 		keep[t.SHA256] = true
-		keep[t.served()] = true
+		keep[servedDigest(*t)] = true
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -542,7 +508,7 @@ func (p *Prefetcher) pruneLocked(dir string, t *Target) {
 }
 
 // fetch runs one download attempt and records what came of it.
-func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path string) {
+func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t model.AgentUpdatePrefetch, path string) {
 	state, reason, have, gained := p.attempt(ctx, t, path)
 	p.mu.Lock()
 	if p.run == run {
@@ -550,13 +516,13 @@ func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path st
 	}
 	if p.key == run.key {
 		switch {
-		case state == StateComplete:
+		case state == model.AgentPrefetchComplete:
 			p.failures, p.retryAt = 0, time.Time{}
 			p.verified = stampOf(path)
 		case ctx.Err() != nil:
 			// Stopped by Hold or by a new config, not failed: no backoff.
 			// The stall timer cancels only the request, never this context.
-			state, reason = StateWaiting, "stopped for a task or a new config; the next config pull resumes it"
+			state, reason = model.AgentPrefetchWaiting, "stopped for a task or a new config; the next config pull resumes it"
 		case gained >= minProgress:
 			// The response delivered bytes before it ended: a line too slow
 			// for the server's 30 minute response, or one that drops or
@@ -586,7 +552,7 @@ func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path st
 // attempt fetches what the file still lacks and verifies a file that reached
 // its size. It returns the state, a reason, how many bytes the file holds,
 // and how many this attempt added. The file is closed before it returns.
-func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (state, reason string, have, gained int64) {
+func (p *Prefetcher) attempt(ctx context.Context, t model.AgentUpdatePrefetch, path string) (state, reason string, have, gained int64) {
 	// The disk is checked before anything is created. A kept file of full
 	// length needs nothing more, and if it fails its digest, truncating it
 	// frees what the download then takes.
@@ -597,32 +563,32 @@ func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (state,
 	if kept < t.Size {
 		avail, err := p.opts.FreeSpace(filepath.Dir(path))
 		if err != nil {
-			return StateRefused, "cannot read the free space: " + err.Error(), kept, 0
+			return model.AgentPrefetchRefused, "cannot read the free space: " + err.Error(), kept, 0
 		}
 		need := uint64(t.Size-kept) + 3*uint64(t.BinarySize) + reserveBytes
 		if avail < need {
-			return StateRefused, fmt.Sprintf("%d bytes free beside the agent; the download needs %d more and must leave room for the update and %d spare", avail, t.Size-kept, reserveBytes), kept, 0
+			return model.AgentPrefetchRefused, fmt.Sprintf("%d bytes free beside the agent; the download needs %d more and must leave room for the update and %d spare", avail, t.Size-kept, reserveBytes), kept, 0
 		}
 	}
 	f, have, err := openPartial(path)
 	if err != nil {
-		return StateWaiting, "cannot open the download: " + err.Error(), 0, 0
+		return model.AgentPrefetchWaiting, "cannot open the download: " + err.Error(), 0, 0
 	}
 	defer f.Close()
 	if have > t.Size {
 		if err := f.Truncate(0); err != nil {
-			return StateWaiting, "cannot reset the download: " + err.Error(), have, 0
+			return model.AgentPrefetchWaiting, "cannot reset the download: " + err.Error(), have, 0
 		}
 		have = 0
 	}
 	if have == t.Size {
-		if ok, err := fileMatches(f, t.served()); err != nil {
-			return StateWaiting, "cannot read the download: " + err.Error(), have, 0
+		if ok, err := fileMatches(f, servedDigest(t)); err != nil {
+			return model.AgentPrefetchWaiting, "cannot read the download: " + err.Error(), have, 0
 		} else if ok {
-			return StateComplete, "", have, 0
+			return model.AgentPrefetchComplete, "", have, 0
 		}
 		if err := f.Truncate(0); err != nil {
-			return StateWaiting, "cannot reset the download: " + err.Error(), have, 0
+			return model.AgentPrefetchWaiting, "cannot reset the download: " + err.Error(), have, 0
 		}
 		have = 0
 	}
@@ -630,37 +596,37 @@ func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (state,
 	have, err = p.download(ctx, f, t, have)
 	gained = max(have-before, 0)
 	if err != nil {
-		return StateWaiting, err.Error(), have, gained
+		return model.AgentPrefetchWaiting, err.Error(), have, gained
 	}
 	// A failure after the download is the disk's, not the line's; it backs
 	// off like an attempt that moved nothing.
 	if err := f.Sync(); err != nil {
-		return StateWaiting, "cannot sync the download: " + err.Error(), have, 0
+		return model.AgentPrefetchWaiting, "cannot sync the download: " + err.Error(), have, 0
 	}
-	ok, err := fileMatches(f, t.served())
+	ok, err := fileMatches(f, servedDigest(t))
 	if err != nil {
-		return StateWaiting, "cannot read the download: " + err.Error(), have, 0
+		return model.AgentPrefetchWaiting, "cannot read the download: " + err.Error(), have, 0
 	}
 	if !ok {
 		// A wrong file of full length cannot be continued; the task would
 		// delete it too. Start over after the backoff.
 		_ = f.Truncate(0)
-		return StateWaiting, "the finished download did not match its digest and was discarded", 0, 0
+		return model.AgentPrefetchWaiting, "the finished download did not match its digest and was discarded", 0, 0
 	}
-	return StateComplete, "", have, gained
+	return model.AgentPrefetchComplete, "", have, gained
 }
 
 // download asks the server for the rest of the file and appends it. It
 // returns the file's size afterwards.
-func (p *Prefetcher) download(ctx context.Context, f *os.File, t Target, have int64) (int64, error) {
+func (p *Prefetcher) download(ctx context.Context, f *os.File, t model.AgentUpdatePrefetch, have int64) (int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	target := p.opts.Server + RoutePrefix + t.objectPath() + "?node_id=" + url.QueryEscape(p.opts.NodeID)
+	target := p.opts.Server + RoutePrefix + objectPath(t) + "?node_id=" + url.QueryEscape(p.opts.NodeID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return have, err
 	}
-	etag := `"` + t.served() + `"`
+	etag := `"` + servedDigest(t) + `"`
 	req.Header.Set("Authorization", "Bearer "+p.opts.Token)
 	// A range addresses the stored bytes. Naming the encoding keeps any
 	// transport from asking for gzip on the wire and decoding it.
