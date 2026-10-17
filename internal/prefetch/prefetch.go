@@ -77,6 +77,13 @@ const (
 
 	firstBackoff = 30 * time.Second
 	maxBackoff   = 15 * time.Minute
+	// progressRetry is the pause before continuing a response that ended
+	// after delivering bytes, about one config pull.
+	progressRetry = 10 * time.Second
+
+	// RoutePrefix is the control plane's prefetch route. It must equal
+	// agentPrefetchPathPrefix in lattice-server.
+	RoutePrefix = "/api/agent/prefetch-binary/"
 
 	maxKeep   = 16
 	maxReason = 200
@@ -210,14 +217,20 @@ type Options struct {
 	// file.
 	CanRunUpdate bool
 
+	// OnChange is called, on its own goroutine, when the reported state
+	// changes; the agent nudges its heartbeat with it.
+	OnChange func()
+	// Logf receives state changes. It is called with the prefetcher's lock
+	// held and must not call back into the Prefetcher.
+	Logf func(format string, args ...any)
+
 	// The rest is for tests.
-	Transport http.RoundTripper
-	FreeSpace func(dir string) (uint64, error)
-	GOOS      string
-	GOARCH    string
-	Now       func() time.Time
-	OnChange  func()
-	Logf      func(format string, args ...any)
+	Transport    http.RoundTripper
+	FreeSpace    func(dir string) (uint64, error)
+	GOOS         string
+	GOARCH       string
+	Now          func() time.Time
+	StallTimeout time.Duration
 }
 
 // Prefetcher runs at most one download at a time and holds it while a task
@@ -273,6 +286,9 @@ func New(opts Options) *Prefetcher {
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
+	}
+	if opts.StallTimeout <= 0 {
+		opts.StallTimeout = stallTimeout
 	}
 	opts.Server = strings.TrimRight(opts.Server, "/")
 	transport := opts.Transport
@@ -359,14 +375,27 @@ func (p *Prefetcher) Facts() *Facts {
 	if !p.known || t == nil || p.state == "" {
 		return nil
 	}
-	bytes := p.bytes
-	if p.run != nil {
-		bytes = p.progress.Load()
-	}
-	return &Facts{
+	facts := &Facts{
 		ApprovalID: boundReason(t.ApprovalID, 64), SHA256: boundReason(t.served(), 64),
-		Bytes: bytes, Size: t.Size, State: p.state, Reason: p.reason,
+		Bytes: p.bytes, Size: t.Size, State: p.state, Reason: p.reason,
 	}
+	if p.key != p.keyLocked() {
+		// The download of the file named before is still stopping; nothing
+		// of it describes the file named now.
+		facts.Bytes, facts.State, facts.Reason = 0, StateWaiting, "switching to the file the server names now"
+	} else if p.run != nil {
+		facts.Bytes = p.progress.Load()
+	}
+	return facts
+}
+
+// keyLocked names the file the current config asks for, "" for none.
+func (p *Prefetcher) keyLocked() string {
+	t := p.cfg.Prefetch
+	if !p.known || t == nil {
+		return ""
+	}
+	return t.ApprovalID + "|" + t.served() + "|" + t.InstallPath
 }
 
 // kickLocked decides what to do with the current config: prune, refuse,
@@ -376,10 +405,7 @@ func (p *Prefetcher) kickLocked() {
 		return
 	}
 	t := p.cfg.Prefetch
-	key := ""
-	if p.known && t != nil {
-		key = t.ApprovalID + "|" + t.served() + "|" + t.InstallPath
-	}
+	key := p.keyLocked()
 	if p.run != nil {
 		if p.run.key != key {
 			// The approval moved on or went away; the download stops and
@@ -513,7 +539,7 @@ func (p *Prefetcher) pruneLocked(dir string, t *Target) {
 
 // fetch runs one download attempt and records what came of it.
 func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path string) {
-	state, reason, have := p.attempt(ctx, t, path)
+	state, reason, have, gained := p.attempt(ctx, t, path)
 	p.mu.Lock()
 	if p.run == run {
 		p.run = nil
@@ -525,7 +551,16 @@ func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path st
 			p.verified = stampOf(path)
 		case ctx.Err() != nil:
 			// Stopped by Hold or by a new config, not failed: no backoff.
+			// The stall timer cancels only the request, never this context.
 			state, reason = StateWaiting, "stopped for a task or a new config; the next config pull resumes it"
+		case gained > 0:
+			// The response delivered bytes before it ended: a line too slow
+			// for the server's 30 minute response, or one that drops or
+			// stalls. That is progress, so it continues after a short pause
+			// rather than the backoff, which is for attempts that move
+			// nothing; the pause keeps a server that sends a byte and hangs
+			// up from turning this into a loop.
+			p.failures, p.retryAt = 0, p.opts.Now().Add(progressRetry)
 		default:
 			// A failure or a refusal (the disk, the server) is retried
 			// after a backoff that doubles up to maxBackoff, never in a
@@ -545,9 +580,9 @@ func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path st
 }
 
 // attempt fetches what the file still lacks and verifies a file that reached
-// its size. It returns the state, a reason, and how many bytes the file
-// holds. The file is closed before it returns.
-func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (string, string, int64) {
+// its size. It returns the state, a reason, how many bytes the file holds,
+// and how many this attempt added. The file is closed before it returns.
+func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (state, reason string, have, gained int64) {
 	// The disk is checked before anything is created. A kept file of full
 	// length needs nothing more, and if it fails its digest, truncating it
 	// frees what the download then takes.
@@ -558,53 +593,55 @@ func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (string
 	if kept < t.Size {
 		avail, err := p.opts.FreeSpace(filepath.Dir(path))
 		if err != nil {
-			return StateRefused, "cannot read the free space: " + err.Error(), kept
+			return StateRefused, "cannot read the free space: " + err.Error(), kept, 0
 		}
 		need := uint64(t.Size-kept) + 3*uint64(t.BinarySize) + reserveBytes
 		if avail < need {
-			return StateRefused, fmt.Sprintf("%d bytes free beside the agent; the download needs %d more and must leave room for the update and %d spare", avail, t.Size-kept, reserveBytes), kept
+			return StateRefused, fmt.Sprintf("%d bytes free beside the agent; the download needs %d more and must leave room for the update and %d spare", avail, t.Size-kept, reserveBytes), kept, 0
 		}
 	}
 	f, have, err := openPartial(path)
 	if err != nil {
-		return StateWaiting, "cannot open the download: " + err.Error(), 0
+		return StateWaiting, "cannot open the download: " + err.Error(), 0, 0
 	}
 	defer f.Close()
 	if have > t.Size {
 		if err := f.Truncate(0); err != nil {
-			return StateWaiting, "cannot reset the download: " + err.Error(), have
+			return StateWaiting, "cannot reset the download: " + err.Error(), have, 0
 		}
 		have = 0
 	}
 	if have == t.Size {
 		if ok, err := fileMatches(f, t.served()); err != nil {
-			return StateWaiting, "cannot read the download: " + err.Error(), have
+			return StateWaiting, "cannot read the download: " + err.Error(), have, 0
 		} else if ok {
-			return StateComplete, "", have
+			return StateComplete, "", have, 0
 		}
 		if err := f.Truncate(0); err != nil {
-			return StateWaiting, "cannot reset the download: " + err.Error(), have
+			return StateWaiting, "cannot reset the download: " + err.Error(), have, 0
 		}
 		have = 0
 	}
+	before := have
 	have, err = p.download(ctx, f, t, have)
+	gained = max(have-before, 0)
 	if err != nil {
-		return StateWaiting, err.Error(), have
+		return StateWaiting, err.Error(), have, gained
 	}
 	if err := f.Sync(); err != nil {
-		return StateWaiting, "cannot sync the download: " + err.Error(), have
+		return StateWaiting, "cannot sync the download: " + err.Error(), have, gained
 	}
 	ok, err := fileMatches(f, t.served())
 	if err != nil {
-		return StateWaiting, "cannot read the download: " + err.Error(), have
+		return StateWaiting, "cannot read the download: " + err.Error(), have, gained
 	}
 	if !ok {
 		// A wrong file of full length cannot be continued; the task would
 		// delete it too. Start over after the backoff.
 		_ = f.Truncate(0)
-		return StateWaiting, "the finished download did not match its digest and was discarded", 0
+		return StateWaiting, "the finished download did not match its digest and was discarded", 0, 0
 	}
-	return StateComplete, "", have
+	return StateComplete, "", have, gained
 }
 
 // download asks the server for the rest of the file and appends it. It
@@ -612,7 +649,7 @@ func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (string
 func (p *Prefetcher) download(ctx context.Context, f *os.File, t Target, have int64) (int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	target := p.opts.Server + "/api/agent/prefetch-binary/" + t.objectPath() + "?node_id=" + url.QueryEscape(p.opts.NodeID)
+	target := p.opts.Server + RoutePrefix + t.objectPath() + "?node_id=" + url.QueryEscape(p.opts.NodeID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return have, err
@@ -636,13 +673,9 @@ func (p *Prefetcher) download(ctx context.Context, f *os.File, t Target, have in
 	case http.StatusOK:
 	case http.StatusPartialContent:
 		var total int64
-		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-", &start); err != nil || start != have {
-			return have, fmt.Errorf("the server answered range %q for a download of %d bytes", resp.Header.Get("Content-Range"), have)
-		}
-		if i := strings.LastIndexByte(resp.Header.Get("Content-Range"), '/'); i < 0 {
-			return have, errors.New("the server's range names no total size")
-		} else if total, err = strconv.ParseInt(resp.Header.Get("Content-Range")[i+1:], 10, 64); err != nil || total != t.Size {
-			return have, fmt.Errorf("the server's range names a file of %s bytes, not %d", resp.Header.Get("Content-Range")[i+1:], t.Size)
+		start, total, err = parseContentRange(resp.Header.Get("Content-Range"))
+		if err != nil || start != have || total != t.Size {
+			return have, fmt.Errorf("the server answered range %q for a download of %d of %d bytes", boundReason(resp.Header.Get("Content-Range"), 80), have, t.Size)
 		}
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 		return have, errRedirect
@@ -663,8 +696,8 @@ func (p *Prefetcher) download(ctx context.Context, f *os.File, t Target, have in
 		return have, err
 	}
 	p.progress.Store(start)
-	body := &stallReader{r: resp.Body}
-	body.timer = time.AfterFunc(stallTimeout, func() {
+	body := &stallReader{r: resp.Body, after: p.opts.StallTimeout}
+	body.timer = time.AfterFunc(body.after, func() {
 		body.fired.Store(true)
 		cancel()
 	})
@@ -674,7 +707,7 @@ func (p *Prefetcher) download(ctx context.Context, f *os.File, t Target, have in
 	have = w.n
 	if err != nil {
 		if body.fired.Load() {
-			return have, fmt.Errorf("no bytes for %s; kept %d bytes", stallTimeout, have)
+			return have, fmt.Errorf("no bytes for %s; kept %d bytes", body.after, have)
 		}
 		return have, fmt.Errorf("download cut after %d bytes: %w", have, err)
 	}
@@ -688,6 +721,7 @@ func (p *Prefetcher) download(ctx context.Context, f *os.File, t Target, have in
 // cancels the request when a response delivers nothing for stallTimeout.
 type stallReader struct {
 	r     io.Reader
+	after time.Duration
 	timer *time.Timer
 	fired atomic.Bool
 }
@@ -695,9 +729,26 @@ type stallReader struct {
 func (s *stallReader) Read(b []byte) (int, error) {
 	n, err := s.r.Read(b)
 	if n > 0 {
-		s.timer.Reset(stallTimeout)
+		s.timer.Reset(s.after)
 	}
 	return n, err
+}
+
+// parseContentRange reads "bytes <first>-<last>/<total>".
+func parseContentRange(v string) (first, total int64, err error) {
+	rest, ok := strings.CutPrefix(v, "bytes ")
+	span, size, ok2 := strings.Cut(rest, "/")
+	from, _, ok3 := strings.Cut(span, "-")
+	if !ok || !ok2 || !ok3 {
+		return 0, 0, errors.New("malformed Content-Range")
+	}
+	if first, err = strconv.ParseInt(from, 10, 64); err != nil {
+		return 0, 0, err
+	}
+	if total, err = strconv.ParseInt(size, 10, 64); err != nil {
+		return 0, 0, err
+	}
+	return first, total, nil
 }
 
 type progressWriter struct {

@@ -32,7 +32,14 @@ func openPartial(path string) (*os.File, int64, error) {
 	} else if !errors.Is(err, syscall.ELOOP) && !errors.Is(err, syscall.EISDIR) && !errors.Is(err, syscall.ENXIO) {
 		return nil, 0, err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// A directory at the name goes with what it holds, as the update
+	// script's rm -rf would take it; only root can have put it there.
+	// RemoveAll never follows a symlink.
+	remove := os.Remove
+	if fi, err := os.Lstat(path); err == nil && fi.IsDir() {
+		remove = os.RemoveAll
+	}
+	if err := remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, 0, fmt.Errorf("remove what stands at the download's name: %w", err)
 	}
 	f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)

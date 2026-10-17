@@ -37,7 +37,7 @@ type testServer struct {
 
 func newTestServer(t *testing.T, data []byte, target Target) *testServer {
 	t.Helper()
-	ts := &testServer{data: data, digest: target.served(), path: "/api/agent/prefetch-binary/" + target.objectPath()}
+	ts := &testServer{data: data, digest: target.served(), path: RoutePrefix + target.objectPath()}
 	ts.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ts.mu.Lock()
 		n := len(ts.requests)
@@ -782,6 +782,90 @@ func TestScriptDirFollowsTheScriptsRule(t *testing.T) {
 		dir, ok := ScriptDir(tc.install, tc.exe)
 		if dir != tc.dir || ok != tc.ok {
 			t.Errorf("ScriptDir(%q, %q) = %q %v, want %q %v", tc.install, tc.exe, dir, ok, tc.dir, tc.ok)
+		}
+	}
+}
+
+// A response that stalls is dropped after the stall timeout, keeping what
+// arrived, and because it made progress it continues after the short pause
+// instead of the backoff.
+func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
+	f := newFixture(t, 64<<10, false)
+	f.opts.StallTimeout = 150 * time.Millisecond
+	f.ts.behave = func(n int, w http.ResponseWriter, r *http.Request) bool {
+		if n != 0 {
+			return false
+		}
+		w.Header().Set("ETag", `"`+f.target.served()+`"`)
+		w.Header().Set("Content-Length", fmt.Sprint(len(f.data)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(f.data[:2048])
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		return true
+	}
+	p := New(f.opts)
+	p.Update(f.config())
+	facts := waitState(t, p, StateWaiting)
+	if !strings.Contains(facts.Reason, "no bytes for 150ms") || facts.Bytes != 2048 {
+		t.Fatalf("facts %+v", facts)
+	}
+	p.Update(f.config())
+	time.Sleep(20 * time.Millisecond)
+	if n := len(f.ts.seen()); n != 1 {
+		t.Fatalf("progress is continued after a pause, not at once: %d requests", n)
+	}
+	f.advance(progressRetry)
+	p.Update(f.config())
+	waitState(t, p, StateComplete)
+	requireScriptFile(t, f.partial(), f.data)
+	if seen := f.ts.seen(); len(seen) != 2 || seen[1].Header.Get("Range") != "bytes=2048-" {
+		t.Fatalf("the stalled download must be continued: %d requests", len(seen))
+	}
+}
+
+// A directory at the download's name is replaced, as the script's rm -rf
+// would replace it, and what it held is not written to.
+func TestPrefetchReplacesADirectoryAtItsName(t *testing.T) {
+	f := newFixture(t, 16<<10, false)
+	if err := os.MkdirAll(filepath.Join(f.partial(), "inner"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := New(f.opts)
+	p.Update(f.config())
+	waitState(t, p, StateComplete)
+	requireScriptFile(t, f.partial(), f.data)
+}
+
+// The names prefetch shares with lattice-server: the kept download's prefix
+// (agentUpdatePartialPrefix), the install paths the update script maps onto
+// the running agent (defaultAgentInstallPath, previousDefaultAgentInstallPath,
+// legacyAgentInstallPath) and the route (agentPrefetchPathPrefix). The
+// server pins the same literals, so a change on one side fails a test.
+func TestPrefetchContractNamesMatchTheServer(t *testing.T) {
+	for got, want := range map[string]string{
+		PartialPrefix:         ".lattice-agent-download-",
+		defaultInstallPath:    "/opt/lattice/node-agent/lattice-agent",
+		oldDefaultInstallPath: "/opt/lattice/lattice-agent",
+		legacyInstallPath:     "/usr/local/bin/lattice-agent",
+		RoutePrefix:           "/api/agent/prefetch-binary/",
+	} {
+		if got != want {
+			t.Errorf("%q, want %q", got, want)
+		}
+	}
+}
+
+func TestParseContentRange(t *testing.T) {
+	for in, want := range map[string][2]int64{"bytes 100-199/200": {100, 200}, "bytes 0-0/1": {0, 1}} {
+		first, total, err := parseContentRange(in)
+		if err != nil || first != want[0] || total != want[1] {
+			t.Errorf("%q: %d %d %v", in, first, total, err)
+		}
+	}
+	for _, in := range []string{"", "bytes */200", "bytes 1-2", "items 1-2/3", "bytes x-2/3", "bytes 1-2/y"} {
+		if _, _, err := parseContentRange(in); err == nil {
+			t.Errorf("%q must be refused", in)
 		}
 	}
 }

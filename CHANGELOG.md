@@ -20,14 +20,16 @@ fetch nor remove anything", and the update runs through its task as before.
   from its own enrolled server at `/api/agent/prefetch-binary/...` with its
   node token, one download at a time, with no deadline, resuming from the
   bytes on disk with `Range` and `If-Range` on the pinned digest, also after
-  a restart. A response that delivers nothing for two minutes is dropped and
-  resumed later; a failure is retried after a backoff from 30 s doubling to
-  15 minutes.
+  a restart. A response that delivers nothing for two minutes is dropped. A
+  response that delivered bytes before it ended is continued after 10 s; an
+  attempt that moved nothing is retried after a backoff from 30 s doubling
+  to 15 minutes.
 - It writes exactly the file the update script continues:
   `.lattice-agent-download-<digest>` (the compressed digest for a compressed
   plan) beside the binary the script replaces, a regular file of the agent's
   user, mode 0600, never through a symlink or a second hard link, and never
-  past the named size. The finished file is held to its digest and discarded
+  past the named size; anything else at that name is removed first, a
+  directory with what it holds, as the script's `rm -rf` would. The finished file is held to its digest and discarded
   if it fails. The agent writes only when the script would resolve its target
   to the agent's own executable, and only in a directory no user but root can
   change.
