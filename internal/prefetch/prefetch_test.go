@@ -342,7 +342,7 @@ func TestPrefetchStopsWhenTheApprovalDisappears(t *testing.T) {
 			f.ts.behave = blockingServer(f, started, &ended)
 			p := New(f.opts)
 			p.Update(f.config())
-			<-started
+			awaitStarted(t, started)
 			cfg := &Config{Keep: []string{}}
 			if kept {
 				cfg.Keep = []string{f.target.served()}
@@ -386,7 +386,7 @@ func TestPrefetchHoldHandsTheFileToTheTask(t *testing.T) {
 	f.ts.behave = blockingServer(f, started, &ended)
 	p := New(f.opts)
 	p.Update(f.config())
-	<-started
+	awaitStarted(t, started)
 	deadline := time.Now().Add(5 * time.Second)
 	for p.Facts().Bytes < 1024 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -715,23 +715,54 @@ func TestPrefetchNeverWritesThroughTheName(t *testing.T) {
 	}
 }
 
+// awaitStarted fails the test instead of hanging when the download it waits
+// for never starts.
+func awaitStarted(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the download never started")
+	}
+}
+
 // A directory another user can change is refused: a name there could be
-// swapped between the agent's checks and the script's.
+// swapped between the agent's checks and the script's. That holds for the
+// directory written into even with the sticky bit, and for a directory
+// above it without one.
 func TestPrefetchRefusesADirectoryOthersCanWrite(t *testing.T) {
-	f := newFixture(t, 16<<10, false)
-	if err := os.Chmod(f.dir, 0o777); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(f.dir, 0o700)
-	p := New(f.opts)
-	p.Update(f.config())
-	facts := p.Facts()
-	if facts == nil || facts.State != StateRefused || !strings.Contains(facts.Reason, "can be changed by a user other than root") {
-		t.Fatalf("facts %+v", facts)
-	}
-	time.Sleep(20 * time.Millisecond)
-	if len(f.ts.seen()) != 0 {
-		t.Fatal("nothing may be fetched into such a directory")
+	for name, mode := range map[string]struct {
+		leaf, parent os.FileMode
+	}{
+		"the directory itself":                          {leaf: 0o777, parent: 0o700},
+		"the directory itself, sticky":                  {leaf: 0o777 | os.ModeSticky, parent: 0o700},
+		"a directory above it":                          {leaf: 0o700, parent: 0o777},
+		"a sticky directory above it not owned by root": {leaf: 0o700, parent: 0o777 | os.ModeSticky},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if mode.parent&os.ModeSticky != 0 && os.Geteuid() == 0 {
+				t.Skip("run as root, the test's sticky directory is root-owned, which the rule accepts")
+			}
+			f := newFixture(t, 16<<10, false)
+			parent := filepath.Dir(f.dir)
+			for path, m := range map[string]os.FileMode{f.dir: mode.leaf, parent: mode.parent} {
+				if err := os.Chmod(path, m); err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer os.Chmod(parent, 0o700)
+			defer os.Chmod(f.dir, 0o700)
+			p := New(f.opts)
+			p.Update(f.config())
+			facts := p.Facts()
+			if facts == nil || facts.State != StateRefused || !strings.Contains(facts.Reason, "can be changed by a user other than root") {
+				t.Fatalf("facts %+v", facts)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if len(f.ts.seen()) != 0 {
+				t.Fatal("nothing may be fetched into such a directory")
+			}
+		})
 	}
 }
 

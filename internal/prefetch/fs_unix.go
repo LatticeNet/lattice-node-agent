@@ -66,16 +66,23 @@ func ownedRegular(f *os.File) (int64, bool) {
 }
 
 // secureDir accepts a directory only when no user but root, or the agent's
-// own user, can change it or any directory above it. The update script
-// trusts its download as far as that directory, which holds the binary root
-// runs; prefetch writes there before any approval, so it also refuses a
-// directory another user could swap a name in.
+// own user, can change it or swap it or any directory above it. The update
+// script trusts its download as far as that directory, which holds the
+// binary root runs; prefetch writes there before any approval, so it also
+// refuses a directory another user could swap a name in.
+//
+// The directory itself must be owned by root or the agent's user and
+// writable by no one else. Each directory above it must be owned the same
+// way and writable by no one else, or be a root-owned sticky directory such
+// as /tmp: there other users may add names but cannot rename or remove the
+// one below it, which is itself checked.
 func secureDir(dir string) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("the install directory %q is not absolute", dir)
 	}
 	euid := os.Geteuid()
-	for p := filepath.Clean(dir); ; p = filepath.Dir(p) {
+	leaf := filepath.Clean(dir)
+	for p := leaf; ; p = filepath.Dir(p) {
 		fi, err := os.Lstat(p)
 		if err != nil {
 			return fmt.Errorf("cannot inspect %s: %w", p, err)
@@ -87,7 +94,10 @@ func secureDir(dir string) error {
 		if !ok {
 			return fmt.Errorf("cannot read the owner of %s", p)
 		}
-		if (st.Uid != 0 && int(st.Uid) != euid) || fi.Mode().Perm()&0o022 != 0 {
+		owned := st.Uid == 0 || int(st.Uid) == euid
+		shared := fi.Mode().Perm()&0o022 != 0
+		stickyRoot := p != leaf && st.Uid == 0 && fi.Mode()&os.ModeSticky != 0
+		if !owned || (shared && !stickyRoot) {
 			return fmt.Errorf("%s can be changed by a user other than root, so the agent does not write there", p)
 		}
 		if p == filepath.Dir(p) {

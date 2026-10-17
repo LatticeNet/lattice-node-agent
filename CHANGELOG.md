@@ -32,7 +32,7 @@ fetch nor remove anything", and the update runs through its task as before.
   directory with what it holds, as the script's `rm -rf` would. The finished file is held to its digest and discarded
   if it fails. The agent writes only when the script would resolve its target
   to the agent's own executable, and only in a directory no user but root can
-  change.
+  change, below directories that are the same or root-owned and sticky.
 - A free-space check runs before anything is created: the download, three
   copies of the binary for the update itself, and 256 MiB spare must fit, or
   the prefetch is refused and reported.
