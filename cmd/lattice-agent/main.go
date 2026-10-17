@@ -35,6 +35,7 @@ import (
 	"github.com/LatticeNet/lattice-node-agent/internal/ipdiscover"
 	"github.com/LatticeNet/lattice-node-agent/internal/linechain"
 	"github.com/LatticeNet/lattice-node-agent/internal/metrics"
+	"github.com/LatticeNet/lattice-node-agent/internal/prefetch"
 	"github.com/LatticeNet/lattice-node-agent/internal/prober"
 	"github.com/LatticeNet/lattice-node-agent/internal/proxyusage"
 	"github.com/LatticeNet/lattice-node-agent/internal/singboxdiscover"
@@ -47,7 +48,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-var version = "0.3.10-alpha.6"
+var version = "0.3.10-alpha.7"
 var compatServerMin = "v0.2.2-alpha.19"
 var compatDashboardMin = "v0.2.2-alpha.7"
 var compatChannel = "alpha"
@@ -115,7 +116,14 @@ type agentConfig struct {
 	NoBeacon bool
 	// Beacon is the node's beacon responder and client. It holds path keys
 	// in memory only; nil only in tests that build a bare config.
-	Beacon              *beacon.Node
+	Beacon *beacon.Node
+	// NoPrefetch is the node veto on agent update prefetch (design 31, S4):
+	// no update binary is downloaded before its task, and no kept download
+	// is removed, whatever the server names.
+	NoPrefetch bool
+	// Prefetch downloads the binary of this node's open agent update in the
+	// background; nil only in tests that build a bare config.
+	Prefetch            *prefetch.Prefetcher
 	TaskCgroupRoot      string
 	TaskCgroupMemoryMax string
 	TaskCgroupPidsMax   string
@@ -256,6 +264,7 @@ func main() {
 	// overriding -allow-exec. Use it to neutralize a node without redeploying.
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.BoolVar(&cfg.NoBeacon, "no-beacon", envVeto("LATTICE_NO_BEACON"), "never open the measurement beacon's UDP socket, whatever the server configures (node veto; beacon checks from this node still run)")
+	flag.BoolVar(&cfg.NoPrefetch, "no-prefetch", envVeto("LATTICE_NO_PREFETCH"), "never download an agent update binary before its task runs, whatever the server names (node veto; the update task still downloads it)")
 	flag.StringVar(&cfg.TaskCgroupRoot, "task-cgroup-root", os.Getenv("LATTICE_TASK_CGROUP_ROOT"), "Linux cgroup v2 root for per-task caps; use \"auto\" for the agent service cgroup or leave empty to disable")
 	flag.StringVar(&cfg.TaskCgroupMemoryMax, "task-cgroup-memory-max", env("LATTICE_TASK_CGROUP_MEMORY_MAX", taskexec.DefaultCgroupMemoryMax), "memory.max value for per-task cgroups when -task-cgroup-root is set")
 	flag.StringVar(&cfg.TaskCgroupPidsMax, "task-cgroup-pids-max", env("LATTICE_TASK_CGROUP_PIDS_MAX", taskexec.DefaultCgroupPidsMax), "pids.max value for per-task cgroups when -task-cgroup-root is set")
@@ -488,10 +497,15 @@ func main() {
 	if err := writeHealthMarker(version); err != nil {
 		log.Printf("warning: health marker not written, an update guard will restore the previous binary: %v", err)
 	}
+	cfg.Prefetch = newPrefetcher(cfg, beat.nudgeNow)
+	if cfg.NoPrefetch {
+		log.Printf("prefetch: -no-prefetch set; update binaries are downloaded only by their tasks")
+	}
 	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 		debugf(cfg, "agent config fetch failed: %v", err)
 	} else {
 		applyAgentConfig(&cfg, agentCfg)
+		cfg.Prefetch.Update(agentCfg.AgentUpdate)
 	}
 	beat.setConfig(cfg)
 	log.Printf("lattice-agent connected node=%s server=%s report_guard_reality=%v allow_exec=%v allow_root_exec=%v task_cgroup=%v task_work_root=%v allow_terminal=%v terminal_transport=%s debug=%v", cfg.NodeID, cfg.Server, cfg.ReportGuardReality, cfg.AllowExec, cfg.AllowRoot, cfg.taskCgroupConfig().Root != "", strings.TrimSpace(cfg.TaskWorkRoot) != "", cfg.AllowTerminal, cfg.TerminalTransport, cfg.Debug)
@@ -523,6 +537,7 @@ func main() {
 	// from reporting; the loop below only hands leases over and keeps going.
 	worker := newTaskWorker(runner, taskResults, linechainManager)
 	worker.health = health
+	worker.prefetch = cfg.Prefetch
 	monitors := newMonitorManager(cfg)
 	monitorFlushCtx, stopMonitorFlush := context.WithCancel(context.Background())
 	defer stopMonitorFlush()
@@ -577,6 +592,9 @@ func main() {
 				return err
 			}
 			applyAgentConfig(&cfg, agentCfg)
+			// The agent update prefetch (design 31, S4); nil from a server
+			// that predates it, which leaves everything on disk alone.
+			cfg.Prefetch.Update(agentCfg.AgentUpdate)
 			monitors.setConfig(cfg)
 			logTailers.setConfig(cfg)
 			return nil
@@ -656,6 +674,7 @@ func main() {
 	log.Printf("lattice-agent stopping: shutdown signal received")
 	_ = sdNotify("STOPPING=1")
 	worker.shutdown(taskShutdownGrace, taskShutdownReportGrace)
+	cfg.Prefetch.Close()
 	stopMonitorFlush()
 	monitors.drain(monitorResultShutdownGrace)
 	cfg.Beacon.Close()
@@ -828,6 +847,29 @@ func fetchAgentConfig(cfg agentConfig) (model.AgentConfig, error) {
 	return out, nil
 }
 
+// newPrefetcher builds the agent update prefetcher from the agent's own
+// enrollment. The executable is read the way the update script reads it,
+// readlink of the agent's /proc/<pid>/exe, because the script keeps its
+// download beside that path; where /proc is missing the path is empty and
+// prefetch refuses rather than guess.
+func newPrefetcher(cfg agentConfig, onChange func()) *prefetch.Prefetcher {
+	executable, _ := os.Readlink("/proc/self/exe")
+	root := os.Geteuid() == 0
+	return prefetch.New(prefetch.Options{
+		Server: cfg.Server, NodeID: cfg.NodeID, Token: cfg.Token,
+		Executable:   executable,
+		AgentVersion: version,
+		Veto:         cfg.NoPrefetch,
+		Root:         root,
+		// The task runner refuses every task without -allow-exec, and every
+		// task of a root agent without -allow-root-exec; -no-exec has
+		// already cleared AllowExec.
+		CanRunUpdate: cfg.AllowExec && (!root || cfg.AllowRoot),
+		OnChange:     onChange,
+		Logf:         log.Printf,
+	})
+}
+
 func applyAgentConfig(cfg *agentConfig, remote model.AgentConfig) {
 	oldDebug := cfg.Debug
 	oldCollect := cfg.DebugCollect
@@ -994,7 +1036,7 @@ func metricsPayload(cfg agentConfig) map[string]any {
 	sandbox := taskexec.SandboxProfileWithOptions(cfg.AllowExec, cfg.AllowRoot, os.Geteuid(), cfg.taskSandboxOptions())
 	probeMethods, probeRefusals := probeFacts()
 	debugf(cfg, "metrics collected: cpu=%.1f load1=%.2f memory=%d/%d disk=%d/%d uptime=%d cpu_cores=%d cpu_model=%q", m.CPUPercent, m.Load1, m.MemoryUsed, m.MemoryTotal, m.DiskUsed, m.DiskTotal, m.UptimeSeconds, facts.CPUCores, facts.CPUModel)
-	return map[string]any{
+	payload := map[string]any{
 		"version":        version,
 		"compatibility":  compatibilityPayload(),
 		"capabilities":   payloadCapabilities(cfg),
@@ -1029,6 +1071,15 @@ func metricsPayload(cfg agentConfig) map[string]any {
 		"metrics":       m,
 		"host_facts":    facts,
 	}
+	// "prefetch" rides the beat only while the server names a file, so the
+	// operator sees the progress beside the approval. Older servers decode
+	// the beat leniently and ignore it.
+	if cfg.Prefetch != nil {
+		if f := cfg.Prefetch.Facts(); f != nil {
+			payload["prefetch"] = f
+		}
+	}
+	return payload
 }
 
 type guardRealityCollector func(context.Context, guardreality.Source, string) (model.GuardNodeReality, error)
@@ -1763,6 +1814,10 @@ type taskWorker struct {
 	// health, when set before the first poll, records how long a batch has
 	// been in flight for the heartbeat's loop health.
 	health *loopHealth
+	// prefetch, when set before the first poll, is held while a batch runs:
+	// its download stops and its file is closed before any task starts, so
+	// an update task is the only writer of the file it continues.
+	prefetch taskHolder
 
 	mu   sync.Mutex
 	busy bool
@@ -1775,6 +1830,12 @@ type taskWorker struct {
 	// task that outlived its grace.
 	runCtx     context.Context
 	cancelRuns context.CancelFunc
+}
+
+// taskHolder is what the worker needs of the prefetcher.
+type taskHolder interface {
+	Hold()
+	Release()
 }
 
 // taskBatch is one lease response together with the config it was leased
@@ -1798,8 +1859,14 @@ func newTaskWorker(runner taskRunner, outbox taskResultOutbox, manager *linechai
 func (w *taskWorker) run() {
 	defer close(w.done)
 	for batch := range w.batches {
+		if w.prefetch != nil {
+			w.prefetch.Hold()
+		}
 		if err := executeTasks(w.runCtx, batch.cfg, w.runner, w.outbox, w.manager, batch.tasks, w.stopping); err != nil {
 			log.Printf("task error: %v", err)
+		}
+		if w.prefetch != nil {
+			w.prefetch.Release()
 		}
 		w.setBusy(false)
 	}

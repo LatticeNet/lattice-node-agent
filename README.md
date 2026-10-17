@@ -365,6 +365,12 @@ missing checksum manifest aborts the install before the binary is written.
   the server configures, and reports `refused_by_node`. Beacon checks this node
   runs against other nodes are not affected; they only send. The variable fails
   closed: any value other than empty, `0`, `false`, `no` or `off` sets the veto.
+- `LATTICE_NO_PREFETCH=1` (`-no-prefetch`) is the node veto on agent update
+  prefetch (design 31, S4): the agent never downloads an update binary before
+  its task runs and never removes a kept download, whatever the server names,
+  and reports `refused`. The update still runs through its task, which
+  downloads the binary itself. The variable fails closed like
+  `LATTICE_NO_BEACON`.
 - `LATTICE_AGENT_RUN_USER` / `LATTICE_AGENT_RUN_GROUP` configure an optional
   non-root systemd service identity during install or reconfigure.
 - `LATTICE_AGENT_ALLOW_TERMINAL=1` enables audited browser terminal sessions.
