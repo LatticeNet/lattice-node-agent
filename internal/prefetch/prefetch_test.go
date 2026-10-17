@@ -735,6 +735,26 @@ func TestPrefetchRefusesADirectoryOthersCanWrite(t *testing.T) {
 	}
 }
 
+// A response that ends after a few bytes is no progress: it backs off like
+// a failure instead of retrying after the short pause.
+func TestPrefetchTreatsAFewBytesAsNoProgress(t *testing.T) {
+	f := newFixture(t, 64<<10, false)
+	f.ts.behave = cutAfter(f.ts, 0, minProgress-1)
+	p := New(f.opts)
+	p.Update(f.config())
+	waitState(t, p, StateWaiting)
+	f.advance(progressRetry)
+	p.Update(f.config())
+	time.Sleep(20 * time.Millisecond)
+	if n := len(f.ts.seen()); n != 1 {
+		t.Fatalf("a few bytes must not earn the short pause: %d requests", n)
+	}
+	f.advance(firstBackoff)
+	p.Update(f.config())
+	waitState(t, p, StateComplete)
+	requireScriptFile(t, f.partial(), f.data)
+}
+
 // A failed attempt is retried after a backoff that doubles, not in a loop.
 func TestPrefetchBacksOffAfterAFailure(t *testing.T) {
 	f := newFixture(t, 16<<10, false)
@@ -799,7 +819,7 @@ func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
 		w.Header().Set("ETag", `"`+f.target.served()+`"`)
 		w.Header().Set("Content-Length", fmt.Sprint(len(f.data)))
 		w.WriteHeader(http.StatusOK)
-		w.Write(f.data[:2048])
+		w.Write(f.data[:minProgress])
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 		return true
@@ -807,7 +827,7 @@ func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
 	p := New(f.opts)
 	p.Update(f.config())
 	facts := waitState(t, p, StateWaiting)
-	if !strings.Contains(facts.Reason, "no bytes for 150ms") || facts.Bytes != 2048 {
+	if !strings.Contains(facts.Reason, "no bytes for 150ms") || facts.Bytes != minProgress {
 		t.Fatalf("facts %+v", facts)
 	}
 	p.Update(f.config())
@@ -819,7 +839,7 @@ func TestPrefetchDropsAStalledResponseAndContinues(t *testing.T) {
 	p.Update(f.config())
 	waitState(t, p, StateComplete)
 	requireScriptFile(t, f.partial(), f.data)
-	if seen := f.ts.seen(); len(seen) != 2 || seen[1].Header.Get("Range") != "bytes=2048-" {
+	if seen := f.ts.seen(); len(seen) != 2 || seen[1].Header.Get("Range") != fmt.Sprintf("bytes=%d-", minProgress) {
 		t.Fatalf("the stalled download must be continued: %d requests", len(seen))
 	}
 }

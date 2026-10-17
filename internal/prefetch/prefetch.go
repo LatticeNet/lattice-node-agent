@@ -78,8 +78,12 @@ const (
 	firstBackoff = 30 * time.Second
 	maxBackoff   = 15 * time.Minute
 	// progressRetry is the pause before continuing a response that ended
-	// after delivering bytes, about one config pull.
+	// after delivering at least minProgress bytes, about one config pull.
+	// 16 KiB is under 30 s of the slowest line seen (0.6 KB/s), so a slow
+	// line that drops counts as progress while a server that sends a few
+	// bytes and hangs up backs off.
 	progressRetry = 10 * time.Second
+	minProgress   = 16 << 10
 
 	// RoutePrefix is the control plane's prefetch route. It must equal
 	// agentPrefetchPathPrefix in lattice-server.
@@ -553,7 +557,7 @@ func (p *Prefetcher) fetch(ctx context.Context, run *fetchRun, t Target, path st
 			// Stopped by Hold or by a new config, not failed: no backoff.
 			// The stall timer cancels only the request, never this context.
 			state, reason = StateWaiting, "stopped for a task or a new config; the next config pull resumes it"
-		case gained > 0:
+		case gained >= minProgress:
 			// The response delivered bytes before it ended: a line too slow
 			// for the server's 30 minute response, or one that drops or
 			// stalls. That is progress, so it continues after a short pause
@@ -628,12 +632,14 @@ func (p *Prefetcher) attempt(ctx context.Context, t Target, path string) (state,
 	if err != nil {
 		return StateWaiting, err.Error(), have, gained
 	}
+	// A failure after the download is the disk's, not the line's; it backs
+	// off like an attempt that moved nothing.
 	if err := f.Sync(); err != nil {
-		return StateWaiting, "cannot sync the download: " + err.Error(), have, gained
+		return StateWaiting, "cannot sync the download: " + err.Error(), have, 0
 	}
 	ok, err := fileMatches(f, t.served())
 	if err != nil {
-		return StateWaiting, "cannot read the download: " + err.Error(), have, gained
+		return StateWaiting, "cannot read the download: " + err.Error(), have, 0
 	}
 	if !ok {
 		// A wrong file of full length cannot be continued; the task would

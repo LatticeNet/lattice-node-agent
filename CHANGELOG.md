@@ -21,9 +21,9 @@ fetch nor remove anything", and the update runs through its task as before.
   node token, one download at a time, with no deadline, resuming from the
   bytes on disk with `Range` and `If-Range` on the pinned digest, also after
   a restart. A response that delivers nothing for two minutes is dropped. A
-  response that delivered bytes before it ended is continued after 10 s; an
-  attempt that moved nothing is retried after a backoff from 30 s doubling
-  to 15 minutes.
+  response that delivered at least 16 KiB before it ended is continued after
+  10 s; any other failed attempt is retried after a backoff from 30 s
+  doubling to 15 minutes.
 - It writes exactly the file the update script continues:
   `.lattice-agent-download-<digest>` (the compressed digest for a compressed
   plan) beside the binary the script replaces, a regular file of the agent's
