@@ -33,6 +33,8 @@ for a in "$@"; do
       echo "Env: LATTICE_SERVER, LATTICE_NODE_ID, LATTICE_NODE_TOKEN (required for install)"
       echo "     LATTICE_HOME (default /opt/lattice), LATTICE_AGENT_VERSION (default latest)"
       echo "     LATTICE_AGENT_RUN_USER / LATTICE_AGENT_RUN_GROUP for optional non-root systemd service"
+      echo "     LATTICE_AGENT_SOURCES (\"m=<mirror base> r=<release base> ...\", tried in order)"
+      echo "     LATTICE_AGENT_SHA256 (\"os/arch=<sha256> ...\"; mirrors are used only with it)"
       exit 0 ;;
   esac
 done
@@ -69,6 +71,7 @@ if [ "$(id -u)" -ne 0 ]; then
     log "re-running with sudo ..."
     exec sudo \
       LATTICE_HOME="$LATTICE_HOME" LATTICE_AGENT_REPO="$repo" LATTICE_AGENT_VERSION="$version" \
+      LATTICE_AGENT_SOURCES="${LATTICE_AGENT_SOURCES:-}" LATTICE_AGENT_SHA256="${LATTICE_AGENT_SHA256:-}" \
       LATTICE_SERVER="$server" LATTICE_NODE_ID="$node_id" LATTICE_NODE_TOKEN="$token" \
       LATTICE_AGENT_BIN="$bin_path" LATTICE_AGENT_ENV="$env_path" LATTICE_AGENT_STATE="$state_dir" \
       LATTICE_AGENT_SERVICE="$service_name" \
@@ -411,19 +414,151 @@ if [ -z "$server" ] || [ -z "$node_id" ] || [ -z "$token" ]; then
   die "set LATTICE_SERVER, LATTICE_NODE_ID, and LATTICE_NODE_TOKEN (copy the enroll command from the dashboard)"
 fi
 
-# download tool (curl preferred, wget fallback)
-if have curl; then dl() { curl -fsSL --proto '=https' --tlsv1.2 "$1" -o "$2"; }
-elif have wget; then dl() { wget --https-only -qO "$2" "$1"; }
+# ---- install: download sources and expected digests ------------------------
+# The control plane renders two optional variables into the enrollment
+# command; without them the installer downloads and verifies as it always has.
+#
+#   LATTICE_AGENT_SHA256   "os/arch=<64 lowercase hex> ..."
+#   LATTICE_AGENT_SOURCES  "m=<base> r=<base> ..."  (tried in this order)
+#
+# m= is a mirror holding <base>/<version>/<os>/<arch>/<sha256>, with <version>
+# the tag without its leading v. r= is a release base holding
+# <base>/lattice-agent-<os>-<arch> and SHA256SUMS. Without LATTICE_AGENT_SOURCES
+# the one source is the GitHub release. The digest is the table's entry for
+# this platform; when the table is unset or has no such entry, it comes from
+# SHA256SUMS on the first r= source, as before. A mirror must never supply the
+# digest it is checked against, so m= sources are used only with a rendered
+# digest. Both values are checked character by character and split on spaces
+# only; nothing in them is evaluated.
+artifact="lattice-agent-${os}-${arch}"
+platform="$os/$arch"
+if [ "$version" = "latest" ]; then
+  base="https://github.com/${repo}/releases/latest/download"
+else
+  base="https://github.com/${repo}/releases/download/${version}"
+fi
+split_ifs="$IFS"
+expected_sha=""
+if [ -n "${LATTICE_AGENT_SHA256:-}" ]; then
+  sha_seen=" "
+  IFS=' '
+  set -f
+  for entry in $LATTICE_AGENT_SHA256; do
+    case "$entry" in
+      *=*) ;;
+      *) die "LATTICE_AGENT_SHA256 entry is not os/arch=<sha256>: $entry" ;;
+    esac
+    sha_key="${entry%%=*}"
+    sha_value="${entry#*=}"
+    case "$sha_key" in
+      */*/*|/*|*/|*[!abcdefghijklmnopqrstuvwxyz0123456789/]*) sha_key="" ;;
+    esac
+    case "$sha_key" in
+      */*) ;;
+      *) die "LATTICE_AGENT_SHA256 entry has a malformed os/arch: $entry" ;;
+    esac
+    case "$sha_value" in
+      *[!0123456789abcdef]*) die "LATTICE_AGENT_SHA256 digest must be 64 lowercase hex characters: $entry" ;;
+    esac
+    [ "${#sha_value}" -eq 64 ] || die "LATTICE_AGENT_SHA256 digest must be 64 lowercase hex characters: $entry"
+    case "$sha_seen" in
+      *" $sha_key "*) die "LATTICE_AGENT_SHA256 lists $sha_key twice" ;;
+    esac
+    sha_seen="$sha_seen$sha_key "
+    if [ "$sha_key" = "$platform" ]; then expected_sha="$sha_value"; fi
+  done
+  IFS="$split_ifs"
+  set +f
+  if [ -z "$expected_sha" ]; then
+    log "LATTICE_AGENT_SHA256 has no digest for $platform; skipping mirrors and verifying against SHA256SUMS"
+  fi
+fi
+
+sources="${LATTICE_AGENT_SOURCES:-}"
+sources_label="LATTICE_AGENT_SOURCES"
+if [ -z "$sources" ]; then
+  sources="r=$base"
+  sources_label="the release URL from LATTICE_AGENT_REPO and LATTICE_AGENT_VERSION"
+fi
+mirror_version="${version#v}"
+fetch_list=""
+sums_base=""
+IFS=' '
+set -f
+for src in $sources; do
+  case "$src" in
+    m=https://?*|r=https://?*) ;;
+    *) die "$sources_label: a source must be m=https://<base> or r=https://<base>: $src" ;;
+  esac
+  src_base="${src#?=}"
+  case "$src_base" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/+-]*)
+      die "$sources_label: a base may hold only the characters A-Z a-z 0-9 . _ ~ : / + -: $src" ;;
+  esac
+  src_base="${src_base%/}"
+  case "$src" in
+    r=*)
+      [ -n "$sums_base" ] || sums_base="$src_base"
+      fetch_list="$fetch_list r=$src_base/$artifact"
+      ;;
+    *)
+      if [ -z "$expected_sha" ]; then
+        log "skipping mirror $src_base: a mirror is used only with a digest for $platform in LATTICE_AGENT_SHA256"
+      elif [ "$version" = "latest" ]; then
+        log "skipping mirror $src_base: a mirror needs an exact LATTICE_AGENT_VERSION, not latest"
+      else
+        case "$mirror_version" in
+          ""|.*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*)
+            die "LATTICE_AGENT_VERSION cannot name a mirror path: $version" ;;
+        esac
+        fetch_list="$fetch_list m=$src_base/$mirror_version/$os/$arch/$expected_sha"
+      fi
+      ;;
+  esac
+done
+IFS="$split_ifs"
+set +f
+[ -n "$fetch_list" ] || die "$sources_label leaves no source to download from (every mirror was skipped, see above)"
+
+# download tool (curl preferred, wget fallback). No total time limit, so a new
+# machine on a slow line can finish; a connect timeout and a stall cutoff
+# (curl: under 1 KiB/s for 60 s; wget: 60 s without data) end a dead source
+# instead. Every fetch continues the file it is given, and a caller that wants
+# a fresh file removes it first. A mirror (m) never follows a redirect, so it
+# cannot send root on this machine to an address of its choosing; a release
+# base (r) follows redirects, HTTPS only, as GitHub's release downloads need.
+if have curl; then
+  dl_tool="curl"
+  fetch() {
+    if [ "$1" = m ]; then
+      curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$2" "$3"
+    else
+      curl -fsSL --proto '=https' --tlsv1.2 --proto-redir '=https' --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$2" "$3"
+    fi
+  }
+elif have wget; then
+  dl_tool="wget"
+  fetch() {
+    if [ "$1" = m ]; then
+      wget --https-only -q --max-redirect=0 --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
+    else
+      wget --https-only -q --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
+    fi
+  }
 else die "need curl or wget to download the agent"; fi
+# Every fetch runs under a file-size limit of 131072 blocks, so a source that
+# streams without end cannot fill the disk and the walk moves past it. That is
+# 64 MiB where the shell counts 512-byte blocks (dash, busybox ash, bash 4 and
+# later as sh) and 128 MiB under macOS's bash 3.2, which counts 1024; the agent
+# binary is about 14 MiB. XFSZ is ignored so the overrun is a write error, not
+# a core dump.
+# yagni: a fixed cap; raise it if the agent binary ever nears 64 MiB.
+fetch_capped() { ( trap '' XFSZ; ulimit -f 131072 2>/dev/null || true; fetch "$@" ); }
 
 # checksum tool (sha256sum on Linux, shasum on macOS/BSD, sha256 on FreeBSD)
-if have sha256sum; then sumcheck() { grep " $1\$" "$2" | sha256sum -c - ; }
-elif have shasum;   then sumcheck() { grep " $1\$" "$2" | shasum -a 256 -c - ; }
-elif have sha256;   then sumcheck() {
-  expected="$(awk -v name="$1" '$2 == name { print $1; found = 1 } END { if (!found) exit 1 }' "$2")" || return 1
-  actual="$(sha256 -q "$1")" || return 1
-  [ "$actual" = "$expected" ]
-}
+if have sha256sum; then sha256_file() { sha256sum "$1" | awk '{ print $1 }'; }
+elif have shasum;   then sha256_file() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+elif have sha256;   then sha256_file() { sha256 -q "$1"; }
 else die "need sha256sum, shasum, or sha256 to verify release checksums"; fi
 
 have install || die "missing required command: install"
@@ -447,22 +582,82 @@ chmod 0750 "$LATTICE_HOME" 2>/dev/null || true
 apply_service_identity_permissions
 
 # ---- download + verify + install binary ------------------------------------
-artifact="lattice-agent-${os}-${arch}"
-if [ "$version" = "latest" ]; then
-  base="https://github.com/${repo}/releases/latest/download"
-else
-  base="https://github.com/${repo}/releases/download/${version}"
-fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-log "downloading $artifact ($version) ..."
-dl "$base/$artifact" "$tmp_dir/$artifact" || die "download failed: $base/$artifact"
-if dl "$base/SHA256SUMS" "$tmp_dir/SHA256SUMS" 2>/dev/null; then
-  ( cd "$tmp_dir" && sumcheck "$artifact" SHA256SUMS ) || die "checksum verification failed"
-  ok "checksum verified"
+part="$tmp_dir/$artifact"
+if [ -n "$expected_sha" ]; then
+  log "expected sha256 for $platform from LATTICE_AGENT_SHA256: $expected_sha"
 else
-  die "SHA256SUMS not available; refusing to install without checksum manifest"
+  fetch_capped r "$tmp_dir/SHA256SUMS" "$sums_base/SHA256SUMS" 2>/dev/null || \
+    die "SHA256SUMS not available; refusing to install without checksum manifest"
+  expected_sha="$(awk -v name="$artifact" '$2 == name { print tolower($1); n++ } END { if (n != 1) exit 1 }' "$tmp_dir/SHA256SUMS")" || \
+    die "SHA256SUMS has no single entry for $artifact; refusing to install"
+  case "$expected_sha" in
+    ""|*[!0123456789abcdef]*) die "SHA256SUMS entry for $artifact is not a sha256 digest" ;;
+  esac
+  [ "${#expected_sha}" -eq 64 ] || die "SHA256SUMS entry for $artifact is not a sha256 digest"
 fi
+
+# Walk the sources in order into one partial file, each fetch continuing it,
+# so a source that fails keeps the progress honest sources made. A source can
+# also splice wrong bytes onto honest ones, which only the finished file's
+# digest shows. So a mismatch deletes the partial and starts a second round in
+# which each source in order fetches a fresh file from byte zero and is
+# verified on its own; the first that verifies wins. The second round also
+# runs when nothing verified after a source continued another's partial: bytes
+# past the real end make every later resume fail without a mismatch.
+nl='
+'
+fetch_report=""
+fetch_mismatch=0
+fetch_resumed=0
+fetch_ok=0
+# try_source ROUND KIND=URL: 0 verified, 1 digest mismatch (file removed),
+# 2 download failed (partial kept).
+try_source() {
+  try_kind="${2%%=*}"
+  try_url="${2#?=}"
+  log "round $1: downloading $artifact ($version) from $try_url ..."
+  if [ -s "$part" ]; then fetch_resumed=1; fi
+  if fetch_capped "$try_kind" "$part" "$try_url"; then
+    try_got="$(sha256_file "$part")"
+    if [ "$try_got" = "$expected_sha" ]; then
+      fetch_report="$fetch_report${nl}  round $1, $try_url: verified"
+      return 0
+    fi
+    rm -f "$part"
+    fetch_mismatch=1
+    log "round $1: $try_url delivered a file with the wrong digest; deleted it"
+    fetch_report="$fetch_report${nl}  round $1, $try_url: digest mismatch (got ${try_got:-nothing})"
+    return 1
+  else
+    try_rc=$?
+  fi
+  log "round $1: $try_url failed ($dl_tool exit $try_rc)"
+  fetch_report="$fetch_report${nl}  round $1, $try_url: download failed ($dl_tool exit $try_rc)"
+  return 2
+}
+for src in $fetch_list; do
+  fetch_rc=0
+  try_source 1 "$src" || fetch_rc=$?
+  case "$fetch_rc" in
+    0) fetch_ok=1; break ;;
+    1) break ;;
+  esac
+done
+if [ "$fetch_ok" != 1 ] && { [ "$fetch_mismatch" = 1 ] || [ "$fetch_resumed" = 1 ]; }; then
+  log "second round: each source again from byte zero, each verified on its own"
+  for src in $fetch_list; do
+    rm -f "$part"
+    if try_source 2 "$src"; then fetch_ok=1; break; fi
+  done
+fi
+if [ "$fetch_ok" != 1 ]; then
+  [ "$fetch_mismatch" != 1 ] || \
+    die "checksum verification failed: no source delivered $artifact with sha256 $expected_sha:$fetch_report"
+  die "download failed: no source delivered $artifact:$fetch_report"
+fi
+ok "checksum verified (sha256 $expected_sha)"
 
 # Upgrade in place: stop a running instance before replacing the binary.
 svc_stop
