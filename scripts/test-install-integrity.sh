@@ -709,6 +709,14 @@ expect_refused src-backslash "LATTICE_AGENT_SOURCES: a base may hold only" \
   LATTICE_AGENT_SHA256="$TABLE" LATTICE_AGENT_SOURCES='r=https://release.example.com/a\b'
 expect_refused src-only-mirror "leaves no source to download from" \
   LATTICE_AGENT_SHA256="$LINUX_TABLE" LATTICE_AGENT_SOURCES="m=https://mirror-good.example.com/agent"
+# The repo and version build the release URL; a space in either would add a
+# source of its own.
+expect_refused repo-space "LATTICE_AGENT_REPO must be owner/repo" \
+  LATTICE_AGENT_REPO="x/y r=https://evil.example.com/y"
+expect_refused repo-path "LATTICE_AGENT_REPO must be owner/repo" \
+  LATTICE_AGENT_REPO="x/y/../z"
+expect_refused version-space "LATTICE_AGENT_VERSION must be latest or a release tag" \
+  LATTICE_AGENT_VERSION="v0.3.9 r=https://evil.example.com/y"
 [ ! -e "$PWNED" ] || { echo "a source value was executed" >&2; exit 1; }
 
 # wget, on a PATH without curl: the mirror fetch carries --max-redirect=0,
