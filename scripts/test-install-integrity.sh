@@ -654,19 +654,60 @@ if [ "${1:-}" = "-u" ]; then
 fi
 exit 1
 SH
+# It records its command line, which any local user could read in ps, and
+# sets SUDO_UID as sudo does; FAKE_SUDO_FAIL makes it fail as a wrong password
+# would.
 cat >"$SUDO_BIN/sudo" <<'SH'
 #!/usr/bin/env sh
+printf '%s\n' "$*" >>"$FAKE_CALLS.sudo"
+[ -z "${FAKE_SUDO_FAIL:-}" ] || exit 1
 exec env -i PATH="$PATH" FAKE_ROOT=1 FAKE_DIR="$FAKE_DIR" FAKE_CALLS="$FAKE_CALLS" \
-  LATTICE_AGENT_PLIST="$LATTICE_AGENT_PLIST" "$@"
+  SUDO_UID="$(/usr/bin/id -u)" LATTICE_AGENT_PLIST="$LATTICE_AGENT_PLIST" "$@"
 SH
 chmod +x "$SUDO_BIN/id" "$SUDO_BIN/sudo"
-SRC_PATH="$SUDO_BIN:/usr/bin:/bin" run_src sudo LATTICE_AGENT_SHA256="$TABLE" \
+mkdir -p "$SRC_TMP/sudo-tmp" "$SRC_TMP/sudo-fail-tmp"
+SRC_PATH="$SUDO_BIN:/usr/bin:/bin" run_src sudo TMPDIR="$SRC_TMP/sudo-tmp" LATTICE_AGENT_SHA256="$TABLE" \
   LATTICE_AGENT_SOURCES="m=https://mirror-good.example.com/agent $REL" || src_fail sudo "install failed"
 SRC_PATH=""
 expect_ok sudo
 expect_log sudo "re-running with sudo"
 expect_calls sudo 1
 expect_call sudo 1 "https://mirror-good.example.com/$MIRROR_PATH" 0
+# The enrollment token never rides sudo's command line. The root child reads
+# it from the 0600 file the re-exec made, installs it, and the file is gone.
+[ -s "$SRC_TMP/sudo.calls.sudo" ] || src_fail sudo "the fake sudo recorded no command line"
+if grep -Fq node-token-src "$SRC_TMP/sudo.calls.sudo"; then
+  src_fail sudo "the enrollment token was on sudo's command line: $(cat "$SRC_TMP/sudo.calls.sudo")"
+fi
+grep -Fq "LATTICE_NODE_TOKEN_FILE=$SRC_TMP/sudo-tmp/lattice-agent-token." "$SRC_TMP/sudo.calls.sudo" || \
+  src_fail sudo "the re-exec handed over no token file"
+grep -Fq '<key>LATTICE_NODE_TOKEN</key><string>node-token-src</string>' "$SRC_TMP/sudo/agent.plist" || \
+  src_fail sudo "the token from the file did not reach the service definition"
+if ls "$SRC_TMP/sudo-tmp" | grep -q lattice-agent-token; then src_fail sudo "the token file outlived the install"; fi
+
+# A sudo that fails (a wrong password) leaves no token file behind.
+if SRC_PATH="$SUDO_BIN:/usr/bin:/bin" run_src sudo-fail TMPDIR="$SRC_TMP/sudo-fail-tmp" FAKE_SUDO_FAIL=1; then
+  SRC_PATH=""
+  src_fail sudo-fail "the installer succeeded without root"
+fi
+SRC_PATH=""
+[ -z "$(ls "$SRC_TMP/sudo-fail-tmp")" ] || src_fail sudo-fail "the token file outlived a failed sudo"
+
+# The root child reads only a file the re-exec could have made: a regular
+# file, not a link, mode 0600, owned by the user who ran sudo.
+TOKEN_DIR="$SRC_TMP/token-files"
+mkdir -p "$TOKEN_DIR"
+MY_UID="$(/usr/bin/id -u)"
+printf 'node-token-file' >"$TOKEN_DIR/ok" && chmod 0600 "$TOKEN_DIR/ok"
+ln -s "$TOKEN_DIR/ok" "$TOKEN_DIR/link"
+printf 'node-token-file' >"$TOKEN_DIR/open" && chmod 0644 "$TOKEN_DIR/open"
+expect_refused tokfile-link "LATTICE_NODE_TOKEN_FILE is not a regular file" \
+  LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/link" SUDO_UID="$MY_UID"
+expect_refused tokfile-mode "LATTICE_NODE_TOKEN_FILE must be mode 0600" \
+  LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/open" SUDO_UID="$MY_UID"
+expect_refused tokfile-owner "owned by uid 4242" \
+  LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/ok" SUDO_UID=4242
+[ -f "$TOKEN_DIR/ok" ] || { echo "a refused token file was removed" >&2; exit 1; }
 
 # Malformed tables and sources die before any download.
 upper_sha="$(printf '%s' "$GOOD_SHA" | tr 'abcdef' 'ABCDEF')"
