@@ -693,6 +693,18 @@ fi
 SRC_PATH=""
 [ -z "$(ls "$SRC_TMP/sudo-fail-tmp")" ] || src_fail sudo-fail "the token file outlived a failed sudo"
 
+# A TMPDIR every user can write to without the sticky bit would let another
+# user swap the token directory itself: the installer refuses it before sudo.
+mkdir -p "$SRC_TMP/sudo-open-tmp" && chmod 0777 "$SRC_TMP/sudo-open-tmp"
+if SRC_PATH="$SUDO_BIN:/usr/bin:/bin" run_src sudo-open TMPDIR="$SRC_TMP/sudo-open-tmp"; then
+  SRC_PATH=""
+  src_fail sudo-open "the installer handed the token over through a TMPDIR anyone can rename in"
+fi
+SRC_PATH=""
+expect_log sudo-open "is writable by every user without the sticky bit"
+[ ! -s "$SRC_TMP/sudo-open.calls.sudo" ] || src_fail sudo-open "sudo ran before the refusal"
+[ -z "$(ls "$SRC_TMP/sudo-open-tmp")" ] || src_fail sudo-open "a token file was written"
+
 # The root child reads only a file the re-exec could have made: in a 0700
 # directory of the user who ran sudo, a regular file, not a link, with one
 # name, mode 0600 and the same owner.
