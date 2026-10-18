@@ -511,7 +511,7 @@ REL_URL="https://release.example.com/download/v0.3.9/lattice-agent-darwin-arm64"
 GH_BASE="https://github.com/LatticeNet/lattice-node-agent/releases/download/v0.3.9"
 MIRROR_PATH="agent/0.3.9/darwin/arm64/$GOOD_SHA"
 CURL_LIMITS=" --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "
-CURL_MIRROR="args: -fsS --proto =https --tlsv1.2$CURL_LIMITS"
+CURL_MIRROR="args: -fsS --proto =https --tlsv1.2 --max-time 600$CURL_LIMITS"
 CURL_RELEASE="args: -fsSL --proto =https --tlsv1.2 --proto-redir =https$CURL_LIMITS"
 
 # A mirror listed first serves wrong bytes; the release serves the right
@@ -524,7 +524,7 @@ expect_calls evil 3
 expect_call evil 1 "https://mirror-evil.example.com/$MIRROR_PATH" 0 "$CURL_MIRROR"
 expect_call evil 2 "https://mirror-evil.example.com/$MIRROR_PATH" 0 "$CURL_MIRROR"
 expect_call evil 3 "$REL_URL" 0 "$CURL_RELEASE"
-expect_call_without evil 1 " -L " "-fsSL" "--proto-redir" "--max-time"
+expect_call_without evil 1 " -L " "-fsSL" "--proto-redir"
 expect_call_without evil 3 "--max-time"
 expect_no_fetch_of evil SHA256SUMS
 expect_log evil "wrong digest"
@@ -723,6 +723,24 @@ for tool in sh awk sed grep mktemp rm mkdir chmod cat cp wc tr tail head sha256s
     /*) ln -s "$tool_path" "$WGET_BIN/$tool" ;;
   esac
 done
+# command -v names the builtin, so link the binary the timeout probe runs.
+for tool_path in /usr/bin/true /bin/true; do
+  if [ -x "$tool_path" ]; then ln -s "$tool_path" "$WGET_BIN/true"; break; fi
+done
+# The same PATH without a timeout command: wget cannot bound a mirror fetch,
+# so the mirror is skipped and the release alone installs.
+WGET_NT_BIN="$SRC_TMP/wget-nt-bin"
+cp -R "$WGET_BIN" "$WGET_NT_BIN"
+# A timeout that runs its command only for the two bounds the installer uses
+# (its probe and the mirror cap), so a mirror fetch under any other bound is
+# never made and the call count catches it.
+cat >"$WGET_BIN/timeout" <<'EOF'
+#!/bin/sh
+case "$1" in 5|600) ;; *) exit 125 ;; esac
+shift
+exec "$@"
+EOF
+chmod 0755 "$WGET_BIN/timeout"
 SRC_PATH="$WGET_BIN" run_src wget LATTICE_AGENT_SHA256="$TABLE" \
   LATTICE_AGENT_SOURCES="m=https://mirror-evil.example.com/agent $REL" || src_fail wget "install failed"
 WGET_LIMITS=" --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "
@@ -731,5 +749,13 @@ expect_calls wget 3
 expect_call wget 1 "https://mirror-evil.example.com/$MIRROR_PATH" 0 "args: --https-only -q --max-redirect=0$WGET_LIMITS"
 expect_call wget 3 "$REL_URL" 0 "args: --https-only -q$WGET_LIMITS"
 expect_call_without wget 3 "--max-redirect"
+
+SRC_PATH="$WGET_NT_BIN" run_src wget-nt LATTICE_AGENT_SHA256="$TABLE" \
+  LATTICE_AGENT_SOURCES="m=https://mirror-evil.example.com/agent $REL" || src_fail wget-nt "install failed"
+expect_ok wget-nt
+expect_calls wget-nt 1
+expect_call wget-nt 1 "$REL_URL" 0 "args: --https-only -q$WGET_LIMITS"
+expect_no_fetch_of wget-nt mirror-evil
+expect_log wget-nt "no working timeout command to bound a wget fetch"
 
 printf 'install integrity contract ok\n'

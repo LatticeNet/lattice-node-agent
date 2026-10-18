@@ -527,20 +527,31 @@ set +f
 # a fresh file removes it first. A mirror (m) never follows a redirect, so it
 # cannot send root on this machine to an address of its choosing; a release
 # base (r) follows redirects, HTTPS only, as GitHub's release downloads need.
+# A mirror is optional and the release follows it, so a mirror fetch is also
+# cut after 600 s: one that trickles bytes just above the stall cutoff cannot
+# hold the install, and what it delivered is kept for the next source. wget
+# has no total limit of its own, so without a working timeout command the
+# mirrors are skipped.
 if have curl; then
   dl_tool="curl"
   fetch() {
     if [ "$1" = m ]; then
-      curl -fsS --proto '=https' --tlsv1.2 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$2" "$3"
+      curl -fsS --proto '=https' --tlsv1.2 --max-time 600 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$2" "$3"
     else
       curl -fsSL --proto '=https' --tlsv1.2 --proto-redir '=https' --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$2" "$3"
     fi
   }
 elif have wget; then
   dl_tool="wget"
+  wget_bound=0
+  if have timeout && timeout 5 true >/dev/null 2>&1; then wget_bound=1; fi
   fetch() {
     if [ "$1" = m ]; then
-      wget --https-only -q --max-redirect=0 --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
+      if [ "$wget_bound" = 0 ]; then
+        log "skipping mirror $3: no working timeout command to bound a wget fetch"
+        return 1
+      fi
+      timeout 600 wget --https-only -q --max-redirect=0 --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
     else
       wget --https-only -q --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
     fi
