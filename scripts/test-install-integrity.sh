@@ -766,4 +766,24 @@ expect_call wget-nt 1 "$REL_URL" 0 "args: --https-only -q$WGET_LIMITS"
 expect_no_fetch_of wget-nt mirror-evil
 expect_log wget-nt "no working timeout command to bound a wget fetch"
 
+# A shell that cannot set the size cap, here because an inherited hard limit
+# is below it, never fetches a mirror: it says why and installs from the
+# release as before. With the release down too, the failure names the
+# skipped mirror and the reason. bash as sh keeps an assignment made before a
+# function call, so the wget runs above leave SRC_PATH set.
+unset SRC_PATH
+( ulimit -f 8192 && run_src nocap LATTICE_AGENT_SHA256="$TABLE" \
+  LATTICE_AGENT_SOURCES="m=https://mirror-good.example.com/agent $REL" ) || src_fail nocap "install failed"
+expect_ok nocap
+expect_calls nocap 1
+expect_call nocap 1 "$REL_URL" 0 "$CURL_RELEASE"
+expect_no_fetch_of nocap mirror-good
+expect_log nocap "skipping mirror https://mirror-good.example.com/$MIRROR_PATH: this shell cannot cap the download's size"
+if ( ulimit -f 8192 && run_src nocap-down LATTICE_AGENT_SHA256="$TABLE" \
+  LATTICE_AGENT_SOURCES="m=https://mirror-good.example.com/agent r=https://release-down.example.com/x" ); then
+  src_fail nocap-down "installer succeeded with no usable source"
+fi
+expect_no_fetch_of nocap-down mirror-good
+expect_log nocap-down "round 1, https://mirror-good.example.com/$MIRROR_PATH: skipped (this shell cannot cap the download's size)"
+
 printf 'install integrity contract ok\n'
