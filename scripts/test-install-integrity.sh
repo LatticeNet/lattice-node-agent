@@ -693,19 +693,28 @@ fi
 SRC_PATH=""
 [ -z "$(ls "$SRC_TMP/sudo-fail-tmp")" ] || src_fail sudo-fail "the token file outlived a failed sudo"
 
-# The root child reads only a file the re-exec could have made: a regular
-# file, not a link, mode 0600, owned by the user who ran sudo.
+# The root child reads only a file the re-exec could have made: in a 0700
+# directory of the user who ran sudo, a regular file, not a link, with one
+# name, mode 0600 and the same owner.
 TOKEN_DIR="$SRC_TMP/token-files"
-mkdir -p "$TOKEN_DIR"
+mkdir -p "$TOKEN_DIR" "$SRC_TMP/token-open-dir"
+chmod 0700 "$TOKEN_DIR"
+chmod 0755 "$SRC_TMP/token-open-dir"
 MY_UID="$(/usr/bin/id -u)"
 printf 'node-token-file' >"$TOKEN_DIR/ok" && chmod 0600 "$TOKEN_DIR/ok"
 ln -s "$TOKEN_DIR/ok" "$TOKEN_DIR/link"
 printf 'node-token-file' >"$TOKEN_DIR/open" && chmod 0644 "$TOKEN_DIR/open"
+printf 'node-token-file' >"$TOKEN_DIR/twice" && chmod 0600 "$TOKEN_DIR/twice" && ln "$TOKEN_DIR/twice" "$TOKEN_DIR/twice-again"
+printf 'node-token-file' >"$SRC_TMP/token-open-dir/ok" && chmod 0600 "$SRC_TMP/token-open-dir/ok"
 expect_refused tokfile-link "LATTICE_NODE_TOKEN_FILE is not a regular file" \
   LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/link" SUDO_UID="$MY_UID"
 expect_refused tokfile-mode "LATTICE_NODE_TOKEN_FILE must be mode 0600" \
   LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/open" SUDO_UID="$MY_UID"
-expect_refused tokfile-owner "owned by uid 4242" \
+expect_refused tokfile-links "with one link" \
+  LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/twice" SUDO_UID="$MY_UID"
+expect_refused tokfile-dir "in a directory only uid $MY_UID can enter" \
+  LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$SRC_TMP/token-open-dir/ok" SUDO_UID="$MY_UID"
+expect_refused tokfile-owner "only uid 4242 can enter" \
   LATTICE_NODE_TOKEN="" LATTICE_NODE_TOKEN_FILE="$TOKEN_DIR/ok" SUDO_UID=4242
 [ -f "$TOKEN_DIR/ok" ] || { echo "a refused token file was removed" >&2; exit 1; }
 
