@@ -2,7 +2,7 @@ module github.com/LatticeNet/lattice-node-agent
 
 go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.26.10
 
 require github.com/LatticeNet/lattice-sdk v0.2.24-0.20261017194014-a3de5f71b589
 
