@@ -525,7 +525,7 @@ func createTaskWorkdir(root string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create task workdir: %w", err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302 -- a directory needs the execute bit; owner only
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("secure task workdir %s: %w", dir, err)
 	}

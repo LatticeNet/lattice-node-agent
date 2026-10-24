@@ -95,7 +95,7 @@ func (q *monitorResultQueue) push(r model.MonitorResult) {
 func (q *monitorResultQueue) countDropped(n int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.dropped += uint64(n)
+	q.dropped += uint64(n) // #nosec G115 -- a count of dropped results, never negative
 }
 
 // droppedSinceLog returns how many results were dropped since the last call,

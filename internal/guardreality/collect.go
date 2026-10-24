@@ -473,7 +473,7 @@ func ParseNFTVersion(raw []byte) string {
 var RunBoundedCommand Runner = runBoundedCommand
 
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- callers run fixed nft, ss, ip and sshd commands, with no shell
 	var stdout limitedBuffer
 	var stderr limitedBuffer
 	cmd.Stdout = &stdout

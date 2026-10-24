@@ -372,15 +372,15 @@ func SaveState(path string, st State) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Chmod(0o644); err != nil { // #nosec G302 -- read by the agent as the witness status; no secret in it
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

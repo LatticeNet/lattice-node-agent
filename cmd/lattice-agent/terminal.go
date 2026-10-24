@@ -139,9 +139,9 @@ func (r *terminalRunner) runPoll(ctx context.Context) {
 		_ = r.postStatus(model.TerminalFailed, fmt.Sprintf("shell not available: %v", err))
 		return
 	}
-	cmd := exec.CommandContext(ctx, shell)
+	cmd := exec.CommandContext(ctx, shell) // #nosec G204 -- the node opted in with -allow-terminal; a terminal runs what the operator types
 	cmd.Env = terminalShellEnv(os.Environ(), r.session.ID, r.cfg.NodeID)
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)})
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)}) // #nosec G115 -- a window size; the kernel takes any 16 bits, so a wrap only mis-sizes this terminal
 	if err != nil {
 		_ = r.postStatus(model.TerminalFailed, err.Error())
 		return
@@ -243,7 +243,7 @@ func (r *terminalRunner) pollInputs(ptmx *os.File) error {
 			}
 		case "resize":
 			if input.Cols > 0 && input.Rows > 0 {
-				if err := pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(input.Cols), Rows: uint16(input.Rows)}); err != nil {
+				if err := pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(input.Cols), Rows: uint16(input.Rows)}); err != nil { // #nosec G115 -- a window size; the kernel takes any 16 bits, so a wrap only mis-sizes this terminal
 					return err
 				}
 			}

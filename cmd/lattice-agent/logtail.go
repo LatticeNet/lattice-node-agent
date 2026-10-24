@@ -120,7 +120,7 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 			if len(pending) > logTailMaxPending {
 				over := len(pending) - logTailMaxPending
 				pending = pending[over:]
-				dropped += uint64(over)
+				dropped += uint64(over) // #nosec G115 -- a count of dropped lines, never negative
 			}
 		}
 		if len(pending) == 0 {
@@ -184,7 +184,7 @@ func loadLogCheckpoint(path string) (uint64, int, bool) {
 	if path == "" {
 		return 0, 0, false
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 -- checkpointPath keeps the file in -log-state-dir
 	if err != nil {
 		return 0, 0, false
 	}

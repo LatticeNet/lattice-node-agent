@@ -238,7 +238,7 @@ func open(dir string) (*Manager, error) {
 	m.restartCommand = []string{"systemctl", "restart", "sing-box"}
 	m.verifyCommand = []string{"systemctl", "is-active", "--quiet", "sing-box"}
 	m.run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		return exec.CommandContext(ctx, name, args...).CombinedOutput()
+		return exec.CommandContext(ctx, name, args...).CombinedOutput() // #nosec G204 -- fixed sing-box and systemctl commands; configDir is the agent's own setting
 	}
 	return m, nil
 }
@@ -1010,7 +1010,7 @@ func writeFile(path string, data []byte) error {
 	if err = os.Rename(name, path); err != nil {
 		return err
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the validated artifact path just renamed into place
 	if err == nil {
 		err = f.Sync()
 		_ = f.Close()
@@ -1066,7 +1066,7 @@ func readJournal(path string) (journal, error) {
 	return j, nil
 }
 func syncDir(path string) error {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the parent directory of a validated artifact path
 	if err != nil {
 		return err
 	}

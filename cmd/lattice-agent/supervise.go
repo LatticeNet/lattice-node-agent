@@ -221,21 +221,21 @@ func writeHealthMarker(agentVersion string) error {
 	}
 	name := tmp.Name()
 	if _, err := tmp.WriteString(agentVersion + "\n"); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name) // #nosec G703 -- name is a CreateTemp file in systemd's absolute RUNTIME_DIRECTORY
 		return err
 	}
 	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name) // #nosec G703 -- name is a CreateTemp file in systemd's absolute RUNTIME_DIRECTORY
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(name)
+		_ = os.Remove(name) // #nosec G703 -- name is a CreateTemp file in systemd's absolute RUNTIME_DIRECTORY
 		return err
 	}
-	if err := os.Rename(name, filepath.Join(dir, healthMarkerName)); err != nil {
-		os.Remove(name)
+	if err := os.Rename(name, filepath.Join(dir, healthMarkerName)); err != nil { // #nosec G703 -- name is a CreateTemp file in systemd's absolute RUNTIME_DIRECTORY
+		_ = os.Remove(name) // #nosec G703 -- name is a CreateTemp file in systemd's absolute RUNTIME_DIRECTORY
 		return err
 	}
 	return nil

@@ -29,14 +29,14 @@ func Collect() model.HostFacts {
 	facts.CPUModel = firstCPUModel(readFile("/proc/cpuinfo"))
 	facts.MemoryTotal, facts.SwapTotal = parseMeminfo(readFile("/proc/meminfo"))
 	if up := parseUptimeSeconds(readFile("/proc/uptime")); up > 0 {
-		facts.BootTime = now.Add(-time.Duration(up) * time.Second)
+		facts.BootTime = now.Add(-time.Duration(up) * time.Second) // #nosec G115 -- seconds of uptime from /proc/uptime, far below 2^63
 	}
 	facts.Virtualization = detectVirtualization()
 	return facts
 }
 
 func readFile(path string) string {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- callers pass fixed /proc and /etc paths
 	if err != nil {
 		return ""
 	}

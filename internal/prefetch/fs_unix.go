@@ -19,16 +19,16 @@ import (
 // second name, another user's file) is removed as a name and a new file is
 // created in its place, exclusively.
 func openPartial(path string) (*os.File, int64, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600) // #nosec G304 -- the download is named by a validated digest; O_NOFOLLOW
 	if err == nil {
 		if size, ok := ownedRegular(f); ok {
 			if err := f.Chmod(0o600); err != nil {
-				f.Close()
+				_ = f.Close()
 				return nil, 0, err
 			}
 			return f, size, nil
 		}
-		f.Close()
+		_ = f.Close()
 	} else if !errors.Is(err, syscall.ELOOP) && !errors.Is(err, syscall.EISDIR) && !errors.Is(err, syscall.ENXIO) {
 		return nil, 0, err
 	}
@@ -42,12 +42,12 @@ func openPartial(path string) (*os.File, int64, error) {
 	if err := remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, 0, fmt.Errorf("remove what stands at the download's name: %w", err)
 	}
-	f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600) // #nosec G304 -- the download is named by a validated digest; O_NOFOLLOW
 	if err != nil {
 		return nil, 0, err
 	}
 	if _, ok := ownedRegular(f); !ok {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, errors.New("the new download is not a regular file of this user")
 	}
 	return f, 0, nil

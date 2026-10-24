@@ -50,14 +50,14 @@ func (t *Tailer) Resume(offset uint64, incarnation int) {
 		// Past the end of any file: start it over, as for a checkpoint past EOF.
 		offset = 0
 	}
-	t.offset = int64(offset)
+	t.offset = int64(offset) // #nosec G115 -- the branch above keeps offset at or below MaxInt64
 	t.incarnation = incarnation
 	t.resumed = true
 	t.started = true
 }
 
 // Offset is the byte offset after the last consumed line (the checkpoint).
-func (t *Tailer) Offset() uint64 { return uint64(t.offset) }
+func (t *Tailer) Offset() uint64 { return uint64(t.offset) } // #nosec G115 -- offsets come from file sizes and seeks, never negative
 
 // RotID is an opaque per-incarnation id that changes on rotation/truncation, so
 // the server can tell the offset namespace reset.
@@ -86,7 +86,7 @@ func (t *Tailer) ensureOpen() error {
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if !t.started {
@@ -98,7 +98,7 @@ func (t *Tailer) ensureOpen() error {
 		t.offset = 0 // checkpoint points past EOF (file was replaced/truncated)
 	}
 	if _, err := f.Seek(t.offset, 0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	t.file = f

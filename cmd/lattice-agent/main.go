@@ -1535,7 +1535,7 @@ func resolveProxyUsageSecret(cfg *agentConfig) error {
 	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" {
 		return fmt.Errorf("configure either proxy-usage-secret or proxy-usage-secret-file, not both")
 	}
-	data, err := os.ReadFile(file)
+	data, err := os.ReadFile(file) // #nosec G304 -- the agent's own -proxy-usage-secret-file flag
 	if err != nil {
 		return err
 	}
@@ -2561,7 +2561,7 @@ func uniqueSortedIPs(values []string, version int) []string {
 }
 
 func runNFTCommand(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "nft", args...)
+	cmd := exec.CommandContext(ctx, "nft", args...) // #nosec G204 -- fixed nft binary; table and set pass nftIdentRe, elements are parsed IPs
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -2692,7 +2692,7 @@ func sshLogCommand(ctx context.Context) *exec.Cmd {
 	if name == "" {
 		return nil
 	}
-	return exec.CommandContext(ctx, name, args...)
+	return exec.CommandContext(ctx, name, args...) // #nosec G204 -- journalctl or tail from PATH with fixed arguments
 }
 
 // sshLogSource picks the login log source: journalctl when present, otherwise

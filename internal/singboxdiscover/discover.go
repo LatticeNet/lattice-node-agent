@@ -247,7 +247,7 @@ func loadSingBoxRuntimeConfigFiles(source Source) []singBoxRuntimeConfigFile {
 // readBoundedConfigFile reads one sing-box config file with a size ceiling, so a
 // single oversized file cannot exhaust agent memory on every discovery cycle.
 func readBoundedConfigFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- a config path found on this node by discovery
 	if err != nil {
 		return nil, err
 	}
@@ -932,7 +932,7 @@ func TrustedProcesses() []TrustedProcess {
 
 // readCmdline splits a /proc/<pid>/cmdline into its NUL-separated arguments.
 func readCmdline(path string) []string {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- /proc/<pid>/cmdline of a process on this node
 	if err != nil || len(raw) == 0 {
 		return nil
 	}
@@ -971,7 +971,7 @@ func identityOf(path string, info os.FileInfo) (fileIdentity, error) {
 	return fileIdentity{
 		mode:    info.Mode(),
 		uid:     stat.Uid,
-		dev:     uint64(stat.Dev),
+		dev:     uint64(stat.Dev), // #nosec G115 -- a device id compared for identity only; the bit pattern is kept
 		ino:     uint64(stat.Ino),
 		modTime: info.ModTime(),
 	}, nil
@@ -1226,7 +1226,7 @@ func executableDigest(path string, id fileIdentity) string {
 	if ok {
 		return sum
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- /proc/<pid>/exe of a process on this node
 	if err != nil {
 		return ""
 	}
@@ -1638,7 +1638,7 @@ func singBoxRuntimeMetadata(value map[string]any) map[string]string {
 const commandWaitDelay = time.Second
 
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- the sb binary is the agent's own -singbox-bin flag; no shell
 	cmd.WaitDelay = commandWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

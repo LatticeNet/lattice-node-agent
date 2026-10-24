@@ -42,7 +42,7 @@ func validateLockInfo(info os.FileInfo, effectiveUID int) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("linechain manager lock must be a regular file")
 	}
-	if stat.Uid != uint32(effectiveUID) {
+	if stat.Uid != uint32(effectiveUID) { // #nosec G115 -- POSIX uids are 32-bit kernel ids
 		return fmt.Errorf("linechain manager lock must be owned by effective user %d", effectiveUID)
 	}
 	if info.Mode().Perm() != 0o600 {

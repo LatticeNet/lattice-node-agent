@@ -565,7 +565,7 @@ func (p *Prefetcher) attempt(ctx context.Context, t model.AgentUpdatePrefetch, p
 		if err != nil {
 			return model.AgentPrefetchRefused, "cannot read the free space: " + err.Error(), kept, 0
 		}
-		need := uint64(t.Size-kept) + 3*uint64(t.BinarySize) + reserveBytes
+		need := uint64(t.Size-kept) + 3*uint64(t.BinarySize) + reserveBytes // #nosec G115 -- validateTarget bounds both sizes to 1..maxFileBytes, and kept < t.Size here
 		if avail < need {
 			return model.AgentPrefetchRefused, fmt.Sprintf("%d bytes free beside the agent; the download needs %d more and must leave room for the update and %d spare", avail, t.Size-kept, reserveBytes), kept, 0
 		}

@@ -71,7 +71,7 @@ const (
 	defaultSingBoxConfigPath = "/etc/sing-box/config.json"
 	// defaultClashSecretPath is where `sb api on` writes the Clash API secret
 	// (root:root 0600) when the policy names no secret path.
-	defaultClashSecretPath = "/etc/sing-box/lattice-clash-api.secret"
+	defaultClashSecretPath = "/etc/sing-box/lattice-clash-api.secret" // #nosec G101 -- a file path, not a credential
 	// nodeFileMaxBytes caps a config or secret read. A sing-box config is a
 	// few kilobytes; anything past this is not one.
 	nodeFileMaxBytes = 1 << 20
@@ -1193,7 +1193,7 @@ func (e *nodeFileError) Error() string { return e.path + " " + e.reason }
 // nobody else either. At most nodeFileMaxBytes are read. A missing file
 // returns the *fs.PathError from open, so os.IsNotExist still works.
 func readNodeFile(path string, secret bool) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0) // #nosec G304 -- O_NOFOLLOW, owner and mode checked on the open file; bytes go only to a loopback controller
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, &nodeFileError{path, "is a symlink"}
