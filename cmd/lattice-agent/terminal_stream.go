@@ -196,9 +196,11 @@ func (s *streamSink) detach(conn io.Writer) {
 // this mode; the agent posts a final closed status so the server need not wait
 // out the detach grace.
 func (r *terminalRunner) runStream(ctx context.Context) {
-	shell := r.session.Shell
-	if shell == "" {
-		shell = "/bin/sh"
+	shell, err := terminalShell(r.session.Shell)
+	if err != nil {
+		debugf(r.cfg, "terminal stream shell refused: session=%s err=%v", r.session.ID, err)
+		_ = r.postStatus(model.TerminalFailed, err.Error())
+		return
 	}
 	if _, err := os.Stat(shell); err != nil {
 		debugf(r.cfg, "terminal stream shell not available: session=%s err=%v", r.session.ID, err)
@@ -206,7 +208,7 @@ func (r *terminalRunner) runStream(ctx context.Context) {
 		return
 	}
 
-	cmd := exec.Command(shell)
+	cmd := exec.Command(shell) // #nosec G204 -- terminalShell allows five fixed shells, and only under -allow-terminal
 	cmd.Env = terminalShellEnv(os.Environ(), r.session.ID, r.cfg.NodeID)
 	// Do NOT set Setpgid here. creack/pty's StartWithSize already sets Setsid,
 	// which makes the shell a session+group leader (pgrp == pid) — that is the
@@ -214,7 +216,7 @@ func (r *terminalRunner) runStream(ctx context.Context) {
 	// Setpgid as well makes the child's setpgid() fail right after its setsid()
 	// (a session leader cannot move its own pgrp), so fork/exec returns EPERM
 	// ("operation not permitted") and no shell ever starts.
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)})
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)}) // #nosec G115 -- a window size; the kernel takes any 16 bits, so a wrap only mis-sizes this terminal
 	if err != nil {
 		debugf(r.cfg, "terminal stream pty start failed: session=%s err=%v", r.session.ID, err)
 		_ = r.postStatus(model.TerminalFailed, err.Error())

@@ -123,7 +123,7 @@ func decodeXrayStats(data []byte, nodeID string, at time.Time) (model.ProxyUsage
 }
 
 func runBoundedCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- binary and address are the agent's own flags, validated before the call
 	stdout := &cappedBuffer{limit: maxUsageFileBytes}
 	stderr := &cappedBuffer{limit: maxXrayStderrBytes}
 	cmd.Stdout = stdout

@@ -20,28 +20,28 @@ func lockOutbox(path string) (*os.File, error) {
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("inspect task result outbox lock: %w", err)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("inspect task result outbox lock ownership: unsupported stat data")
 	}
 	if !info.Mode().IsRegular() {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("task result outbox lock must be a regular file")
 	}
-	if stat.Uid != uint32(os.Geteuid()) {
-		f.Close()
+	if stat.Uid != uint32(os.Geteuid()) { // #nosec G115 -- POSIX uids are 32-bit kernel ids
+		_ = f.Close()
 		return nil, fmt.Errorf("task result outbox lock must be owned by effective user %d", os.Geteuid())
 	}
 	if info.Mode().Perm() != 0o600 {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("task result outbox lock permissions are %o, want 600", info.Mode().Perm())
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("task result outbox is already owned by another agent process: %w", err)
 	}
 	return f, nil

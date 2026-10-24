@@ -1,6 +1,7 @@
 package logtail
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -169,5 +170,19 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	}
 	if _, _, ok := ParseCheckpoint("garbage"); ok {
 		t.Fatal("garbage should not parse")
+	}
+}
+
+// A checkpoint offset no int64 can hold is past the end of any file, so the
+// tailer starts the file over, as it does for any checkpoint past EOF,
+// instead of failing every poll on a negative seek.
+func TestResumePastAnyOffsetStartsOver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	writeFile(t, path, "x\ny\n")
+	tl := New(path, 0)
+	defer tl.Close()
+	tl.Resume(math.MaxUint64, 0)
+	if lines := poll(t, tl); !reflect.DeepEqual(lines, []string{"x", "y"}) {
+		t.Fatalf("got %v", lines)
 	}
 }

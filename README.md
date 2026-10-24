@@ -376,6 +376,27 @@ missing checksum manifest aborts the install before the binary is written.
 - `LATTICE_AGENT_ALLOW_TERMINAL=1` enables audited browser terminal sessions.
 - `LATTICE_TERMINAL_TRANSPORT=poll|stream` selects the terminal transport.
 - `LATTICE_SSH_ALERTS=1` reports accepted sshd logins.
+- `LATTICE_LOG_PATH_ALLOW=/opt/app/logs,/srv/logs` widens the files and
+  directories the node tails logs from beyond `/var/log/`. Each entry is
+  taken whole. The built-in `/var/log/` leaves out the files
+  that hold credentials or audit trails: `auth.log*`, `secure*`, `btmp*`,
+  `wtmp*`, `lastlog`, `faillog`, `tallylog`, `sudo.log*`, `cloud-init*`,
+  and everything under `audit/`, `sudo-io/`, `installer/`, `anaconda/` and
+  `private/`. Those names are judged without case and where the path really
+  leads, so a symlink to one is refused too. A node that should ship one of
+  them lists the file itself or a directory inside `/var/log/` that holds it,
+  for example `LATTICE_LOG_PATH_ALLOW=/var/log/auth.log` or
+  `/var/log/audit`. Listing `/var/log/` itself, or a parent such as `/var/`,
+  restates the default and keeps them out; a listed parent still takes in
+  everything else under it, and the agent warns at start when one is listed.
+  The
+  server keeps its own allowlist
+  with the same variable name; a log source has to pass both, and nothing the
+  server sends widens the node's. A refused source shows on the node's loop
+  health under `log_sources`.
+- `LATTICE_NO_LOG_TAIL=1` turns log tailing off on the node: no assigned
+  source is tailed, and each is reported as refused. The variable fails
+  closed like `LATTICE_NO_BEACON`.
 - `LATTICE_SINGBOX_DISCOVER=1` and `LATTICE_SINGBOX_BIN=sb` enable sing-box
   discovery. `LATTICE_SINGBOX_META` overrides the design-15 sidecar path
   (default `/etc/sing-box/lattice-metadata.json`), which annotates each line

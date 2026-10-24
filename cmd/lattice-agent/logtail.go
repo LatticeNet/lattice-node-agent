@@ -3,13 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +37,22 @@ type logTailManager struct {
 	cfg    agentConfig
 	mu     sync.Mutex
 	active map[string]*logTailEntry
+	// policy is the node's log allowlist and noTail its kill switch, both
+	// fixed at start from the agent's own configuration; nothing the server
+	// sends changes them.
+	policy logPathPolicy
+	noTail bool
+	// refused holds each source the node refuses to tail, by id, for the
+	// log_sources step to report.
+	refused map[string]logSourceRefusal
+}
+
+// logSourceRefusal is one refused source. atOpen marks a refusal the tailer
+// met on (re)opening, which only that tailer can clear.
+type logSourceRefusal struct {
+	path   string
+	reason string
+	atOpen bool
 }
 
 type logTailEntry struct {
@@ -39,7 +61,104 @@ type logTailEntry struct {
 }
 
 func newLogTailManager(cfg agentConfig) *logTailManager {
-	return &logTailManager{cfg: cfg, active: map[string]*logTailEntry{}}
+	m := &logTailManager{
+		cfg: cfg, active: map[string]*logTailEntry{},
+		policy:  newLogPathPolicy(cfg.LogPathAllow),
+		noTail:  cfg.NoLogTail,
+		refused: map[string]logSourceRefusal{},
+	}
+	log.Printf("log tail: this node tails only regular files under %q except %q, and under its own %q", m.policy.base, defaultLogPathDeny, m.policy.allow)
+	if slices.Contains(m.policy.allow, "/") {
+		log.Printf("log tail: warning: the allowlist holds \"/\", so the server may name any file this agent can read but the credential and audit logs under /var/log/")
+	}
+	var parents []string
+	for _, listed := range m.policy.allow {
+		for _, base := range m.policy.base {
+			if listed != "/" && listed != base && strings.HasPrefix(base, listed) && !slices.Contains(parents, listed) {
+				parents = append(parents, listed)
+			}
+		}
+	}
+	if len(parents) > 0 {
+		log.Printf("log tail: warning: the allowlist holds %q, a parent of /var/log/, so the server may name any file under it; the credential and audit logs under /var/log/ stay out", parents)
+	}
+	return m
+}
+
+// noteRefused records a refusal and logs it on the node the first time it is
+// seen for that source, path and reason.
+func (m *logTailManager) noteRefused(src model.LogSource, err error, atOpen bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noteRefusedLocked(src, err, atOpen)
+}
+
+func (m *logTailManager) noteRefusedLocked(src model.LogSource, err error, atOpen bool) {
+	var refusal *logPathRefusal
+	reason := err.Error()
+	if errors.As(err, &refusal) {
+		reason = refusal.reason
+	}
+	next := logSourceRefusal{path: src.Path, reason: reason, atOpen: atOpen}
+	if prev, ok := m.refused[src.ID]; ok && prev.path == next.path && prev.reason == next.reason {
+		return
+	}
+	m.refused[src.ID] = next
+	log.Printf("log tail: source %q %q refused by the node: %s", src.ID, src.Path, reason)
+}
+
+// clearOpenRefusal drops a refusal the tailer for src met on opening, once it
+// opens cleanly or stops. A refusal reconcile recorded is reconcile's to drop.
+func (m *logTailManager) clearOpenRefusal(src model.LogSource) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.refused[src.ID]; ok && r.atOpen && r.path == src.Path {
+		delete(m.refused, src.ID)
+	}
+}
+
+// refusals is the log_sources step's error: every source the node refuses,
+// so the heartbeat's loop health tells the operator why it is not tailed.
+// The server shows that step's error and derives nothing from it. Sources are
+// grouped under their reason, reason first, so the sentence that says what to
+// do survives the 200-rune cut of loop health.
+func (m *logTailManager) refusals() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.refused) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(m.refused))
+	for id := range m.refused {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var reasons []string
+	byReason := map[string][]string{}
+	for _, id := range ids {
+		r := m.refused[id]
+		if _, seen := byReason[r.reason]; !seen {
+			reasons = append(reasons, r.reason)
+		}
+		byReason[r.reason] = append(byReason[r.reason], fmt.Sprintf("%q %q", id, r.path))
+	}
+	groups := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		groups = append(groups, reason+": "+strings.Join(byReason[reason], ", "))
+	}
+	return errors.New("refused by the node: " + strings.Join(groups, " | "))
+}
+
+// newSourceTailer is a source's tailer: it opens through the node's
+// allowlist, and resumes only from a checkpoint of the same file, so a
+// source retargeted under the same id starts at the end of its new file.
+func newSourceTailer(src model.LogSource, ckptPath string, policy logPathPolicy) *logtail.Tailer {
+	tailer := logtail.New(src.Path, src.MaxLineBytes)
+	tailer.Open = policy.open
+	if off, inc, ok := loadLogCheckpoint(ckptPath, src.Path); ok {
+		tailer.Resume(off, inc)
+	}
+	return tailer
 }
 
 func (m *logTailManager) setConfig(cfg agentConfig) {
@@ -61,6 +180,11 @@ func (m *logTailManager) reconcile(sources []model.LogSource) {
 	for _, s := range sources {
 		desired[s.ID] = s
 	}
+	for id, r := range m.refused {
+		if d, ok := desired[id]; !ok || d.Path != r.path {
+			delete(m.refused, id)
+		}
+	}
 	for id, entry := range m.active {
 		if d, ok := desired[id]; !ok || logSourceChanged(entry.spec, d) {
 			entry.cancel()
@@ -68,6 +192,21 @@ func (m *logTailManager) reconcile(sources []model.LogSource) {
 		}
 	}
 	for id, s := range desired {
+		if m.noTail {
+			m.noteRefusedLocked(s, refuseLogPath(logRefusedOff), false)
+			continue
+		}
+		if err := m.policy.check(s.Path); errors.Is(err, errLogPathRefused) {
+			if entry, ok := m.active[id]; ok {
+				entry.cancel()
+				delete(m.active, id)
+			}
+			m.noteRefusedLocked(s, err, false)
+			continue
+		}
+		if r, ok := m.refused[id]; ok && !r.atOpen {
+			delete(m.refused, id)
+		}
 		if _, ok := m.active[id]; ok {
 			continue
 		}
@@ -82,12 +221,10 @@ func logSourceChanged(a, b model.LogSource) bool {
 }
 
 func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
-	tailer := logtail.New(src.Path, src.MaxLineBytes)
-	defer tailer.Close()
 	ckptPath := m.checkpointPath(src.ID)
-	if off, inc, ok := loadLogCheckpoint(ckptPath); ok {
-		tailer.Resume(off, inc)
-	}
+	tailer := newSourceTailer(src, ckptPath, m.policy)
+	defer tailer.Close()
+	defer m.clearOpenRefusal(src)
 	batchLines := src.MaxBatchLines
 	if batchLines <= 0 {
 		batchLines = 500
@@ -106,20 +243,29 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 		case <-flush.C:
 		}
 		lines, err := tailer.Poll()
+		if errors.Is(err, errLogPathRefused) {
+			// A tailer reconcile has stopped records nothing: its source
+			// is gone or now judged afresh.
+			if ctx.Err() == nil {
+				m.noteRefused(src, err, true)
+			}
+			continue
+		}
 		if err != nil {
 			if !loggedReadErr {
-				log.Printf("logtail %s (%s): %v", src.ID, src.Path, err)
+				log.Printf("logtail %q (%q): %v", src.ID, src.Path, err)
 				loggedReadErr = true
 			}
 			continue
 		}
 		loggedReadErr = false
+		m.clearOpenRefusal(src)
 		if len(lines) > 0 {
 			pending = append(pending, lines...)
 			if len(pending) > logTailMaxPending {
 				over := len(pending) - logTailMaxPending
 				pending = pending[over:]
-				dropped += uint64(over)
+				dropped += uint64(over) // #nosec G115 -- a count of dropped lines, never negative
 			}
 		}
 		if len(pending) == 0 {
@@ -154,31 +300,61 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 			pending = pending[n:]
 		}
 		if len(pending) == 0 {
-			saveLogCheckpoint(ckptPath, tailer.Offset(), tailer.Incarnation())
+			saveLogCheckpoint(ckptPath, src.Path, tailer.Offset(), tailer.Incarnation())
 		}
 	}
 }
 
+// logSourceIDRE is a log source id that is safe as a file name: the server
+// mints "logsrc_<base32>", "agent-debug-<hex>" and "singbox-<hex>".
+var logSourceIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// checkpointPath is where a source's checkpoint lives, or "" for none. The id
+// comes from the server and the agent writes the file as its own user, often
+// root, so an id that is not a plain file name gets no checkpoint rather than
+// a path outside the state directory; the source still tails from the end.
 func (m *logTailManager) checkpointPath(sourceID string) string {
-	dir := strings.TrimSpace(m.cfg.LogStateDir)
+	dir := strings.TrimSpace(m.snapshotConfig().LogStateDir)
 	if dir == "" {
+		return ""
+	}
+	if !logSourceIDRE.MatchString(sourceID) {
+		log.Printf("log tail: source id %q is not a plain file name; no checkpoint is kept for it", sourceID)
 		return ""
 	}
 	return filepath.Join(dir, sourceID+".ckpt")
 }
 
-func loadLogCheckpoint(path string) (uint64, int, bool) {
+// checkpointBinding names the file a checkpoint measured. A checkpoint is
+// "offset:incarnation:binding". One an older agent wrote has no binding, so
+// nothing says it measured the file the source names now: it is ignored and
+// the source starts at the end, once, after the upgrade.
+func checkpointBinding(sourcePath string) string {
+	sum := sha256.Sum256([]byte(sourcePath))
+	return hex.EncodeToString(sum[:8])
+}
+
+// loadLogCheckpoint resumes a source only from a checkpoint of the same file:
+// after the server changes a source's path under the same id, the old offset
+// says nothing about the new file, so the source starts from the end, like a
+// new one.
+func loadLogCheckpoint(path, sourcePath string) (uint64, int, bool) {
 	if path == "" {
 		return 0, 0, false
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 -- checkpointPath keeps the file in -log-state-dir
 	if err != nil {
 		return 0, 0, false
 	}
-	return logtail.ParseCheckpoint(strings.TrimSpace(string(b)))
+	s := strings.TrimSpace(string(b))
+	i := strings.LastIndexByte(s, ':')
+	if strings.Count(s, ":") != 2 || s[i+1:] != checkpointBinding(sourcePath) {
+		return 0, 0, false
+	}
+	return logtail.ParseCheckpoint(s[:i])
 }
 
-func saveLogCheckpoint(path string, offset uint64, incarnation int) {
+func saveLogCheckpoint(path, sourcePath string, offset uint64, incarnation int) {
 	if path == "" {
 		return
 	}
@@ -186,7 +362,8 @@ func saveLogCheckpoint(path string, offset uint64, incarnation int) {
 		return
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(logtail.CheckpointString(offset, incarnation)), 0o600); err != nil {
+	line := logtail.CheckpointString(offset, incarnation) + ":" + checkpointBinding(sourcePath)
+	if err := os.WriteFile(tmp, []byte(line), 0o600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, path)

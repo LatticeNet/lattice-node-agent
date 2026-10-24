@@ -27,7 +27,7 @@ func LoadFile(path, nodeID string) (model.ProxyUsageSnapshot, error) {
 	if info.Size() > maxUsageFileBytes {
 		return model.ProxyUsageSnapshot{}, fmt.Errorf("proxy usage file exceeds %d bytes", maxUsageFileBytes)
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the agent's own -proxy-usage-file flag
 	if err != nil {
 		return model.ProxyUsageSnapshot{}, err
 	}

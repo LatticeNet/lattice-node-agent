@@ -215,8 +215,8 @@ func readDisk(path string) (used, total uint64) {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return 0, 0
 	}
-	total = st.Blocks * uint64(st.Bsize)
-	free := st.Bavail * uint64(st.Bsize)
+	total = st.Blocks * uint64(st.Bsize) // #nosec G115 -- statfs reports a positive block size
+	free := st.Bavail * uint64(st.Bsize) // #nosec G115 -- statfs reports a positive block size
 	if total > free {
 		used = total - free
 	}

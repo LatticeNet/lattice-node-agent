@@ -131,17 +131,18 @@ func (r *terminalRunner) run(ctx context.Context) {
 }
 
 func (r *terminalRunner) runPoll(ctx context.Context) {
-	shell := r.session.Shell
-	if shell == "" {
-		shell = "/bin/sh"
+	shell, err := terminalShell(r.session.Shell)
+	if err != nil {
+		_ = r.postStatus(model.TerminalFailed, err.Error())
+		return
 	}
 	if _, err := os.Stat(shell); err != nil {
 		_ = r.postStatus(model.TerminalFailed, fmt.Sprintf("shell not available: %v", err))
 		return
 	}
-	cmd := exec.CommandContext(ctx, shell)
+	cmd := exec.CommandContext(ctx, shell) // #nosec G204 -- terminalShell allows five fixed shells, and only under -allow-terminal
 	cmd.Env = terminalShellEnv(os.Environ(), r.session.ID, r.cfg.NodeID)
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)})
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(r.session.Cols), Rows: uint16(r.session.Rows)}) // #nosec G115 -- a window size; the kernel takes any 16 bits, so a wrap only mis-sizes this terminal
 	if err != nil {
 		_ = r.postStatus(model.TerminalFailed, err.Error())
 		return
@@ -243,7 +244,7 @@ func (r *terminalRunner) pollInputs(ptmx *os.File) error {
 			}
 		case "resize":
 			if input.Cols > 0 && input.Rows > 0 {
-				if err := pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(input.Cols), Rows: uint16(input.Rows)}); err != nil {
+				if err := pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(input.Cols), Rows: uint16(input.Rows)}); err != nil { // #nosec G115 -- a window size; the kernel takes any 16 bits, so a wrap only mis-sizes this terminal
 					return err
 				}
 			}
@@ -297,4 +298,23 @@ func getAgentJSON(cfg agentConfig, path string, out any) error {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// terminalShells are the shells a session may start: the five the server
+// normalises every request to (normalizeTerminalShell). The path comes from
+// the server and the agent may be root, so the agent holds it to them too.
+var terminalShells = map[string]bool{
+	"/bin/sh": true, "/bin/bash": true, "/usr/bin/bash": true, "/usr/bin/zsh": true, "/bin/zsh": true,
+}
+
+// terminalShell is the shell for a session: /bin/sh when the server names
+// none, an error for any path outside terminalShells.
+func terminalShell(requested string) (string, error) {
+	if requested == "" {
+		return "/bin/sh", nil
+	}
+	if !terminalShells[requested] {
+		return "", fmt.Errorf("shell %q is not an allowed terminal shell", requested)
+	}
+	return requested, nil
 }

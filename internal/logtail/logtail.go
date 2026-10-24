@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 )
@@ -22,6 +23,10 @@ const (
 // Tailer follows one file. It is not safe for concurrent use; the agent runs one
 // per source in its own goroutine.
 type Tailer struct {
+	// Open opens the file at every (re)open, rotations included; nil is
+	// os.Open. The agent sets it to judge each open against its allowlist.
+	Open func(path string) (*os.File, error)
+
 	path         string
 	maxLineBytes int
 	maxReadBytes int64
@@ -45,6 +50,10 @@ func New(path string, maxLineBytes int) *Tailer {
 // Resume restores a checkpoint so a restart continues without re-shipping or
 // losing position. Call before the first Poll.
 func (t *Tailer) Resume(offset uint64, incarnation int) {
+	if offset > math.MaxInt64 {
+		// Past the end of any file: start it over, as for a checkpoint past EOF.
+		offset = 0
+	}
 	t.offset = int64(offset)
 	t.incarnation = incarnation
 	t.resumed = true
@@ -52,7 +61,7 @@ func (t *Tailer) Resume(offset uint64, incarnation int) {
 }
 
 // Offset is the byte offset after the last consumed line (the checkpoint).
-func (t *Tailer) Offset() uint64 { return uint64(t.offset) }
+func (t *Tailer) Offset() uint64 { return uint64(t.offset) } // #nosec G115 -- offsets come from file sizes and seeks, never negative
 
 // RotID is an opaque per-incarnation id that changes on rotation/truncation, so
 // the server can tell the offset namespace reset.
@@ -75,13 +84,17 @@ func (t *Tailer) ensureOpen() error {
 	if t.file != nil {
 		return nil
 	}
-	f, err := os.Open(t.path)
+	open := t.Open
+	if open == nil {
+		open = os.Open
+	}
+	f, err := open(t.path)
 	if err != nil {
 		return err
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if !t.started {
@@ -93,7 +106,7 @@ func (t *Tailer) ensureOpen() error {
 		t.offset = 0 // checkpoint points past EOF (file was replaced/truncated)
 	}
 	if _, err := f.Seek(t.offset, 0); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	t.file = f

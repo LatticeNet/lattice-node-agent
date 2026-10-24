@@ -27,7 +27,7 @@ func prepareTaskCgroup(config CgroupConfig, _ string) (preparedCgroup, error) {
 // tree on timeout. Resource rlimits are deliberately not applied off Linux;
 // this path is for development and is documented as such.
 func buildHardenedCmd(interp, scriptPath string, _ time.Duration, _ string) *exec.Cmd {
-	cmd := exec.Command(interp, scriptPath)
+	cmd := exec.Command(interp, scriptPath) // #nosec G204 -- an allowlisted interpreter on the approved task script under -allow-exec
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	return cmd
 }

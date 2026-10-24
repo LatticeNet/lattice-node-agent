@@ -121,6 +121,9 @@ type agentConfig struct {
 	// no update binary is downloaded before its task, and no kept download
 	// is removed, whatever the server names.
 	NoPrefetch bool
+	// NoLogTail is the node veto on log tailing: no log source is tailed,
+	// whatever the server assigns, and each is reported as refused.
+	NoLogTail bool
 	// Prefetch downloads the binary of this node's open agent update in the
 	// background; nil only in tests that build a bare config.
 	Prefetch            *prefetch.Prefetcher
@@ -199,6 +202,7 @@ type agentConfig struct {
 	SingBoxBin                string
 	SingBoxMeta               string
 	LogStateDir               string
+	LogPathAllow              string // the node's own log allowlist beyond /var/log/; the server cannot widen it
 	TaskOutboxDir             string
 	LinechainTxnDir           string
 	LinechainReady            bool
@@ -265,6 +269,7 @@ func main() {
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.BoolVar(&cfg.NoBeacon, "no-beacon", envVeto("LATTICE_NO_BEACON"), "never open the measurement beacon's UDP socket, whatever the server configures (node veto; beacon checks from this node still run)")
 	flag.BoolVar(&cfg.NoPrefetch, "no-prefetch", envVeto("LATTICE_NO_PREFETCH"), "never download an agent update binary before its task runs, whatever the server names (node veto; the update task still downloads it)")
+	flag.BoolVar(&cfg.NoLogTail, "no-log-tail", envVeto("LATTICE_NO_LOG_TAIL"), "never tail a log file, whatever the server assigns (node veto; each assigned source is reported as refused)")
 	flag.StringVar(&cfg.TaskCgroupRoot, "task-cgroup-root", os.Getenv("LATTICE_TASK_CGROUP_ROOT"), "Linux cgroup v2 root for per-task caps; use \"auto\" for the agent service cgroup or leave empty to disable")
 	flag.StringVar(&cfg.TaskCgroupMemoryMax, "task-cgroup-memory-max", env("LATTICE_TASK_CGROUP_MEMORY_MAX", taskexec.DefaultCgroupMemoryMax), "memory.max value for per-task cgroups when -task-cgroup-root is set")
 	flag.StringVar(&cfg.TaskCgroupPidsMax, "task-cgroup-pids-max", env("LATTICE_TASK_CGROUP_PIDS_MAX", taskexec.DefaultCgroupPidsMax), "pids.max value for per-task cgroups when -task-cgroup-root is set")
@@ -308,6 +313,7 @@ func main() {
 	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
 	flag.StringVar(&cfg.SingBoxMeta, "singbox-meta", env("LATTICE_SINGBOX_META", ""), "design-15 sing-box sidecar metadata path for -singbox-discover (default /etc/sing-box/lattice-metadata.json)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
+	flag.StringVar(&cfg.LogPathAllow, "log-path-allow", os.Getenv("LATTICE_LOG_PATH_ALLOW"), "comma-separated absolute files or directories the node may tail logs from besides /var/log/, each taken whole; the built-in /var/log/ leaves out "+strings.Join(defaultLogPathDeny, " ")+", which the node allows only by listing the file itself or a directory inside /var/log/ that holds it (listing /var/log/ or a parent of it keeps them out); the server cannot widen it")
 	flag.StringVar(&cfg.TaskOutboxDir, "task-outbox-dir", os.Getenv("LATTICE_TASK_OUTBOX_DIR"), "base directory for durable task-result journals (default: log state dir, or the user cache directory for manual runs)")
 	flag.StringVar(&cfg.LinechainTxnDir, "linechain-txn-dir", os.Getenv("LATTICE_LINECHAIN_TXN_DIR"), "private directory for crash-recoverable linechain transactions")
 	flag.BoolVar(&applyLinechain, "linechain-apply", false, "apply one bounded linechain document from stdin and exit")
@@ -501,6 +507,9 @@ func main() {
 	if cfg.NoPrefetch {
 		log.Printf("prefetch: -no-prefetch set; update binaries are downloaded only by their tasks")
 	}
+	if cfg.NoLogTail {
+		log.Printf("log tail: -no-log-tail set; no log source is tailed, and each is reported as refused")
+	}
 	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 		debugf(cfg, "agent config fetch failed: %v", err)
 	} else {
@@ -643,7 +652,7 @@ func main() {
 				return err
 			}
 			logTailers.reconcile(sources)
-			return nil
+			return logTailers.refusals()
 		})
 		_ = health.run(stepTrace, func() error {
 			traceCollector.reconcile(context.Background(), cfg)
@@ -1535,7 +1544,7 @@ func resolveProxyUsageSecret(cfg *agentConfig) error {
 	if strings.TrimSpace(cfg.ProxyUsageSecret) != "" {
 		return fmt.Errorf("configure either proxy-usage-secret or proxy-usage-secret-file, not both")
 	}
-	data, err := os.ReadFile(file)
+	data, err := os.ReadFile(file) // #nosec G304 -- the agent's own -proxy-usage-secret-file flag
 	if err != nil {
 		return err
 	}
@@ -2561,7 +2570,7 @@ func uniqueSortedIPs(values []string, version int) []string {
 }
 
 func runNFTCommand(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "nft", args...)
+	cmd := exec.CommandContext(ctx, "nft", args...) // #nosec G204 -- fixed nft binary; table and set pass nftIdentRe, elements are parsed IPs
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
@@ -2692,7 +2701,7 @@ func sshLogCommand(ctx context.Context) *exec.Cmd {
 	if name == "" {
 		return nil
 	}
-	return exec.CommandContext(ctx, name, args...)
+	return exec.CommandContext(ctx, name, args...) // #nosec G204 -- journalctl or tail from PATH with fixed arguments
 }
 
 // sshLogSource picks the login log source: journalctl when present, otherwise

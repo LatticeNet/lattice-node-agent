@@ -139,7 +139,7 @@ func Discover(files []string) (Result, error) {
 }
 
 func readBounded(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- a config path found on this node by discovery
 	if err != nil {
 		return nil, err
 	}

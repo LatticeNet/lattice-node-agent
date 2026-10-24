@@ -76,7 +76,7 @@ func openWithSync(dir string, syncDirectory func(string) error) (*Store, error) 
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return nil, fmt.Errorf("task result outbox must be a real directory: %s", dir)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302 -- a directory needs the execute bit; owner only
 		return nil, fmt.Errorf("secure task result outbox: %w", err)
 	}
 	lock, err := lockOutbox(filepath.Join(dir, ".lock"))
@@ -371,7 +371,7 @@ func (s *Store) read(key string) (Entry, error) {
 	if info.Size() > maxEntrySize {
 		return Entry{}, fmt.Errorf("task result journal exceeds %d bytes: %s", maxEntrySize, path)
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- key is a sha256 entry key; the file was checked regular and private above
 	if err != nil {
 		return Entry{}, fmt.Errorf("open task result journal: %w", err)
 	}
@@ -462,7 +462,7 @@ func (s *Store) writeEntry(key string, entry Entry, createOnly bool) (bool, erro
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() {
-		tmp.Close()
+		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
@@ -515,7 +515,7 @@ func entryKey(taskID, leaseID string) string {
 }
 
 func syncDir(dir string) error {
-	f, err := os.Open(dir)
+	f, err := os.Open(dir) // #nosec G304 -- the outbox's own directory
 	if err != nil {
 		return err
 	}

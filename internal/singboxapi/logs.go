@@ -286,7 +286,7 @@ func (c *Client) backoffFor(attempt int) time.Duration {
 }
 
 func defaultJitter() float64 {
-	return rand.Float64()
+	return rand.Float64() // #nosec G404 -- reconnect jitter, not a secret
 }
 
 // sleepContext waits for d, or returns early with ctx.Err() if ctx is done.
