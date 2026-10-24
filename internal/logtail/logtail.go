@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 )
@@ -45,6 +46,10 @@ func New(path string, maxLineBytes int) *Tailer {
 // Resume restores a checkpoint so a restart continues without re-shipping or
 // losing position. Call before the first Poll.
 func (t *Tailer) Resume(offset uint64, incarnation int) {
+	if offset > math.MaxInt64 {
+		// Past the end of any file: start it over, as for a checkpoint past EOF.
+		offset = 0
+	}
 	t.offset = int64(offset)
 	t.incarnation = incarnation
 	t.resumed = true
