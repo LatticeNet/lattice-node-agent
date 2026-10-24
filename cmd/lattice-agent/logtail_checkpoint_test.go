@@ -38,11 +38,12 @@ func TestLogCheckpointIsBoundToItsPath(t *testing.T) {
 	if _, _, ok := loadLogCheckpoint(ckpt, "/var/log/other.log"); ok {
 		t.Fatal("a checkpoint resumed a different file")
 	}
-	// A checkpoint an older agent wrote names no path; it still resumes.
+	// A checkpoint an older agent wrote names no file, so nothing says it
+	// measured this one: the source starts at the end, as a new one does.
 	if err := os.WriteFile(ckpt, []byte("42:1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if off, inc, ok := loadLogCheckpoint(ckpt, "/var/log/syslog"); !ok || off != 42 || inc != 1 {
-		t.Fatalf("old checkpoint: offset %d, incarnation %d, ok %t", off, inc, ok)
+	if _, _, ok := loadLogCheckpoint(ckpt, "/var/log/syslog"); ok {
+		t.Fatal("an unbound checkpoint resumed a source")
 	}
 }

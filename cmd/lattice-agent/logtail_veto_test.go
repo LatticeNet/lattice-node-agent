@@ -156,14 +156,25 @@ func TestRetargetedLogSourceStartsAtTheEnd(t *testing.T) {
 	saveLogCheckpoint(ckpt, big, 8192, 0)
 
 	small := filepath.Join(dir, "app.log") // holds "a\n", shorter than the old offset
-	tl := newSourceTailer(model.LogSource{ID: "logsrc_a", Path: small}, ckpt, p)
-	defer tl.Close()
-	lines, err := tl.Poll()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(lines) != 0 {
-		t.Fatalf("retargeted source shipped %q from the new file's existing content", lines)
+	for name, write := range map[string]func(){
+		"bound to the old file": func() { saveLogCheckpoint(ckpt, big, 8192, 0) },
+		// An older agent's checkpoint names no file at all.
+		"written by an older agent": func() {
+			if err := os.WriteFile(ckpt, []byte("8192:0"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		write()
+		tl := newSourceTailer(model.LogSource{ID: "logsrc_a", Path: small}, ckpt, p)
+		lines, err := tl.Poll()
+		tl.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(lines) != 0 {
+			t.Fatalf("checkpoint %s: retargeted source shipped %q from the new file's existing content", name, lines)
+		}
 	}
 }
 
@@ -234,10 +245,10 @@ func TestLogRefusalsGroupByReason(t *testing.T) {
 		t.Fatal("no refusals reported")
 	}
 	got := err.Error()
-	if !strings.HasPrefix(got, "refused by the node: "+outsideAllowlist+": logsrc_a ") {
+	if !strings.HasPrefix(got, "refused by the node: "+outsideAllowlist+`: "logsrc_a" `) {
 		t.Fatalf("refusals() = %q, want the allowlist sentence first, then its sources by id", got)
 	}
-	if !strings.Contains(got, "logsrc_b") || !strings.Contains(got, "not a regular file: logsrc_c") {
+	if !strings.Contains(got, `"logsrc_b"`) || !strings.Contains(got, `not a regular file: "logsrc_c"`) {
 		t.Fatalf("refusals() = %q, want every refused source under its reason", got)
 	}
 }

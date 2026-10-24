@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -60,12 +61,17 @@ type logTailEntry struct {
 }
 
 func newLogTailManager(cfg agentConfig) *logTailManager {
-	return &logTailManager{
+	m := &logTailManager{
 		cfg: cfg, active: map[string]*logTailEntry{},
 		policy:  newLogPathPolicy(cfg.LogPathAllow),
 		noTail:  cfg.NoLogTail,
 		refused: map[string]logSourceRefusal{},
 	}
+	log.Printf("log tail: this node tails only regular files under %q", m.policy.allow)
+	if slices.Contains(m.policy.allow, "/") {
+		log.Printf("log tail: warning: the allowlist holds \"/\", so the server may name any file this agent can read")
+	}
+	return m
 }
 
 // noteRefused records a refusal and logs it on the node the first time it is
@@ -87,7 +93,7 @@ func (m *logTailManager) noteRefusedLocked(src model.LogSource, err error, atOpe
 		return
 	}
 	m.refused[src.ID] = next
-	log.Printf("log tail: source %s %q refused by the node: %s", src.ID, src.Path, reason)
+	log.Printf("log tail: source %q %q refused by the node: %s", src.ID, src.Path, reason)
 }
 
 // clearOpenRefusal drops a refusal the tailer for src met on opening, once it
@@ -123,7 +129,7 @@ func (m *logTailManager) refusals() error {
 		if _, seen := byReason[r.reason]; !seen {
 			reasons = append(reasons, r.reason)
 		}
-		byReason[r.reason] = append(byReason[r.reason], fmt.Sprintf("%s %q", id, r.path))
+		byReason[r.reason] = append(byReason[r.reason], fmt.Sprintf("%q %q", id, r.path))
 	}
 	groups := make([]string, 0, len(reasons))
 	for _, reason := range reasons {
@@ -227,12 +233,16 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 		}
 		lines, err := tailer.Poll()
 		if errors.Is(err, errLogPathRefused) {
-			m.noteRefused(src, err, true)
+			// A tailer reconcile has stopped records nothing: its source
+			// is gone or now judged afresh.
+			if ctx.Err() == nil {
+				m.noteRefused(src, err, true)
+			}
 			continue
 		}
 		if err != nil {
 			if !loggedReadErr {
-				log.Printf("logtail %s (%s): %v", src.ID, src.Path, err)
+				log.Printf("logtail %q (%q): %v", src.ID, src.Path, err)
 				loggedReadErr = true
 			}
 			continue
@@ -305,8 +315,9 @@ func (m *logTailManager) checkpointPath(sourceID string) string {
 }
 
 // checkpointBinding names the file a checkpoint measured. A checkpoint is
-// "offset:incarnation:binding"; one an older agent wrote has no binding and
-// still resumes its source.
+// "offset:incarnation:binding". One an older agent wrote has no binding, so
+// nothing says it measured the file the source names now: it is ignored and
+// the source starts at the end, once, after the upgrade.
 func checkpointBinding(sourcePath string) string {
 	sum := sha256.Sum256([]byte(sourcePath))
 	return hex.EncodeToString(sum[:8])
@@ -325,14 +336,11 @@ func loadLogCheckpoint(path, sourcePath string) (uint64, int, bool) {
 		return 0, 0, false
 	}
 	s := strings.TrimSpace(string(b))
-	if strings.Count(s, ":") == 2 {
-		i := strings.LastIndexByte(s, ':')
-		if s[i+1:] != checkpointBinding(sourcePath) {
-			return 0, 0, false
-		}
-		s = s[:i]
+	i := strings.LastIndexByte(s, ':')
+	if strings.Count(s, ":") != 2 || s[i+1:] != checkpointBinding(sourcePath) {
+		return 0, 0, false
 	}
-	return logtail.ParseCheckpoint(s)
+	return logtail.ParseCheckpoint(s[:i])
 }
 
 func saveLogCheckpoint(path, sourcePath string, offset uint64, incarnation int) {
