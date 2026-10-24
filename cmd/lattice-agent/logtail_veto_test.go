@@ -21,11 +21,14 @@ const outsideAllowlist = "outside this node's log allowlist; widen it with LATTI
 // node's configuration (-log-path-allow, LATTICE_LOG_PATH_ALLOW) widens it.
 // Nothing the server sends can widen it.
 func TestLogPathAllowlistDefaultsAndWidening(t *testing.T) {
-	if p := newLogPathPolicy(""); !slices.Contains(p.allow, "/var/log/") {
-		t.Fatalf("default allowlist %q lacks /var/log/", p.allow)
+	if p := newLogPathPolicy(""); !slices.Contains(p.base, "/var/log/") || len(p.allow) != 0 {
+		t.Fatalf("default allowlist base=%q allow=%q, want /var/log/ alone", p.base, p.allow)
 	}
 	p := newLogPathPolicy(" /opt/app/logs , relative/dir, /srv/x/ ,")
-	for _, want := range []string{"/var/log/", "/opt/app/logs/", "/srv/x/"} {
+	if !slices.Contains(p.base, "/var/log/") {
+		t.Errorf("widening dropped the built-in /var/log/: %q", p.base)
+	}
+	for _, want := range []string{"/opt/app/logs/", "/srv/x/"} {
 		if !slices.Contains(p.allow, want) {
 			t.Errorf("allowlist %q lacks %q", p.allow, want)
 		}
@@ -250,5 +253,112 @@ func TestLogRefusalsGroupByReason(t *testing.T) {
 	}
 	if !strings.Contains(got, `"logsrc_b"`) || !strings.Contains(got, `not a regular file: "logsrc_c"`) {
 		t.Fatalf("refusals() = %q, want every refused source under its reason", got)
+	}
+}
+
+// sensitiveLog is the refusal for a file the built-in /var/log/ leaves out.
+const sensitiveLog = "a credential or audit log this node's default leaves out; allow it by listing its directory in LATTICE_LOG_PATH_ALLOW on the node"
+
+// varLog is a stand-in for /var/log/ holding the files the default leaves out
+// and a few it keeps.
+func varLog(t *testing.T) string {
+	t.Helper()
+	base := filepath.Join(t.TempDir(), "log")
+	for _, name := range []string{
+		"auth.log", "auth.log.1", "secure", "secure-20261020", "btmp", "btmp.1", "wtmp",
+		"lastlog", "faillog", "sudo.log", "audit/audit.log", "sudo-io/00/00/01/log",
+		"syslog", "kern.log", "nginx/access.log", "nginx/secure.log",
+	} {
+		path := filepath.Join(base, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return base
+}
+
+func assertLogRefused(t *testing.T, p logPathPolicy, path, reason string) {
+	t.Helper()
+	if err := p.check(path); !errors.Is(err, errLogPathRefused) || !strings.Contains(err.Error(), reason) {
+		t.Errorf("check(%q) = %v, want a refusal saying %q", path, err, reason)
+	}
+	f, err := p.open(path)
+	if err == nil {
+		_ = f.Close()
+	}
+	if !errors.Is(err, errLogPathRefused) || !strings.Contains(err.Error(), reason) {
+		t.Errorf("open(%q) = %v, want a refusal saying %q", path, err, reason)
+	}
+}
+
+func assertLogAllowed(t *testing.T, p logPathPolicy, path string) {
+	t.Helper()
+	if err := p.check(path); err != nil {
+		t.Errorf("check(%q) = %v, want it allowed", path, err)
+	}
+	f, err := p.open(path)
+	if err != nil {
+		t.Errorf("open(%q) = %v, want it allowed", path, err)
+		return
+	}
+	_ = f.Close()
+}
+
+// The built-in /var/log/ leaves out the files that hold credentials or audit
+// trails. The names are judged where the path really leads, so a symlink to
+// one is refused wherever the link sits, and a missing one is refused before
+// it appears. A directory the node lists does not lift that from /var/log/.
+func TestDefaultLogAllowlistLeavesOutCredentialAndAuditLogs(t *testing.T) {
+	base := varLog(t)
+	other := filepath.Join(t.TempDir(), "app")
+	if err := os.Mkdir(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "real.log"), []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "auth.log"), filepath.Join(base, "innocent.log")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "audit", "audit.log"), filepath.Join(other, "app.log")); err != nil {
+		t.Fatal(err)
+	}
+	p := newLogPathPolicyFrom(base, other)
+	for _, name := range []string{
+		"auth.log", "auth.log.1", "auth.log.2.gz", "secure", "secure-20261020", "btmp", "btmp.1",
+		"wtmp", "lastlog", "faillog", "sudo.log", "audit/audit.log", "audit/audit.log.1",
+		"sudo-io/00/00/01/log", "innocent.log",
+	} {
+		assertLogRefused(t, p, filepath.Join(base, name), sensitiveLog)
+	}
+	assertLogRefused(t, p, filepath.Join(other, "app.log"), sensitiveLog)
+	for _, name := range []string{"syslog", "kern.log", "nginx/access.log", "nginx/secure.log"} {
+		assertLogAllowed(t, p, filepath.Join(base, name))
+	}
+	assertLogAllowed(t, p, filepath.Join(other, "real.log"))
+}
+
+// LATTICE_LOG_PATH_ALLOW is taken literally: a directory the node lists is
+// tailed whole, the names the default leaves out included, which is how a
+// node opts in to its own auth.log. What it does not list keeps the default.
+func TestNodeLogAllowlistIsTakenLiterally(t *testing.T) {
+	base := varLog(t)
+	for _, tc := range []struct {
+		extra            string
+		allowed, refused []string
+	}{
+		{base, []string{"auth.log", "secure", "btmp", "audit/audit.log", "sudo-io/00/00/01/log", "syslog"}, nil},
+		{filepath.Join(base, "audit"), []string{"audit/audit.log", "syslog"}, []string{"auth.log", "secure", "sudo.log"}},
+	} {
+		p := newLogPathPolicyFrom(base, tc.extra)
+		for _, name := range tc.allowed {
+			assertLogAllowed(t, p, filepath.Join(base, name))
+		}
+		for _, name := range tc.refused {
+			assertLogRefused(t, p, filepath.Join(base, name), sensitiveLog)
+		}
 	}
 }

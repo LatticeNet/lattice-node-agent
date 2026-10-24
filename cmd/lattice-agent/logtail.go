@@ -67,7 +67,7 @@ func newLogTailManager(cfg agentConfig) *logTailManager {
 		noTail:  cfg.NoLogTail,
 		refused: map[string]logSourceRefusal{},
 	}
-	log.Printf("log tail: this node tails only regular files under %q", m.policy.allow)
+	log.Printf("log tail: this node tails only regular files under %q except %q, and under its own %q", m.policy.base, defaultLogPathDeny, m.policy.allow)
 	if slices.Contains(m.policy.allow, "/") {
 		log.Printf("log tail: warning: the allowlist holds \"/\", so the server may name any file this agent can read")
 	}

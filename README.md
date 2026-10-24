@@ -377,7 +377,14 @@ missing checksum manifest aborts the install before the binary is written.
 - `LATTICE_TERMINAL_TRANSPORT=poll|stream` selects the terminal transport.
 - `LATTICE_SSH_ALERTS=1` reports accepted sshd logins.
 - `LATTICE_LOG_PATH_ALLOW=/opt/app/logs,/srv/logs` widens the directories the
-  node tails logs from beyond `/var/log/`. The server keeps its own allowlist
+  node tails logs from beyond `/var/log/`. Each directory listed is taken
+  literally and tailed whole. The built-in `/var/log/` leaves out the files
+  that hold credentials or audit trails: `auth.log*`, `secure*`, `btmp*`,
+  `wtmp*`, `lastlog`, `faillog`, `sudo.log*`, and everything under `audit/`
+  and `sudo-io/`. Those names are judged where the path really leads, so a
+  symlink to one is refused too. A node that should ship one of them lists
+  its directory, for example `LATTICE_LOG_PATH_ALLOW=/var/log/audit`. The
+  server keeps its own allowlist
   with the same variable name; a log source has to pass both, and nothing the
   server sends widens the node's. A refused source shows on the node's loop
   health under `log_sources`.

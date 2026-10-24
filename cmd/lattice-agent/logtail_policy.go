@@ -16,12 +16,20 @@ import (
 // word for what its own user, usually root, may read and ship: it tails only
 // regular files under its own allowlist, /var/log/ unless -log-path-allow
 // (LATTICE_LOG_PATH_ALLOW in the agent's env file) widens it, and nothing the
-// server sends can widen it. The path is judged after symlinks and ".." are
-// resolved, and again on every open, rotations included.
+// server sends can widen it. The built-in /var/log/ leaves out the files that
+// hold credentials or audit trails (defaultLogPathDeny); a directory the node
+// lists itself is taken literally, which is how a node opts in to those. The
+// path is judged as written, after symlinks and ".." are resolved, and again
+// on every open, rotations included.
 
 // defaultLogPathAllow is the prefix a node tails without configuration, the
 // server's own default.
 const defaultLogPathAllow = "/var/log/"
+
+// defaultLogPathDeny is what the built-in /var/log/ leaves out. An entry
+// ending in "*" is a file name prefix directly under /var/log/, one ending in
+// "/" a whole directory under it, and any other a file name there.
+var defaultLogPathDeny = []string{"auth.log*", "secure*", "btmp*", "wtmp*", "lastlog", "faillog", "sudo.log*", "audit/", "sudo-io/"}
 
 // errLogPathRefused marks a source the node refuses to tail.
 var errLogPathRefused = errors.New("refused by the node")
@@ -37,48 +45,84 @@ func refuseLogPath(reason string) error { return &logPathRefusal{reason: reason}
 // would let the source through.
 const (
 	logRefusedOutside    = "outside this node's log allowlist; widen it with LATTICE_LOG_PATH_ALLOW on the node"
+	logRefusedSensitive  = "a credential or audit log this node's default leaves out; allow it by listing its directory in LATTICE_LOG_PATH_ALLOW on the node"
 	logRefusedNotRegular = "not a regular file"
 	logRefusedOff        = "log tailing is turned off on this node (LATTICE_NO_LOG_TAIL)"
 )
 
 // logPathPolicy is the node's allowlist: absolute directory prefixes, each
-// ending in "/". A prefix that is itself reached through a symlink is listed
-// as written and as resolved, so /var/log/ still matches where /var is a link.
+// ending in "/". base is the built-in /var/log/, which leaves out
+// defaultLogPathDeny; allow is what the node lists, taken literally. A prefix
+// that is itself reached through a symlink is listed as written and as
+// resolved, so /var/log/ still matches where /var is a link.
 type logPathPolicy struct {
 	allow []string
+	base  []string
 }
 
 func newLogPathPolicy(extra string) logPathPolicy {
-	var p logPathPolicy
-	add := func(prefix string) {
-		prefix = strings.TrimSpace(prefix)
-		if !filepath.IsAbs(prefix) {
-			return
-		}
-		prefix = filepath.Clean(prefix)
-		forms := []string{prefix}
-		if resolved, err := filepath.EvalSymlinks(prefix); err == nil {
-			forms = append(forms, resolved)
-		}
-		for _, form := range forms {
-			if !strings.HasSuffix(form, "/") {
-				form += "/"
-			}
-			if !slices.Contains(p.allow, form) {
-				p.allow = append(p.allow, form)
-			}
-		}
-	}
-	add(defaultLogPathAllow)
+	return newLogPathPolicyFrom(defaultLogPathAllow, extra)
+}
+
+func newLogPathPolicyFrom(base, extra string) logPathPolicy {
+	p := logPathPolicy{base: appendLogPrefix(nil, base)}
 	for _, prefix := range strings.Split(extra, ",") {
-		add(prefix)
+		p.allow = appendLogPrefix(p.allow, prefix)
 	}
 	return p
 }
 
-func (p logPathPolicy) allowed(path string) bool {
+func appendLogPrefix(list []string, prefix string) []string {
+	prefix = strings.TrimSpace(prefix)
+	if !filepath.IsAbs(prefix) {
+		return list
+	}
+	prefix = filepath.Clean(prefix)
+	forms := []string{prefix}
+	if resolved, err := filepath.EvalSymlinks(prefix); err == nil {
+		forms = append(forms, resolved)
+	}
+	for _, form := range forms {
+		if !strings.HasSuffix(form, "/") {
+			form += "/"
+		}
+		if !slices.Contains(list, form) {
+			list = append(list, form)
+		}
+	}
+	return list
+}
+
+// judge is why the node refuses path, or "" when it may tail it.
+func (p logPathPolicy) judge(path string) string {
 	for _, prefix := range p.allow {
 		if strings.HasPrefix(path, prefix) {
+			return ""
+		}
+	}
+	for _, prefix := range p.base {
+		if rel, ok := strings.CutPrefix(path, prefix); ok {
+			if deniedByDefault(rel) {
+				return logRefusedSensitive
+			}
+			return ""
+		}
+	}
+	return logRefusedOutside
+}
+
+func deniedByDefault(rel string) bool {
+	for _, entry := range defaultLogPathDeny {
+		switch {
+		case strings.HasSuffix(entry, "/"):
+			if strings.HasPrefix(rel, entry) {
+				return true
+			}
+		case strings.HasSuffix(entry, "*"):
+			if !strings.Contains(rel, "/") && strings.HasPrefix(rel, strings.TrimSuffix(entry, "*")) {
+				return true
+			}
+		case rel == entry:
 			return true
 		}
 	}
@@ -95,8 +139,8 @@ func (p logPathPolicy) resolve(path string) (string, error) {
 	if !filepath.IsAbs(path) || strings.ContainsFunc(path, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
 		return "", refuseLogPath(logRefusedOutside)
 	}
-	if !p.allowed(filepath.Clean(path)) {
-		return "", refuseLogPath(logRefusedOutside)
+	if reason := p.judge(filepath.Clean(path)); reason != "" {
+		return "", refuseLogPath(reason)
 	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -105,8 +149,8 @@ func (p logPathPolicy) resolve(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !p.allowed(resolved) {
-		return "", refuseLogPath(logRefusedOutside)
+	if reason := p.judge(resolved); reason != "" {
+		return "", refuseLogPath(reason)
 	}
 	return resolved, nil
 }
@@ -161,9 +205,11 @@ func (p logPathPolicy) open(path string) (*os.File, error) {
 		_ = f.Close()
 		return nil, refuseLogPath(logRefusedNotRegular)
 	}
-	if opened, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(f.Fd()), 10)); err == nil && !p.allowed(opened) {
-		_ = f.Close()
-		return nil, refuseLogPath(logRefusedOutside)
+	if opened, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(f.Fd()), 10)); err == nil {
+		if reason := p.judge(opened); reason != "" {
+			_ = f.Close()
+			return nil, refuseLogPath(reason)
+		}
 	}
 	return f, nil
 }
