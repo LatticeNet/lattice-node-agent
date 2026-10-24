@@ -257,7 +257,7 @@ func TestLogRefusalsGroupByReason(t *testing.T) {
 }
 
 // sensitiveLog is the refusal for a file the built-in /var/log/ leaves out.
-const sensitiveLog = "a credential or audit log this node's default leaves out; allow it by listing its directory in LATTICE_LOG_PATH_ALLOW on the node"
+const sensitiveLog = "a credential or audit log this node's default leaves out; allow it by listing the file in LATTICE_LOG_PATH_ALLOW on the node"
 
 // varLog is a stand-in for /var/log/ holding the files the default leaves out
 // and a few it keeps.
@@ -345,17 +345,26 @@ func TestDefaultLogAllowlistLeavesOutCredentialAndAuditLogs(t *testing.T) {
 	assertLogAllowed(t, p, filepath.Join(other, "real.log"))
 }
 
-// LATTICE_LOG_PATH_ALLOW is taken literally: a directory the node lists is
-// tailed whole, the names the default leaves out included, which is how a
-// node opts in to its own auth.log. What it does not list keeps the default.
+// A node opts in to a file the default leaves out by listing that file, or a
+// directory inside /var/log/ that holds it, and gets exactly that. Listing
+// /var/log/ itself, or a parent of it, restates the default and does not
+// lift the denylist, since that is the setting an operator could write
+// without meaning auth.log.
 func TestNodeLogAllowlistIsTakenLiterally(t *testing.T) {
 	base := varLog(t)
+	parent := filepath.Dir(base)
+	if err := os.WriteFile(filepath.Join(parent, "beside.log"), []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		extra            string
 		allowed, refused []string
 	}{
-		{base, []string{"auth.log", "secure", "btmp", "audit/audit.log", "sudo-io/00/00/01/log", "syslog"}, nil},
+		{filepath.Join(base, "auth.log"), []string{"auth.log", "syslog"}, []string{"auth.log.1", "secure", "audit/audit.log"}},
 		{filepath.Join(base, "audit"), []string{"audit/audit.log", "syslog"}, []string{"auth.log", "secure", "sudo.log"}},
+		{base, []string{"syslog"}, []string{"auth.log", "secure", "audit/audit.log"}},
+		{base + "/", []string{"syslog"}, []string{"auth.log", "secure", "audit/audit.log"}},
+		{parent, []string{"syslog", "../beside.log"}, []string{"auth.log", "secure", "audit/audit.log"}},
 	} {
 		p := newLogPathPolicyFrom(base, tc.extra)
 		for _, name := range tc.allowed {
