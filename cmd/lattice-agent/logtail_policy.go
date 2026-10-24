@@ -26,10 +26,17 @@ import (
 // server's own default.
 const defaultLogPathAllow = "/var/log/"
 
-// defaultLogPathDeny is what the built-in /var/log/ leaves out. An entry
-// ending in "*" is a file name prefix directly under /var/log/, one ending in
-// "/" a whole directory under it, and any other a file name there.
-var defaultLogPathDeny = []string{"auth.log*", "secure*", "btmp*", "wtmp*", "lastlog", "faillog", "sudo.log*", "audit/", "sudo-io/"}
+// defaultLogPathDeny is what the built-in /var/log/ leaves out: logins and
+// failed logins, audit and sudo session logs, and the installer and
+// cloud-init logs that can echo a password or user-data. An entry ending in
+// "*" is a file name prefix directly under /var/log/, one ending in "/" a
+// whole directory under it, and any other a file name there. Entries are
+// lowercase and matched without case, since a filesystem that folds case
+// opens auth.log as AUTH.log.
+var defaultLogPathDeny = []string{
+	"auth.log*", "secure*", "btmp*", "wtmp*", "lastlog", "faillog", "tallylog", "sudo.log*",
+	"cloud-init*", "audit/", "sudo-io/", "installer/", "anaconda/", "private/",
+}
 
 // errLogPathRefused marks a source the node refuses to tail.
 var errLogPathRefused = errors.New("refused by the node")
@@ -112,6 +119,7 @@ func (p logPathPolicy) judge(path string) string {
 }
 
 func deniedByDefault(rel string) bool {
+	rel = strings.ToLower(rel)
 	for _, entry := range defaultLogPathDeny {
 		switch {
 		case strings.HasSuffix(entry, "/"):

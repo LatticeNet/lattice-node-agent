@@ -331,6 +331,10 @@ func TestDefaultLogAllowlistLeavesOutCredentialAndAuditLogs(t *testing.T) {
 		"auth.log", "auth.log.1", "auth.log.2.gz", "secure", "secure-20261020", "btmp", "btmp.1",
 		"wtmp", "lastlog", "faillog", "sudo.log", "audit/audit.log", "audit/audit.log.1",
 		"sudo-io/00/00/01/log", "innocent.log",
+		"tallylog", "cloud-init.log", "cloud-init-output.log.1", "installer/autoinstall-user-data",
+		"anaconda/ks-script-1.log", "private/app/app.log",
+		// A filesystem that folds case opens auth.log under any of these.
+		"AUTH.log", "Secure", "AUDIT/audit.log", "Sudo-IO/00/00/01/log",
 	} {
 		assertLogRefused(t, p, filepath.Join(base, name), sensitiveLog)
 	}
