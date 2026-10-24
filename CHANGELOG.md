@@ -5,6 +5,47 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
+## 0.3.10-alpha.9 (2026-10-24)
+
+Security hardening found when CI's gosec step, which had been scanning no
+files, was made to scan the agent, plus the installer and mirror work since
+alpha.7, built with Go 1.26.10 (GO-2026-6809). The tag v0.3.10-alpha.8 exists
+on e5f769f but was never released; its release run was cancelled before
+publishing, and the version is not reused. No compatibility floor moves.
+
+What changes on a node:
+
+- Log tailing is held to the node's own allowlist. The agent tails only
+  regular files under /var/log/, plus the entries in -log-path-allow
+  (LATTICE_LOG_PATH_ALLOW in the agent env file, which the installer carries
+  through the sudo re-exec and keeps across reinstalls). The built-in
+  /var/log/ entry leaves out credential and audit logs (auth.log, secure,
+  btmp, wtmp, lastlog, faillog, tallylog, sudo.log, cloud-init, and the
+  audit/, sudo-io/, installer/, anaconda/ and private/ directories),
+  matched without case and after symlinks resolve; a node allows one by
+  listing the file itself or a directory inside /var/log/ that holds it.
+  The opened file's real path is checked, so a symlink cannot leave the
+  allowlist. -no-log-tail turns log tailing off. A refused source shows in
+  the agent's log_sources loop health with the setting that would allow it.
+  Nothing the server sends widens the allowlist. A server's
+  LATTICE_LOG_PATH_ALLOW that reached beyond /var/log/ now needs the same
+  entry on each node.
+- A log source's checkpoint stays inside the state directory whatever id the
+  server sends; a checkpoint is resumed only for the same file, a retargeted
+  source starts at the end of the new file, and a damaged offset starts the
+  log over instead of failing every poll.
+- A terminal starts only with one of the five shells the server already
+  maps every request to; any other path fails the session before anything
+  runs. -allow-terminal still gates terminals.
+- Installer: the enrollment token reaches the sudo re-exec through a private
+  directory the root child verifies, never through argv; a world-renamable
+  TMPDIR is refused. Installs come from ordered sources (the control plane,
+  then mirrors), each bounded in time and verified against the rendered
+  digest, and a mirror the installer cannot cap is skipped with the reason
+  in its report.
+- CI runs gosec inside the module and fails when it scans no files or a
+  package fails to load; scanners are pinned.
+
 ## 0.3.10-alpha.7 (2026-10-17)
 
 Design 31, slice S4: the agent fetches the binary of its open agent update in
