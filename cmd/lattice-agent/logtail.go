@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -159,9 +160,21 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 	}
 }
 
+// logSourceIDRE is a log source id that is safe as a file name: the server
+// mints "logsrc_<base32>", "agent-debug-<hex>" and "singbox-<hex>".
+var logSourceIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// checkpointPath is where a source's checkpoint lives, or "" for none. The id
+// comes from the server and the agent writes the file as its own user, often
+// root, so an id that is not a plain file name gets no checkpoint rather than
+// a path outside the state directory; the source still tails from the end.
 func (m *logTailManager) checkpointPath(sourceID string) string {
 	dir := strings.TrimSpace(m.cfg.LogStateDir)
 	if dir == "" {
+		return ""
+	}
+	if !logSourceIDRE.MatchString(sourceID) {
+		log.Printf("log tail: source id %q is not a plain file name; no checkpoint is kept for it", sourceID)
 		return ""
 	}
 	return filepath.Join(dir, sourceID+".ckpt")
