@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,20 @@ type logTailManager struct {
 	cfg    agentConfig
 	mu     sync.Mutex
 	active map[string]*logTailEntry
+	// policy is the node's log allowlist, fixed at start from the agent's own
+	// configuration; nothing the server sends rebuilds it.
+	policy logPathPolicy
+	// refused holds each source the node refuses to tail, by id, for the
+	// log_sources step to report.
+	refused map[string]logSourceRefusal
+}
+
+// logSourceRefusal is one refused source. atOpen marks a refusal the tailer
+// met on (re)opening, which only that tailer can clear.
+type logSourceRefusal struct {
+	path   string
+	reason string
+	atOpen bool
 }
 
 type logTailEntry struct {
@@ -42,7 +58,77 @@ type logTailEntry struct {
 }
 
 func newLogTailManager(cfg agentConfig) *logTailManager {
-	return &logTailManager{cfg: cfg, active: map[string]*logTailEntry{}}
+	return &logTailManager{
+		cfg: cfg, active: map[string]*logTailEntry{},
+		policy:  newLogPathPolicy(cfg.LogPathAllow),
+		refused: map[string]logSourceRefusal{},
+	}
+}
+
+// noteRefused records a refusal and logs it on the node the first time it is
+// seen for that source, path and reason.
+func (m *logTailManager) noteRefused(src model.LogSource, err error, atOpen bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noteRefusedLocked(src, err, atOpen)
+}
+
+func (m *logTailManager) noteRefusedLocked(src model.LogSource, err error, atOpen bool) {
+	var refusal *logPathRefusal
+	reason := err.Error()
+	if errors.As(err, &refusal) {
+		reason = refusal.reason
+	}
+	next := logSourceRefusal{path: src.Path, reason: reason, atOpen: atOpen}
+	if prev, ok := m.refused[src.ID]; ok && prev.path == next.path && prev.reason == next.reason {
+		return
+	}
+	m.refused[src.ID] = next
+	log.Printf("log tail: source %s %q refused by the node: %s", src.ID, src.Path, reason)
+}
+
+// clearOpenRefusal drops a refusal the tailer for src met on opening, once it
+// opens cleanly or stops. A refusal reconcile recorded is reconcile's to drop.
+func (m *logTailManager) clearOpenRefusal(src model.LogSource) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.refused[src.ID]; ok && r.atOpen && r.path == src.Path {
+		delete(m.refused, src.ID)
+	}
+}
+
+// refusals is the log_sources step's error: every source the node refuses,
+// so the heartbeat's loop health tells the operator why it is not tailed.
+// The server shows that step's error and derives nothing from it.
+func (m *logTailManager) refusals() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.refused) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(m.refused))
+	for id := range m.refused {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		r := m.refused[id]
+		parts = append(parts, fmt.Sprintf("%s: %s %q", r.reason, id, r.path))
+	}
+	return errors.New("refused by the node: " + strings.Join(parts, "; "))
+}
+
+// newSourceTailer is a source's tailer: it opens through the node's
+// allowlist, and resumes only from a checkpoint of the same file, so a
+// source retargeted under the same id starts at the end of its new file.
+func newSourceTailer(src model.LogSource, ckptPath string, policy logPathPolicy) *logtail.Tailer {
+	tailer := logtail.New(src.Path, src.MaxLineBytes)
+	tailer.Open = policy.open
+	if off, inc, ok := loadLogCheckpoint(ckptPath, src.Path); ok {
+		tailer.Resume(off, inc)
+	}
+	return tailer
 }
 
 func (m *logTailManager) setConfig(cfg agentConfig) {
@@ -64,6 +150,11 @@ func (m *logTailManager) reconcile(sources []model.LogSource) {
 	for _, s := range sources {
 		desired[s.ID] = s
 	}
+	for id, r := range m.refused {
+		if d, ok := desired[id]; !ok || d.Path != r.path {
+			delete(m.refused, id)
+		}
+	}
 	for id, entry := range m.active {
 		if d, ok := desired[id]; !ok || logSourceChanged(entry.spec, d) {
 			entry.cancel()
@@ -71,6 +162,17 @@ func (m *logTailManager) reconcile(sources []model.LogSource) {
 		}
 	}
 	for id, s := range desired {
+		if err := m.policy.check(s.Path); errors.Is(err, errLogPathRefused) {
+			if entry, ok := m.active[id]; ok {
+				entry.cancel()
+				delete(m.active, id)
+			}
+			m.noteRefusedLocked(s, err, false)
+			continue
+		}
+		if r, ok := m.refused[id]; ok && !r.atOpen {
+			delete(m.refused, id)
+		}
 		if _, ok := m.active[id]; ok {
 			continue
 		}
@@ -85,12 +187,10 @@ func logSourceChanged(a, b model.LogSource) bool {
 }
 
 func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
-	tailer := logtail.New(src.Path, src.MaxLineBytes)
-	defer tailer.Close()
 	ckptPath := m.checkpointPath(src.ID)
-	if off, inc, ok := loadLogCheckpoint(ckptPath, src.Path); ok {
-		tailer.Resume(off, inc)
-	}
+	tailer := newSourceTailer(src, ckptPath, m.policy)
+	defer tailer.Close()
+	defer m.clearOpenRefusal(src)
 	batchLines := src.MaxBatchLines
 	if batchLines <= 0 {
 		batchLines = 500
@@ -109,6 +209,10 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 		case <-flush.C:
 		}
 		lines, err := tailer.Poll()
+		if errors.Is(err, errLogPathRefused) {
+			m.noteRefused(src, err, true)
+			continue
+		}
 		if err != nil {
 			if !loggedReadErr {
 				log.Printf("logtail %s (%s): %v", src.ID, src.Path, err)
@@ -117,6 +221,7 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 			continue
 		}
 		loggedReadErr = false
+		m.clearOpenRefusal(src)
 		if len(lines) > 0 {
 			pending = append(pending, lines...)
 			if len(pending) > logTailMaxPending {

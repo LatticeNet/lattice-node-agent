@@ -23,6 +23,10 @@ const (
 // Tailer follows one file. It is not safe for concurrent use; the agent runs one
 // per source in its own goroutine.
 type Tailer struct {
+	// Open opens the file at every (re)open, rotations included; nil is
+	// os.Open. The agent sets it to judge each open against its allowlist.
+	Open func(path string) (*os.File, error)
+
 	path         string
 	maxLineBytes int
 	maxReadBytes int64
@@ -80,7 +84,11 @@ func (t *Tailer) ensureOpen() error {
 	if t.file != nil {
 		return nil
 	}
-	f, err := os.Open(t.path)
+	open := t.Open
+	if open == nil {
+		open = os.Open
+	}
+	f, err := open(t.path)
 	if err != nil {
 		return err
 	}

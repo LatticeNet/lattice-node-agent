@@ -199,6 +199,7 @@ type agentConfig struct {
 	SingBoxBin                string
 	SingBoxMeta               string
 	LogStateDir               string
+	LogPathAllow              string // the node's own log allowlist beyond /var/log/; the server cannot widen it
 	TaskOutboxDir             string
 	LinechainTxnDir           string
 	LinechainReady            bool
@@ -308,6 +309,7 @@ func main() {
 	flag.StringVar(&cfg.SingBoxBin, "singbox-bin", env("LATTICE_SINGBOX_BIN", "sb"), "sb management binary for -singbox-discover (default \"sb\" resolved on PATH)")
 	flag.StringVar(&cfg.SingBoxMeta, "singbox-meta", env("LATTICE_SINGBOX_META", ""), "design-15 sing-box sidecar metadata path for -singbox-discover (default /etc/sing-box/lattice-metadata.json)")
 	flag.StringVar(&cfg.LogStateDir, "log-state-dir", os.Getenv("LATTICE_LOG_STATE_DIR"), "directory for log-tail checkpoints (empty disables checkpoint persistence; sources still tail from end)")
+	flag.StringVar(&cfg.LogPathAllow, "log-path-allow", os.Getenv("LATTICE_LOG_PATH_ALLOW"), "comma-separated absolute directories the node may tail logs from besides /var/log/; the server cannot widen it")
 	flag.StringVar(&cfg.TaskOutboxDir, "task-outbox-dir", os.Getenv("LATTICE_TASK_OUTBOX_DIR"), "base directory for durable task-result journals (default: log state dir, or the user cache directory for manual runs)")
 	flag.StringVar(&cfg.LinechainTxnDir, "linechain-txn-dir", os.Getenv("LATTICE_LINECHAIN_TXN_DIR"), "private directory for crash-recoverable linechain transactions")
 	flag.BoolVar(&applyLinechain, "linechain-apply", false, "apply one bounded linechain document from stdin and exit")
@@ -643,7 +645,7 @@ func main() {
 				return err
 			}
 			logTailers.reconcile(sources)
-			return nil
+			return logTailers.refusals()
 		})
 		_ = health.run(stepTrace, func() error {
 			traceCollector.reconcile(context.Background(), cfg)

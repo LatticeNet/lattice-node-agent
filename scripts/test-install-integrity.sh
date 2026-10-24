@@ -137,6 +137,21 @@ do
   fi
 done
 
+# The node's log allowlist is the node's own setting: the installer carries
+# it through the sudo re-exec, keeps it across a reinstall, and writes it for
+# both systemd and launchd.
+for expected in \
+  'LATTICE_LOG_PATH_ALLOW="${LATTICE_LOG_PATH_ALLOW:-}"' \
+  'LATTICE_SSH_ALERTS LATTICE_LOG_PATH_ALLOW' \
+  'LATTICE_LOG_PATH_ALLOW=$(quote_env "${LATTICE_LOG_PATH_ALLOW:-}")' \
+  '<key>LATTICE_LOG_PATH_ALLOW</key>'
+do
+  if ! grep -Fq "$expected" "$ROOT/scripts/install.sh"; then
+    echo "installer log allowlist contract missing: $expected" >&2
+    exit 1
+  fi
+done
+
 # Keepalive supervision: the drop-in is written only for a binary that
 # advertises sd-notify-v1, it grants a notify socket without turning the unit
 # into Type=notify (an older binary installed later must not be killed for
