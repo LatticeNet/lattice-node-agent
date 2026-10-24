@@ -38,9 +38,23 @@ jobs:
         working-directory: lattice-node-agent
         run: go test -race -cover ./...
       - name: gosec
+        working-directory: lattice-node-agent
+        # Inside the module, like vet and test. Run from the parent directory,
+        # gosec v2.29.0 loaded no package and passed with "Files: 0", so the
+        # step also fails when the scan covered no file or could not load a
+        # package, the same silent miss in another form. -exclude-generated
+        # skips protoc output (stats.pb.go), whose unsafe calls are protobuf's
+        # own and would be rewritten by the next regeneration.
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
-          gosec ./lattice-node-agent/...
+          status=0
+          gosec -exclude-generated -fmt=json -out="$RUNNER_TEMP/gosec.json" -stdout -verbose=text ./... || status=$?
+          if ! jq -e '.Stats.files > 0 and ((."Golang errors" // {}) | length) == 0' "$RUNNER_TEMP/gosec.json" >/dev/null; then
+            echo "::error::gosec scanned no file or could not load a package"
+            jq -c '{files: .Stats.files, load_errors: (."Golang errors" // {} | keys)}' "$RUNNER_TEMP/gosec.json" || true
+            exit 1
+          fi
+          exit "$status"
       - name: govulncheck
         working-directory: lattice-node-agent
         run: |
