@@ -84,7 +84,7 @@ func MaybeRunChildShim(argv []string) bool {
 	// process group (set by Setpgid on the parent command) and the rlimits
 	// just installed. The private umask and environment are already installed
 	// on the shim process, so the interpreter and its descendants inherit them.
-	if err := syscall.Exec(interp, []string{interp, scriptPath}, os.Environ()); err != nil {
+	if err := syscall.Exec(interp, []string{interp, scriptPath}, os.Environ()); err != nil { // #nosec G204 -- an allowlisted interpreter on the approved task script under -allow-exec
 		fmt.Fprintf(os.Stderr, "taskexec shim: exec %s: %v\n", interp, err)
 		os.Exit(126)
 	}
@@ -127,7 +127,7 @@ func currentUIDThreadCount() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	uid := uint32(os.Getuid())
+	uid := uint32(os.Getuid()) // #nosec G115 -- POSIX uids are 32-bit kernel ids
 	var count uint64
 	for _, entry := range entries {
 		if !entry.IsDir() || !isProcPID(entry.Name()) {
@@ -202,7 +202,7 @@ func prepareTaskCgroup(config CgroupConfig, taskID string) (preparedCgroup, erro
 	cleanup := func() {
 		// cgroup.kill is not available on every cgroup v2 kernel. Use it when
 		// present to make cleanup robust, then remove the cgroup best-effort.
-		_ = os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0o644)
+		_ = os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0o644) // #nosec G306 -- a cgroupfs control file that already exists; the mode is never applied
 		if err := os.Remove(path); err != nil {
 			for _, name := range []string{"memory.max", "pids.max", "cpu.max", "cgroup.procs", "cgroup.kill"} {
 				_ = os.Remove(filepath.Join(path, name))
@@ -278,7 +278,7 @@ func safeCgroupName(taskID string) string {
 func ensureCgroupV2Root(root string, config CgroupConfig) error {
 	required := requiredCgroupControllers(config)
 	controllersPath := filepath.Join(root, "cgroup.controllers")
-	data, err := os.ReadFile(controllersPath)
+	data, err := os.ReadFile(controllersPath) // #nosec G304 -- under the agent's own -task-cgroup root
 	if err != nil {
 		return fmt.Errorf("task cgroup root %s is not a cgroup v2 directory: %w", root, err)
 	}
@@ -302,7 +302,7 @@ func ensureCgroupV2Root(root string, config CgroupConfig) error {
 	for _, controller := range required {
 		enable = append(enable, "+"+controller)
 	}
-	if err := os.WriteFile(subtreePath, []byte(strings.Join(enable, " ")), 0o644); err != nil {
+	if err := os.WriteFile(subtreePath, []byte(strings.Join(enable, " ")), 0o644); err != nil { // #nosec G306 -- a cgroupfs control file that already exists; the mode is never applied
 		return fmt.Errorf("enable task cgroup controllers %s: %w", strings.Join(enable, " "), err)
 	}
 	return nil
@@ -341,7 +341,7 @@ func writeCgroupControl(path, file, value string) error {
 	if value == "" {
 		return nil
 	}
-	if err := os.WriteFile(filepath.Join(path, file), []byte(value), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(path, file), []byte(value), 0o644); err != nil { // #nosec G306 -- a cgroupfs control file that already exists; the mode is never applied
 		return fmt.Errorf("write task cgroup %s=%q: %w", file, value, err)
 	}
 	return nil
@@ -352,14 +352,14 @@ func joinTaskCgroup(path string) error {
 	if path == "" {
 		return nil
 	}
-	return os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0o644)
+	return os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(os.Getpid())), 0o644) // #nosec G306 -- a cgroupfs control file that already exists; the mode is never applied
 }
 
 // buildHardenedCmd constructs the task command on Linux. It re-execs the agent
 // binary into the rlimit shim (which then execs the interpreter) and places the
 // child in its own process group so the whole tree can be killed on timeout.
 func buildHardenedCmd(interp, scriptPath string, timeout time.Duration, cgroupPath string) *exec.Cmd {
-	cpuSecs := uint64(timeout/time.Second) + cpuGraceSeconds
+	cpuSecs := uint64(timeout/time.Second) + cpuGraceSeconds // #nosec G115 -- resolveTaskTimeout bounds timeout to 1s..maxTaskTimeout
 	if cpuSecs < cpuGraceSeconds {
 		cpuSecs = cpuGraceSeconds
 	}
@@ -369,7 +369,7 @@ func buildHardenedCmd(interp, scriptPath string, timeout time.Duration, cgroupPa
 		args = append(args, cgroupPath)
 	}
 	args = append(args, interp, scriptPath)
-	cmd := exec.Command(self, args...)
+	cmd := exec.Command(self, args...) // #nosec G204 -- re-execs this agent binary into its rlimit shim with an allowlisted interpreter
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	return cmd
 }
