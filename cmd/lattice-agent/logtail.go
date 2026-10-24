@@ -36,9 +36,11 @@ type logTailManager struct {
 	cfg    agentConfig
 	mu     sync.Mutex
 	active map[string]*logTailEntry
-	// policy is the node's log allowlist, fixed at start from the agent's own
-	// configuration; nothing the server sends rebuilds it.
+	// policy is the node's log allowlist and noTail its kill switch, both
+	// fixed at start from the agent's own configuration; nothing the server
+	// sends changes them.
 	policy logPathPolicy
+	noTail bool
 	// refused holds each source the node refuses to tail, by id, for the
 	// log_sources step to report.
 	refused map[string]logSourceRefusal
@@ -61,6 +63,7 @@ func newLogTailManager(cfg agentConfig) *logTailManager {
 	return &logTailManager{
 		cfg: cfg, active: map[string]*logTailEntry{},
 		policy:  newLogPathPolicy(cfg.LogPathAllow),
+		noTail:  cfg.NoLogTail,
 		refused: map[string]logSourceRefusal{},
 	}
 }
@@ -99,7 +102,9 @@ func (m *logTailManager) clearOpenRefusal(src model.LogSource) {
 
 // refusals is the log_sources step's error: every source the node refuses,
 // so the heartbeat's loop health tells the operator why it is not tailed.
-// The server shows that step's error and derives nothing from it.
+// The server shows that step's error and derives nothing from it. Sources are
+// grouped under their reason, reason first, so the sentence that says what to
+// do survives the 200-rune cut of loop health.
 func (m *logTailManager) refusals() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -111,12 +116,20 @@ func (m *logTailManager) refusals() error {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	parts := make([]string, 0, len(ids))
+	var reasons []string
+	byReason := map[string][]string{}
 	for _, id := range ids {
 		r := m.refused[id]
-		parts = append(parts, fmt.Sprintf("%s: %s %q", r.reason, id, r.path))
+		if _, seen := byReason[r.reason]; !seen {
+			reasons = append(reasons, r.reason)
+		}
+		byReason[r.reason] = append(byReason[r.reason], fmt.Sprintf("%s %q", id, r.path))
 	}
-	return errors.New("refused by the node: " + strings.Join(parts, "; "))
+	groups := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		groups = append(groups, reason+": "+strings.Join(byReason[reason], ", "))
+	}
+	return errors.New("refused by the node: " + strings.Join(groups, " | "))
 }
 
 // newSourceTailer is a source's tailer: it opens through the node's
@@ -162,6 +175,10 @@ func (m *logTailManager) reconcile(sources []model.LogSource) {
 		}
 	}
 	for id, s := range desired {
+		if m.noTail {
+			m.noteRefusedLocked(s, refuseLogPath(logRefusedOff), false)
+			continue
+		}
 		if err := m.policy.check(s.Path); errors.Is(err, errLogPathRefused) {
 			if entry, ok := m.active[id]; ok {
 				entry.cancel()

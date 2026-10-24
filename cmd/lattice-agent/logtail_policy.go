@@ -33,9 +33,12 @@ func (e *logPathRefusal) Unwrap() error { return errLogPathRefused }
 
 func refuseLogPath(reason string) error { return &logPathRefusal{reason: reason} }
 
+// The reasons an operator reads on the node's loop health, each saying what
+// would let the source through.
 const (
-	logRefusedOutside    = "outside its log allowlist"
+	logRefusedOutside    = "outside this node's log allowlist; widen it with LATTICE_LOG_PATH_ALLOW on the node"
 	logRefusedNotRegular = "not a regular file"
+	logRefusedOff        = "log tailing is turned off on this node (LATTICE_NO_LOG_TAIL)"
 )
 
 // logPathPolicy is the node's allowlist: absolute directory prefixes, each

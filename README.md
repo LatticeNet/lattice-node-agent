@@ -379,7 +379,11 @@ missing checksum manifest aborts the install before the binary is written.
 - `LATTICE_LOG_PATH_ALLOW=/opt/app/logs,/srv/logs` widens the directories the
   node tails logs from beyond `/var/log/`. The server keeps its own allowlist
   with the same variable name; a log source has to pass both, and nothing the
-  server sends widens the node's.
+  server sends widens the node's. A refused source shows on the node's loop
+  health under `log_sources`.
+- `LATTICE_NO_LOG_TAIL=1` turns log tailing off on the node: no assigned
+  source is tailed, and each is reported as refused. The variable fails
+  closed like `LATTICE_NO_BEACON`.
 - `LATTICE_SINGBOX_DISCOVER=1` and `LATTICE_SINGBOX_BIN=sb` enable sing-box
   discovery. `LATTICE_SINGBOX_META` overrides the design-15 sidecar path
   (default `/etc/sing-box/lattice-metadata.json`), which annotates each line

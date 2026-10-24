@@ -137,14 +137,17 @@ do
   fi
 done
 
-# The node's log allowlist is the node's own setting: the installer carries
-# it through the sudo re-exec, keeps it across a reinstall, and writes it for
-# both systemd and launchd.
+# The node's log allowlist and its log tail kill switch are the node's own
+# settings: the installer carries them through the sudo re-exec, keeps them
+# across a reinstall, and writes them for both systemd and launchd.
 for expected in \
   'LATTICE_LOG_PATH_ALLOW="${LATTICE_LOG_PATH_ALLOW:-}"' \
-  'LATTICE_SSH_ALERTS LATTICE_LOG_PATH_ALLOW' \
+  'LATTICE_NO_LOG_TAIL="${LATTICE_NO_LOG_TAIL:-}"' \
+  'LATTICE_SSH_ALERTS LATTICE_LOG_PATH_ALLOW LATTICE_NO_LOG_TAIL' \
   'LATTICE_LOG_PATH_ALLOW=$(quote_env "${LATTICE_LOG_PATH_ALLOW:-}")' \
-  '<key>LATTICE_LOG_PATH_ALLOW</key>'
+  'LATTICE_NO_LOG_TAIL=$(quote_env "${LATTICE_NO_LOG_TAIL:-0}")' \
+  '<key>LATTICE_LOG_PATH_ALLOW</key>' \
+  '<key>LATTICE_NO_LOG_TAIL</key>'
 do
   if ! grep -Fq "$expected" "$ROOT/scripts/install.sh"; then
     echo "installer log allowlist contract missing: $expected" >&2

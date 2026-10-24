@@ -13,6 +13,10 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
+// outsideAllowlist is the sentence an operator reads on the node's loop
+// health: what was refused, and the one setting that would let it through.
+const outsideAllowlist = "outside this node's log allowlist; widen it with LATTICE_LOG_PATH_ALLOW on the node"
+
 // The node tails only files under its own allowlist: /var/log/ unless the
 // node's configuration (-log-path-allow, LATTICE_LOG_PATH_ALLOW) widens it.
 // Nothing the server sends can widen it.
@@ -73,19 +77,19 @@ func TestLogPathPolicyRefusesWhatItCannotVouchFor(t *testing.T) {
 		t.Fatalf("a log that does not exist yet is judged when it appears, not refused: %v", err)
 	}
 	for path, reason := range map[string]string{
-		"singbox://legend-sg":                              "outside its log allowlist",
-		"singbox://../../etc/shadow":                       "outside its log allowlist",
-		"agent-debug://node-a":                             "outside its log allowlist",
-		"unknown://x":                                      "outside its log allowlist",
-		"relative.log":                                     "outside its log allowlist",
-		outside:                                            "outside its log allowlist",
-		filepath.Join(dir, "..", "secret"):                 "outside its log allowlist",
-		filepath.Join(dir, "link.log"):                     "outside its log allowlist",
+		"singbox://legend-sg":                              outsideAllowlist,
+		"singbox://../../etc/shadow":                       outsideAllowlist,
+		"agent-debug://node-a":                             outsideAllowlist,
+		"unknown://x":                                      outsideAllowlist,
+		"relative.log":                                     outsideAllowlist,
+		outside:                                            outsideAllowlist,
+		filepath.Join(dir, "..", "secret"):                 outsideAllowlist,
+		filepath.Join(dir, "link.log"):                     outsideAllowlist,
 		filepath.Join(dir, "sub.log"):                      "not a regular file",
 		filepath.Join(dir, "fifo.log"):                     "not a regular file",
-		filepath.Join(dir, "app.log") + "\x00x":            "outside its log allowlist",
-		"/var/log/../../etc/shadow":                        "outside its log allowlist",
-		filepath.Join(dir, "nested", "..", "..", "secret"): "outside its log allowlist",
+		filepath.Join(dir, "app.log") + "\x00x":            outsideAllowlist,
+		"/var/log/../../etc/shadow":                        outsideAllowlist,
+		filepath.Join(dir, "nested", "..", "..", "secret"): outsideAllowlist,
 	} {
 		err := p.check(path)
 		if !errors.Is(err, errLogPathRefused) || !strings.Contains(err.Error(), reason) {
@@ -174,7 +178,7 @@ func TestRefusedLogSourceIsReportedAndNotTailed(t *testing.T) {
 		{ID: "logsrc_bad", Path: outside},
 	})
 	err := m.refusals()
-	if err == nil || !strings.Contains(err.Error(), "refused by the node: outside its log allowlist") ||
+	if err == nil || !strings.Contains(err.Error(), "refused by the node: "+outsideAllowlist) ||
 		!strings.Contains(err.Error(), "logsrc_bad") || strings.Contains(err.Error(), "logsrc_ok") {
 		t.Fatalf("refusals() = %v, want only logsrc_bad named as refused", err)
 	}
@@ -188,5 +192,52 @@ func TestRefusedLogSourceIsReportedAndNotTailed(t *testing.T) {
 	m.reconcile([]model.LogSource{{ID: "logsrc_ok", Path: filepath.Join(dir, "app.log")}})
 	if err := m.refusals(); err != nil {
 		t.Fatalf("refusals() after the refused source went away = %v, want nil", err)
+	}
+}
+
+// -no-log-tail (LATTICE_NO_LOG_TAIL) is the node's kill switch: it tails no
+// source at all, whatever the server assigns, and says so for each one.
+func TestNoLogTailRefusesEverySource(t *testing.T) {
+	_, dir, _ := allowedDir(t)
+	m := newLogTailManager(agentConfig{NoLogTail: true, LogPathAllow: dir})
+	defer m.reconcile(nil)
+	m.reconcile([]model.LogSource{{ID: "logsrc_ok", Path: filepath.Join(dir, "app.log")}})
+	m.mu.Lock()
+	_, active := m.active["logsrc_ok"]
+	m.mu.Unlock()
+	if active {
+		t.Fatal("a source was tailed under -no-log-tail")
+	}
+	err := m.refusals()
+	if err == nil || !strings.Contains(err.Error(), "log tailing is turned off on this node") || !strings.Contains(err.Error(), "logsrc_ok") {
+		t.Fatalf("refusals() = %v, want logsrc_ok refused because tailing is off", err)
+	}
+}
+
+// Several refusals keep each actionable sentence in front of the sources it
+// covers, so the 200-rune loop health still says what to do.
+func TestLogRefusalsGroupByReason(t *testing.T) {
+	p, dir, outside := allowedDir(t)
+	if err := os.Mkdir(filepath.Join(dir, "sub.log"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	m := newLogTailManager(agentConfig{LogPathAllow: dir})
+	_ = p
+	defer m.reconcile(nil)
+	m.reconcile([]model.LogSource{
+		{ID: "logsrc_b", Path: outside},
+		{ID: "logsrc_a", Path: "/etc/shadow"},
+		{ID: "logsrc_c", Path: filepath.Join(dir, "sub.log")},
+	})
+	err := m.refusals()
+	if err == nil {
+		t.Fatal("no refusals reported")
+	}
+	got := err.Error()
+	if !strings.HasPrefix(got, "refused by the node: "+outsideAllowlist+": logsrc_a ") {
+		t.Fatalf("refusals() = %q, want the allowlist sentence first, then its sources by id", got)
+	}
+	if !strings.Contains(got, "logsrc_b") || !strings.Contains(got, "not a regular file: logsrc_c") {
+		t.Fatalf("refusals() = %q, want every refused source under its reason", got)
 	}
 }

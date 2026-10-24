@@ -121,6 +121,9 @@ type agentConfig struct {
 	// no update binary is downloaded before its task, and no kept download
 	// is removed, whatever the server names.
 	NoPrefetch bool
+	// NoLogTail is the node veto on log tailing: no log source is tailed,
+	// whatever the server assigns, and each is reported as refused.
+	NoLogTail bool
 	// Prefetch downloads the binary of this node's open agent update in the
 	// background; nil only in tests that build a bare config.
 	Prefetch            *prefetch.Prefetcher
@@ -266,6 +269,7 @@ func main() {
 	flag.BoolVar(&cfg.NoExec, "no-exec", os.Getenv("LATTICE_NO_EXEC") == "1", "disable all task execution (kill switch; overrides -allow-exec)")
 	flag.BoolVar(&cfg.NoBeacon, "no-beacon", envVeto("LATTICE_NO_BEACON"), "never open the measurement beacon's UDP socket, whatever the server configures (node veto; beacon checks from this node still run)")
 	flag.BoolVar(&cfg.NoPrefetch, "no-prefetch", envVeto("LATTICE_NO_PREFETCH"), "never download an agent update binary before its task runs, whatever the server names (node veto; the update task still downloads it)")
+	flag.BoolVar(&cfg.NoLogTail, "no-log-tail", envVeto("LATTICE_NO_LOG_TAIL"), "never tail a log file, whatever the server assigns (node veto; each assigned source is reported as refused)")
 	flag.StringVar(&cfg.TaskCgroupRoot, "task-cgroup-root", os.Getenv("LATTICE_TASK_CGROUP_ROOT"), "Linux cgroup v2 root for per-task caps; use \"auto\" for the agent service cgroup or leave empty to disable")
 	flag.StringVar(&cfg.TaskCgroupMemoryMax, "task-cgroup-memory-max", env("LATTICE_TASK_CGROUP_MEMORY_MAX", taskexec.DefaultCgroupMemoryMax), "memory.max value for per-task cgroups when -task-cgroup-root is set")
 	flag.StringVar(&cfg.TaskCgroupPidsMax, "task-cgroup-pids-max", env("LATTICE_TASK_CGROUP_PIDS_MAX", taskexec.DefaultCgroupPidsMax), "pids.max value for per-task cgroups when -task-cgroup-root is set")
@@ -502,6 +506,9 @@ func main() {
 	cfg.Prefetch = newPrefetcher(cfg, beat.nudgeNow)
 	if cfg.NoPrefetch {
 		log.Printf("prefetch: -no-prefetch set; update binaries are downloaded only by their tasks")
+	}
+	if cfg.NoLogTail {
+		log.Printf("log tail: -no-log-tail set; no log source is tailed, and each is reported as refused")
 	}
 	if agentCfg, err := fetchAgentConfig(cfg); err != nil {
 		debugf(cfg, "agent config fetch failed: %v", err)
