@@ -71,6 +71,17 @@ func newLogTailManager(cfg agentConfig) *logTailManager {
 	if slices.Contains(m.policy.allow, "/") {
 		log.Printf("log tail: warning: the allowlist holds \"/\", so the server may name any file this agent can read but the credential and audit logs under /var/log/")
 	}
+	var parents []string
+	for _, listed := range m.policy.allow {
+		for _, base := range m.policy.base {
+			if listed != "/" && listed != base && strings.HasPrefix(base, listed) && !slices.Contains(parents, listed) {
+				parents = append(parents, listed)
+			}
+		}
+	}
+	if len(parents) > 0 {
+		log.Printf("log tail: warning: the allowlist holds %q, a parent of /var/log/, so the server may name any file under it; the credential and audit logs under /var/log/ stay out", parents)
+	}
 	return m
 }
 

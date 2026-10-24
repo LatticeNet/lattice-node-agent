@@ -387,7 +387,9 @@ missing checksum manifest aborts the install before the binary is written.
   them lists the file itself or a directory inside `/var/log/` that holds it,
   for example `LATTICE_LOG_PATH_ALLOW=/var/log/auth.log` or
   `/var/log/audit`. Listing `/var/log/` itself, or a parent such as `/var/`,
-  restates the default and keeps them out. The
+  restates the default and keeps them out; a listed parent still takes in
+  everything else under it, and the agent warns at start when one is listed.
+  The
   server keeps its own allowlist
   with the same variable name; a log source has to pass both, and nothing the
   server sends widens the node's. A refused source shows on the node's loop
