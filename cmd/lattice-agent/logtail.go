@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -86,7 +88,7 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 	tailer := logtail.New(src.Path, src.MaxLineBytes)
 	defer tailer.Close()
 	ckptPath := m.checkpointPath(src.ID)
-	if off, inc, ok := loadLogCheckpoint(ckptPath); ok {
+	if off, inc, ok := loadLogCheckpoint(ckptPath, src.Path); ok {
 		tailer.Resume(off, inc)
 	}
 	batchLines := src.MaxBatchLines
@@ -155,7 +157,7 @@ func (m *logTailManager) run(ctx context.Context, src model.LogSource) {
 			pending = pending[n:]
 		}
 		if len(pending) == 0 {
-			saveLogCheckpoint(ckptPath, tailer.Offset(), tailer.Incarnation())
+			saveLogCheckpoint(ckptPath, src.Path, tailer.Offset(), tailer.Incarnation())
 		}
 	}
 }
@@ -169,7 +171,7 @@ var logSourceIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 // root, so an id that is not a plain file name gets no checkpoint rather than
 // a path outside the state directory; the source still tails from the end.
 func (m *logTailManager) checkpointPath(sourceID string) string {
-	dir := strings.TrimSpace(m.cfg.LogStateDir)
+	dir := strings.TrimSpace(m.snapshotConfig().LogStateDir)
 	if dir == "" {
 		return ""
 	}
@@ -180,7 +182,19 @@ func (m *logTailManager) checkpointPath(sourceID string) string {
 	return filepath.Join(dir, sourceID+".ckpt")
 }
 
-func loadLogCheckpoint(path string) (uint64, int, bool) {
+// checkpointBinding names the file a checkpoint measured. A checkpoint is
+// "offset:incarnation:binding"; one an older agent wrote has no binding and
+// still resumes its source.
+func checkpointBinding(sourcePath string) string {
+	sum := sha256.Sum256([]byte(sourcePath))
+	return hex.EncodeToString(sum[:8])
+}
+
+// loadLogCheckpoint resumes a source only from a checkpoint of the same file:
+// after the server changes a source's path under the same id, the old offset
+// says nothing about the new file, so the source starts from the end, like a
+// new one.
+func loadLogCheckpoint(path, sourcePath string) (uint64, int, bool) {
 	if path == "" {
 		return 0, 0, false
 	}
@@ -188,10 +202,18 @@ func loadLogCheckpoint(path string) (uint64, int, bool) {
 	if err != nil {
 		return 0, 0, false
 	}
-	return logtail.ParseCheckpoint(strings.TrimSpace(string(b)))
+	s := strings.TrimSpace(string(b))
+	if strings.Count(s, ":") == 2 {
+		i := strings.LastIndexByte(s, ':')
+		if s[i+1:] != checkpointBinding(sourcePath) {
+			return 0, 0, false
+		}
+		s = s[:i]
+	}
+	return logtail.ParseCheckpoint(s)
 }
 
-func saveLogCheckpoint(path string, offset uint64, incarnation int) {
+func saveLogCheckpoint(path, sourcePath string, offset uint64, incarnation int) {
 	if path == "" {
 		return
 	}
@@ -199,7 +221,8 @@ func saveLogCheckpoint(path string, offset uint64, incarnation int) {
 		return
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(logtail.CheckpointString(offset, incarnation)), 0o600); err != nil {
+	line := logtail.CheckpointString(offset, incarnation) + ":" + checkpointBinding(sourcePath)
+	if err := os.WriteFile(tmp, []byte(line), 0o600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, path)
