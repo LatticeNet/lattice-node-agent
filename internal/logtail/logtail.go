@@ -50,7 +50,7 @@ func (t *Tailer) Resume(offset uint64, incarnation int) {
 		// Past the end of any file: start it over, as for a checkpoint past EOF.
 		offset = 0
 	}
-	t.offset = int64(offset) // #nosec G115 -- the branch above keeps offset at or below MaxInt64
+	t.offset = int64(offset)
 	t.incarnation = incarnation
 	t.resumed = true
 	t.started = true
