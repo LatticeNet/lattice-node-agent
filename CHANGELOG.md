@@ -31,9 +31,9 @@ What changes on a node:
   destination_refused before anything is sent. A DoH request goes only to the
   judged addresses, through no proxy, and follows no redirect.
 - One query per run, with recursion desired and EDNS(0) at 1232 bytes, to the
-  first of the resolver's addresses that answers: over every transport, an
-  address that cannot be reached or stays silent passes the question to the
-  next within the timeout, and an answer, right or wrong, ends the run. The
+  first of the resolver's addresses that answers: an address that cannot be
+  reached passes the question to the next within the timeout, over UDP so
+  does one that stays silent, and an answer, right or wrong, ends the run. The
   check's timeout bounds the whole exchange, a DoH body over 64 KiB is refused
   unread, latency runs from the dial to the decoded answer, and a run
   cancelled at shutdown ends at once rather than at its timeout.
