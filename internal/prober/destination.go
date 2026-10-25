@@ -83,6 +83,23 @@ func asciiHost(host string) (string, error) {
 // net.Dialer gives each address of a serial fallback.
 const minDialSlice = 2 * time.Second
 
+// addrContext is the share of ctx's time one address gets while left
+// addresses, itself included, remain to be tried: an equal share of what is
+// left, at least minDialSlice (or all of it when less remains), and all of
+// it for the last address.
+func addrContext(ctx context.Context, left int) (context.Context, context.CancelFunc) {
+	if left > 1 {
+		if deadline, ok := ctx.Deadline(); ok {
+			slice := time.Until(deadline) / time.Duration(left)
+			if slice < minDialSlice {
+				slice = min(minDialSlice, time.Until(deadline))
+			}
+			return context.WithTimeout(ctx, slice)
+		}
+	}
+	return ctx, func() {}
+}
+
 // dialJudged connects over network (tcp or udp) to the first of addrs that
 // answers on port, in the order the resolver gave them, sharing the time
 // left between the addresses not yet tried as net.Dialer does. addrs are
@@ -93,16 +110,7 @@ func (p *prober) dialJudged(ctx context.Context, network string, addrs []netip.A
 	}
 	var firstErr error
 	for i, addr := range addrs {
-		dctx, cancel := ctx, context.CancelFunc(func() {})
-		if left := len(addrs) - i; left > 1 {
-			if deadline, ok := ctx.Deadline(); ok {
-				slice := time.Until(deadline) / time.Duration(left)
-				if slice < minDialSlice {
-					slice = min(minDialSlice, time.Until(deadline))
-				}
-				dctx, cancel = context.WithTimeout(ctx, slice)
-			}
-		}
+		dctx, cancel := addrContext(ctx, len(addrs)-i)
 		conn, err := p.dial(dctx, network, net.JoinHostPort(addr.String(), port))
 		cancel()
 		if err == nil {

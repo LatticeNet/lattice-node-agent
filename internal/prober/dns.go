@@ -489,12 +489,8 @@ func dnsStreamExchange(conn net.Conn, query []byte) ([]byte, error) {
 // redirect, the certificate verified against the host. A body over
 // model.MonitorDNSResponseMax is refused rather than read.
 func (p *prober) exchangeDoH(ctx context.Context, r model.DNSResolver, addrs []netip.Addr, query []byte, res *model.MonitorResult) ([]byte, error) {
-	transport := p.httpTransport(r.Host, addrs)
-	defer transport.CloseIdleConnections()
-	client := &http.Client{
-		Transport:     transport,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := p.dohClient(r.Host, addrs)
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.URL(), bytes.NewReader(query))
 	if err != nil {
 		return nil, err
@@ -535,6 +531,16 @@ func (p *prober) exchangeDoH(ctx context.Context, r model.DNSResolver, addrs []n
 		return nil, tooLarge
 	}
 	return body, nil
+}
+
+// dohClient is what a DoH exchange posts through: the http check's
+// transport, which dials only the judged addresses of host and takes no
+// proxy from the environment, and a redirect reported rather than followed.
+func (p *prober) dohClient(host string, addrs []netip.Addr) *http.Client {
+	return &http.Client{
+		Transport:     p.httpTransport(host, addrs),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // unwrapURLError drops the method and URL net/http puts before a request
