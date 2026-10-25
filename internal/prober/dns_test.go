@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -688,5 +689,121 @@ func TestDNSReportedValuesKeepTheirBound(t *testing.T) {
 	}
 	if got[1] != "ok" {
 		t.Fatalf("invalid bytes = %q", got[1])
+	}
+}
+
+// A DoH 3xx is the run's failure and is never followed, wherever it
+// points: loopback, a private range, the metadata service. Nothing reaches
+// the address it names.
+func TestDNSDoHRedirectIsReportedNotFollowed(t *testing.T) {
+	var landed atomic.Int32
+	inside := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { landed.Add(1) }))
+	t.Cleanup(inside.Close)
+	cert, roots, _ := testCert(t, testHost)
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		for _, location := range []string{inside.URL + "/dns-query", "http://10.0.0.5/dns-query", "http://169.254.169.254/latest/meta-data/"} {
+			doh := dohServer(t, cert, func(w http.ResponseWriter, _ dnsmessage.Message) {
+				w.Header().Set("Location", location)
+				w.WriteHeader(status)
+			})
+			p := dnsProber(t, nil, doh.Listener.Addr(), roots)
+			res := p.probe(context.Background(), dnsMonitor("https://"+testHost+"/dns-query"))
+			if res.Success || res.Reason != "" || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, "http status "+strconv.Itoa(status)) {
+				t.Fatalf("%d to %s: want a reported redirect, got %+v", status, location, res)
+			}
+		}
+	}
+	if n := landed.Load(); n != 0 {
+		t.Fatalf("a redirect was followed to loopback %d times", n)
+	}
+}
+
+// A proxy named in the environment is never used for DoH: the query goes
+// to the resolver's judged address and the proxy sees no connection.
+func TestDNSDoHIgnoresEnvironmentProxy(t *testing.T) {
+	proxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	var proxied atomic.Int32
+	go func() {
+		for {
+			conn, err := proxy.Accept()
+			if err != nil {
+				return
+			}
+			proxied.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
+		t.Setenv(name, "http://"+proxy.Addr().String())
+	}
+	cert, roots, _ := testCert(t, testHost)
+	doh := dohServer(t, cert, func(w http.ResponseWriter, q dnsmessage.Message) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(answerA("192.0.2.1")("tcp", q))
+	})
+	p := dnsProber(t, nil, doh.Listener.Addr(), roots)
+	// net/http reads the environment's proxy once per process, so the
+	// transport is checked as well as the run.
+	if tr, ok := p.dohClient(testHost, nil).Transport.(*http.Transport); !ok || tr.Proxy != nil {
+		t.Fatal("the DoH transport carries a proxy function")
+	}
+	res := p.probe(context.Background(), dnsMonitor("https://"+testHost+"/dns-query"))
+	if !res.Success {
+		t.Fatalf("DoH with a proxy in the environment: %+v", res)
+	}
+	if n := proxied.Load(); n != 0 {
+		t.Fatalf("the proxy saw %d connections", n)
+	}
+}
+
+// A DoH request leaves only for the resolver's host. A request for any
+// other host, which is what a followed redirect or a proxy would make, is
+// refused before anything is dialed.
+func TestDNSDoHDialsOnlyTheTarget(t *testing.T) {
+	p, _, d := fakeNetProber(nil)
+	client := p.dohClient(testHost, []netip.Addr{netip.MustParseAddr(testPublicAddr)})
+	for _, u := range []string{"https://other.example/dns-query", "https://127.0.0.1/dns-query", "http://169.254.169.254/latest/meta-data/"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		cancel()
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		var refused *destinationError
+		if !errors.As(err, &refused) {
+			t.Fatalf("%s: want destination refused, got %v", u, err)
+		}
+	}
+	if got := d.addresses(); len(got) != 0 {
+		t.Fatalf("a request for another host dialed %v", got)
+	}
+}
+
+// A resolver name with a private address among its public ones is refused
+// before any query, whichever order the addresses come in and over every
+// transport: one refused address refuses the run, and nothing is dialed.
+func TestDNSResolverWithOnePrivateAddressRefused(t *testing.T) {
+	for _, addrs := range [][]string{{testPublicAddr, "10.0.0.5"}, {"10.0.0.5", testPublicAddr}} {
+		for _, target := range []string{"udp://mixed.example", "tcp://mixed.example", "tls://mixed.example", "https://mixed.example/dns-query"} {
+			p, r, d := fakeNetProber(map[string][]string{"mixed.example": addrs})
+			res := p.probe(context.Background(), dnsMonitor(target))
+			if res.Reason != model.PathReasonDestinationRefused || res.Success || !strings.Contains(res.Error, "10.0.0.5") {
+				t.Fatalf("%s resolving to %v: %+v", target, addrs, res)
+			}
+			if got := d.addresses(); len(got) != 0 {
+				t.Fatalf("%s resolving to %v: dialed %v", target, addrs, got)
+			}
+			if !slices.Equal(r.lookups, []string{"mixed.example"}) {
+				t.Fatalf("%s: lookups %v, want one", target, r.lookups)
+			}
+		}
 	}
 }
