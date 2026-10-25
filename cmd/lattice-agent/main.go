@@ -783,7 +783,9 @@ func monitorChanged(a, b model.Monitor) bool {
 	return a.Type != b.Type || a.Target != b.Target || a.TargetNode != b.TargetNode ||
 		a.IntervalSec != b.IntervalSec || a.TimeoutSec != b.TimeoutSec ||
 		a.Packets != b.Packets || a.ExpectStatus != b.ExpectStatus ||
-		a.SecretsOrigin != b.SecretsOrigin || !slices.Equal(a.Headers, b.Headers)
+		a.SecretsOrigin != b.SecretsOrigin || !slices.Equal(a.Headers, b.Headers) ||
+		a.DNSName != b.DNSName || a.DNSType != b.DNSType || a.DNSExpectRcode != b.DNSExpectRcode ||
+		!slices.Equal(a.DNSExpect, b.DNSExpect)
 }
 
 // probe runs one probe and queues its result; flushLoop sends it, in a batch

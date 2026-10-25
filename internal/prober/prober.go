@@ -1,5 +1,6 @@
 // Package prober runs one monitor probe and returns a timed result: a TCP
-// connect, an HTTP GET or a run of ICMP echoes (design 29 M2a). Every kind
+// connect, an HTTP GET, a run of ICMP echoes (design 29 M2a) or one DNS
+// query over DoH, DoT, UDP or TCP (design 32 S5a). Every kind
 // resolves its target once, refuses private and local destinations unless
 // the control plane resolved a tcp or icmp target from a node, and dials
 // only an address it judged. A kind this agent does not run is reported with the
@@ -111,6 +112,9 @@ func (p *prober) probe(ctx context.Context, m model.Monitor) model.MonitorResult
 	case model.MonitorTypeICMP:
 		p.probeICMP(ctx, m, timeout, &res)
 		return res
+	case model.MonitorTypeDNS:
+		p.probeDNS(ctx, m, timeout, &res)
+		return res
 	default:
 		res.Reason = model.PathReasonAgentTooOld
 		res.Error = fmt.Sprintf("this agent does not run %q checks", m.Type)
@@ -146,7 +150,7 @@ func (p *prober) probeTCP(ctx context.Context, m model.Monitor, timeout time.Dur
 	if err != nil {
 		return err
 	}
-	conn, err := p.dialJudged(ctx, addrs, port)
+	conn, err := p.dialJudged(ctx, "tcp", addrs, port)
 	if err != nil {
 		return err
 	}
@@ -246,7 +250,7 @@ func (p *prober) httpTransport(host string, addrs []netip.Addr) *http.Transport 
 			if !strings.EqualFold(dialHost, host) {
 				return nil, &destinationError{msg: fmt.Sprintf("destination refused: a request left for %s, not the target", dialHost)}
 			}
-			return p.dialJudged(ctx, addrs, port)
+			return p.dialJudged(ctx, "tcp", addrs, port)
 		},
 		TLSClientConfig:        &tls.Config{RootCAs: p.rootCAs, MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2:      true,

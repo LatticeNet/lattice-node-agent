@@ -293,8 +293,8 @@ func TestICMPPermissionFallback(t *testing.T) {
 		if slices.Contains(methods, model.MonitorTypeICMP) || refusals[model.MonitorTypeICMP] != model.PathReasonICMPNotPermitted {
 			t.Fatalf("%v: refused run did not move icmp to refusals: methods %v refusals %v", refusal, methods, refusals)
 		}
-		if !slices.Equal(methods, []string{model.MonitorTypeHTTP, model.MonitorTypeTCP}) {
-			t.Fatalf("tcp and http always run: %v", methods)
+		if !slices.Equal(methods, []string{model.MonitorTypeDNS, model.MonitorTypeHTTP, model.MonitorTypeTCP}) {
+			t.Fatalf("dns, tcp and http always run: %v", methods)
 		}
 	}
 }
