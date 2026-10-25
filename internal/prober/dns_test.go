@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -688,5 +690,330 @@ func TestDNSReportedValuesKeepTheirBound(t *testing.T) {
 	}
 	if got[1] != "ok" {
 		t.Fatalf("invalid bytes = %q", got[1])
+	}
+}
+
+// A DoH 3xx is the run's failure and is never followed, wherever it
+// points: loopback, a private range, the metadata service. Nothing reaches
+// the address it names.
+func TestDNSDoHRedirectIsReportedNotFollowed(t *testing.T) {
+	var landed atomic.Int32
+	inside := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { landed.Add(1) }))
+	t.Cleanup(inside.Close)
+	cert, roots, _ := testCert(t, testHost)
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		for _, location := range []string{inside.URL + "/dns-query", "http://10.0.0.5/dns-query", "http://169.254.169.254/latest/meta-data/"} {
+			doh := dohServer(t, cert, func(w http.ResponseWriter, _ dnsmessage.Message) {
+				w.Header().Set("Location", location)
+				w.WriteHeader(status)
+			})
+			p := dnsProber(t, nil, doh.Listener.Addr(), roots)
+			res := p.probe(context.Background(), dnsMonitor("https://"+testHost+"/dns-query"))
+			if res.Success || res.Reason != "" || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, "http status "+strconv.Itoa(status)) {
+				t.Fatalf("%d to %s: want a reported redirect, got %+v", status, location, res)
+			}
+		}
+	}
+	if n := landed.Load(); n != 0 {
+		t.Fatalf("a redirect was followed to loopback %d times", n)
+	}
+}
+
+// A proxy named in the environment is never used for DoH: the query goes
+// to the resolver's judged address and the proxy sees no connection.
+func TestDNSDoHIgnoresEnvironmentProxy(t *testing.T) {
+	proxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
+	var proxied atomic.Int32
+	go func() {
+		for {
+			conn, err := proxy.Accept()
+			if err != nil {
+				return
+			}
+			proxied.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
+		t.Setenv(name, "http://"+proxy.Addr().String())
+	}
+	cert, roots, _ := testCert(t, testHost)
+	doh := dohServer(t, cert, func(w http.ResponseWriter, q dnsmessage.Message) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(answerA("192.0.2.1")("tcp", q))
+	})
+	p := dnsProber(t, nil, doh.Listener.Addr(), roots)
+	// net/http reads the environment's proxy once per process, so the
+	// transport is checked as well as the run.
+	if tr, ok := p.dohClient(testHost, nil).Transport.(*http.Transport); !ok || tr.Proxy != nil {
+		t.Fatal("the DoH transport carries a proxy function")
+	}
+	res := p.probe(context.Background(), dnsMonitor("https://"+testHost+"/dns-query"))
+	if !res.Success {
+		t.Fatalf("DoH with a proxy in the environment: %+v", res)
+	}
+	if n := proxied.Load(); n != 0 {
+		t.Fatalf("the proxy saw %d connections", n)
+	}
+}
+
+// A DoH request leaves only for the resolver's host. A request for any
+// other host, which is what a followed redirect or a proxy would make, is
+// refused before anything is dialed.
+func TestDNSDoHDialsOnlyTheTarget(t *testing.T) {
+	p, _, d := fakeNetProber(nil)
+	client := p.dohClient(testHost, []netip.Addr{netip.MustParseAddr(testPublicAddr)})
+	for _, u := range []string{"https://other.example/dns-query", "https://127.0.0.1/dns-query", "http://169.254.169.254/latest/meta-data/"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		cancel()
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		var refused *destinationError
+		if !errors.As(err, &refused) {
+			t.Fatalf("%s: want destination refused, got %v", u, err)
+		}
+	}
+	if got := d.addresses(); len(got) != 0 {
+		t.Fatalf("a request for another host dialed %v", got)
+	}
+}
+
+// A resolver name with a private address among its public ones is refused
+// before any query, whichever order the addresses come in and over every
+// transport: one refused address refuses the run, and nothing is dialed.
+func TestDNSResolverWithOnePrivateAddressRefused(t *testing.T) {
+	for _, addrs := range [][]string{{testPublicAddr, "10.0.0.5"}, {"10.0.0.5", testPublicAddr}} {
+		for _, target := range []string{"udp://mixed.example", "tcp://mixed.example", "tls://mixed.example", "https://mixed.example/dns-query"} {
+			p, r, d := fakeNetProber(map[string][]string{"mixed.example": addrs})
+			res := p.probe(context.Background(), dnsMonitor(target))
+			if res.Reason != model.PathReasonDestinationRefused || res.Success || !strings.Contains(res.Error, "10.0.0.5") {
+				t.Fatalf("%s resolving to %v: %+v", target, addrs, res)
+			}
+			if got := d.addresses(); len(got) != 0 {
+				t.Fatalf("%s resolving to %v: dialed %v", target, addrs, got)
+			}
+			if !slices.Equal(r.lookups, []string{"mixed.example"}) {
+				t.Fatalf("%s: lookups %v, want one", target, r.lookups)
+			}
+		}
+	}
+}
+
+// Text the resolver chooses reaches a result's error only in short pieces:
+// a content type, a certificate's names, an HTTP response it garbles. The
+// error is shipped from every node and stored, so its size is the agent's
+// to bound.
+func TestDNSResolverTextInErrorsIsBounded(t *testing.T) {
+	long := strings.Repeat("a", 60<<10)
+	var names []string
+	for i := range 200 {
+		names = append(names, fmt.Sprintf("%s%d.example", strings.Repeat("n", 50), i))
+	}
+	many, manyRoots, _ := testCert(t, names...)
+	cert, roots, _ := testCert(t, testHost)
+	contentType := func(value string) *httptest.Server {
+		return dohServer(t, cert, func(w http.ResponseWriter, q dnsmessage.Message) {
+			w.Header().Set("Content-Type", value)
+			_, _ = w.Write(answerA("192.0.2.1")("tcp", q))
+		})
+	}
+	garbled, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = garbled.Close() })
+	go func() {
+		for {
+			conn, err := garbled.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = conn.Read(make([]byte, 4096))
+				_, _ = io.WriteString(conn, "XTTP/"+long[:8<<10]+"\r\n\r\n")
+			}()
+		}
+	}()
+	dot := newDNSStub(t, &tls.Config{Certificates: []tls.Certificate{many}}, answerA("192.0.2.1"))
+	manyDoH := dohServer(t, many, func(http.ResponseWriter, dnsmessage.Message) {})
+	doh := "https://" + testHost + "/dns-query"
+	for name, tc := range map[string]struct {
+		p      *prober
+		target string
+		want   string
+	}{
+		"long media type":    {dnsProber(t, nil, contentType(long).Listener.Addr(), roots), doh, "content type"},
+		"long parameter":     {dnsProber(t, nil, contentType("text/html; x="+long).Listener.Addr(), roots), doh, `"text/html"`},
+		"dot cert names":     {dnsProber(t, nil, dot.tcp.Addr(), manyRoots), "tls://" + testHost, "does not cover " + testHost},
+		"doh cert names":     {dnsProber(t, nil, manyDoH.Listener.Addr(), manyRoots), doh, "does not cover " + testHost},
+		"garbled http reply": {dnsProber(t, nil, garbled.Addr(), roots), doh, "XTTP/"},
+	} {
+		res := tc.p.probe(context.Background(), dnsMonitor(tc.target))
+		if res.Success || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, tc.want) {
+			t.Fatalf("%s: %+v", name, res)
+		}
+		if len(res.Error) > dnsErrorMax || !utf8.ValidString(res.Error) ||
+			strings.Contains(res.Error, strings.Repeat("a", dnsDetailMax+1)) || strings.Contains(res.Error, strings.Repeat("n", dnsQuotedMax+1)) {
+			t.Fatalf("%s: error of %d bytes carries the resolver's text unbounded: %.300q", name, len(res.Error), res.Error)
+		}
+	}
+}
+
+// testFirstAddr is the address twoAddrProber gives a resolver ahead of
+// testPublicAddr.
+const testFirstAddr = "203.0.113.81"
+
+// twoAddrProber resolves testHost to testFirstAddr, then testPublicAddr,
+// and carries a dial to each to its stub's socket of the same network. A
+// nil stub refuses the dial, as a host without a route to that address's
+// family does. dialed lists "network address" per dial, in order.
+func twoAddrProber(t *testing.T, first, second *dnsStub) (p *prober, dialed func() []string) {
+	t.Helper()
+	real := &net.Dialer{}
+	stubs := map[string]*dnsStub{testFirstAddr: first, testPublicAddr: second}
+	var mu sync.Mutex
+	var log []string
+	p = newProber()
+	p.resolver = &fakeResolver{answers: map[string][]string{testHost: {testFirstAddr, testPublicAddr}}}
+	p.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		stub, ok := stubs[host]
+		if err != nil || !ok {
+			return nil, fmt.Errorf("test dialer: unexpected address %s", address)
+		}
+		mu.Lock()
+		log = append(log, network+" "+host)
+		mu.Unlock()
+		switch {
+		case stub == nil:
+			return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("network is unreachable")}
+		case network == "udp":
+			return real.DialContext(ctx, network, stub.udp.LocalAddr().String())
+		}
+		return real.DialContext(ctx, network, stub.tcp.Addr().String())
+	}
+	return p, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(log)
+	}
+}
+
+// UDP asks the resolver's next address when one cannot be reached or stays
+// silent, within the run's timeout, as TCP, DoT and DoH do. An answer, even
+// a wrong one, ends the run at that address, and a truncated answer is
+// asked again over TCP of the address that sent it.
+func TestDNSUDPTriesTheNextAddress(t *testing.T) {
+	good := newDNSStub(t, nil, answerA("192.0.2.1"))
+	silent := newDNSStub(t, nil, func(string, dnsmessage.Message) []byte { return nil })
+	t.Run("unreachable", func(t *testing.T) {
+		p, dialed := twoAddrProber(t, nil, good)
+		res := p.probe(context.Background(), dnsMonitor("udp://"+testHost))
+		if !res.Success {
+			t.Fatalf("first address unreachable: %+v", res)
+		}
+		if got, want := dialed(), []string{"udp " + testFirstAddr, "udp " + testPublicAddr}; !slices.Equal(got, want) {
+			t.Fatalf("dialed %v, want %v", got, want)
+		}
+	})
+	t.Run("silent", func(t *testing.T) {
+		p, _ := twoAddrProber(t, silent, good)
+		m := dnsMonitor("udp://" + testHost)
+		m.TimeoutSec = 4
+		before := silent.queries.Load()
+		start := time.Now()
+		res := p.probe(context.Background(), m)
+		if took := time.Since(start); !res.Success || took > 4*time.Second {
+			t.Fatalf("first address silent: %+v after %s", res, took)
+		}
+		if silent.queries.Load() == before {
+			t.Fatal("the first address was never asked")
+		}
+	})
+	t.Run("wrong answer", func(t *testing.T) {
+		wrong := newDNSStub(t, nil, answerA("192.0.2.9"))
+		second := newDNSStub(t, nil, answerA("192.0.2.1"))
+		p, _ := twoAddrProber(t, wrong, second)
+		m := dnsMonitor("udp://" + testHost)
+		m.DNSExpect = []string{"192.0.2.1"}
+		res := p.probe(context.Background(), m)
+		if res.Success || failureCode(res) != model.DNSFailureMismatch {
+			t.Fatalf("a wrong answer from the first address: %+v", res)
+		}
+		if n := second.queries.Load(); n != 0 {
+			t.Fatalf("a wrong answer passed the question on; the second address was asked %d times", n)
+		}
+	})
+	t.Run("truncated", func(t *testing.T) {
+		truncating := newDNSStub(t, nil, func(network string, q dnsmessage.Message) []byte {
+			if network == "udp" {
+				return dnsReply(q, dnsmessage.RCodeSuccess, true)
+			}
+			return answerA("192.0.2.1")(network, q)
+		})
+		p, dialed := twoAddrProber(t, silent, truncating)
+		m := dnsMonitor("udp://" + testHost)
+		m.TimeoutSec = 4
+		res := p.probe(context.Background(), m)
+		if !res.Success {
+			t.Fatalf("truncated answer from the second address: %+v", res)
+		}
+		got := dialed()
+		if !slices.Contains(got, "tcp "+testPublicAddr) || slices.Contains(got, "tcp "+testFirstAddr) {
+			t.Fatalf("the TCP retry did not go to the address that answered: %v", got)
+		}
+	})
+}
+
+// Cancelling a run wakes a read in progress over UDP, TCP, DoT and DoH, so
+// a shutdown does not wait out the check's timeout, and the result says
+// the run was cancelled rather than timed out.
+func TestDNSCancelEndsTheRun(t *testing.T) {
+	release := make(chan struct{})
+	hold := func(string, dnsmessage.Message) []byte {
+		<-release
+		return nil
+	}
+	plain := newDNSStub(t, nil, hold)
+	cert, roots, _ := testCert(t, testHost)
+	dot := newDNSStub(t, &tls.Config{Certificates: []tls.Certificate{cert}}, hold)
+	doh := dohServer(t, cert, func(http.ResponseWriter, dnsmessage.Message) { <-release })
+	// Registered after the servers, so it runs before they wait for their
+	// handlers to return.
+	t.Cleanup(func() { close(release) })
+	for name, tc := range map[string]struct {
+		p      *prober
+		target string
+	}{
+		"udp": {dnsProber(t, plain.udp.LocalAddr(), plain.tcp.Addr(), nil), "udp://" + testHost},
+		"tcp": {dnsProber(t, plain.udp.LocalAddr(), plain.tcp.Addr(), nil), "tcp://" + testHost},
+		"dot": {dnsProber(t, nil, dot.tcp.Addr(), roots), "tls://" + testHost},
+		"doh": {dnsProber(t, nil, doh.Listener.Addr(), roots), "https://" + testHost + "/dns-query"},
+	} {
+		m := dnsMonitor(tc.target)
+		m.TimeoutSec = 20
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(200*time.Millisecond, cancel)
+		start := time.Now()
+		res := tc.p.probe(ctx, m)
+		took := time.Since(start)
+		cancel()
+		if took > 2*time.Second {
+			t.Fatalf("%s: a run cancelled after 200 ms took %s", name, took)
+		}
+		if res.Success || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, "cancelled") {
+			t.Fatalf("%s: cancelled run: %+v", name, res)
+		}
 	}
 }
