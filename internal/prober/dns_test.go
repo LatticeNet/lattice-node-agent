@@ -807,3 +807,64 @@ func TestDNSResolverWithOnePrivateAddressRefused(t *testing.T) {
 		}
 	}
 }
+
+// Text the resolver chooses reaches a result's error only in short pieces:
+// a content type, a certificate's names, an HTTP response it garbles. The
+// error is shipped from every node and stored, so its size is the agent's
+// to bound.
+func TestDNSResolverTextInErrorsIsBounded(t *testing.T) {
+	long := strings.Repeat("a", 60<<10)
+	var names []string
+	for i := range 200 {
+		names = append(names, fmt.Sprintf("%s%d.example", strings.Repeat("n", 50), i))
+	}
+	many, manyRoots, _ := testCert(t, names...)
+	cert, roots, _ := testCert(t, testHost)
+	contentType := func(value string) *httptest.Server {
+		return dohServer(t, cert, func(w http.ResponseWriter, q dnsmessage.Message) {
+			w.Header().Set("Content-Type", value)
+			_, _ = w.Write(answerA("192.0.2.1")("tcp", q))
+		})
+	}
+	garbled, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = garbled.Close() })
+	go func() {
+		for {
+			conn, err := garbled.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = conn.Read(make([]byte, 4096))
+				_, _ = io.WriteString(conn, "XTTP/"+long[:8<<10]+"\r\n\r\n")
+			}()
+		}
+	}()
+	dot := newDNSStub(t, &tls.Config{Certificates: []tls.Certificate{many}}, answerA("192.0.2.1"))
+	manyDoH := dohServer(t, many, func(http.ResponseWriter, dnsmessage.Message) {})
+	doh := "https://" + testHost + "/dns-query"
+	for name, tc := range map[string]struct {
+		p      *prober
+		target string
+		want   string
+	}{
+		"long media type":    {dnsProber(t, nil, contentType(long).Listener.Addr(), roots), doh, "content type"},
+		"long parameter":     {dnsProber(t, nil, contentType("text/html; x="+long).Listener.Addr(), roots), doh, `"text/html"`},
+		"dot cert names":     {dnsProber(t, nil, dot.tcp.Addr(), manyRoots), "tls://" + testHost, "does not cover " + testHost},
+		"doh cert names":     {dnsProber(t, nil, manyDoH.Listener.Addr(), manyRoots), doh, "does not cover " + testHost},
+		"garbled http reply": {dnsProber(t, nil, garbled.Addr(), roots), doh, "XTTP/"},
+	} {
+		res := tc.p.probe(context.Background(), dnsMonitor(tc.target))
+		if res.Success || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, tc.want) {
+			t.Fatalf("%s: %+v", name, res)
+		}
+		if len(res.Error) > dnsErrorMax || !utf8.ValidString(res.Error) ||
+			strings.Contains(res.Error, strings.Repeat("a", dnsDetailMax+1)) || strings.Contains(res.Error, strings.Repeat("n", dnsQuotedMax+1)) {
+			t.Fatalf("%s: error of %d bytes carries the resolver's text unbounded: %.300q", name, len(res.Error), res.Error)
+		}
+	}
+}

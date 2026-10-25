@@ -87,6 +87,30 @@ func dnsQuestionOf(m model.Monitor) (dnsQuestion, error) {
 	return q, nil
 }
 
+// Bounds on the text a result's error takes from the resolver's side: a
+// header value or certificate name is quoted at most dnsQuotedMax bytes, a
+// transport error (which can quote the resolver's bytes) at most
+// dnsDetailMax, and the whole error at most dnsErrorMax, the server's bound
+// on a stored error, so a node never sends text the server would cut.
+const (
+	dnsQuotedMax = 64
+	dnsDetailMax = 160
+	dnsErrorMax  = 512
+)
+
+// cutUTF8 is s with invalid UTF-8 dropped, cut to at most n bytes at a
+// character boundary.
+func cutUTF8(s string, n int) string {
+	s = strings.ToValidUTF8(s, "")
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
 // dnsFailure is a run that failed with a model.DNSFailure* code.
 type dnsFailure struct {
 	code string
@@ -103,7 +127,42 @@ func dnsTransportError(err error) *dnsFailure {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || isTimeout(err) {
 		return &dnsFailure{code: model.DNSFailureTransport, msg: "no answer before the check's timeout"}
 	}
-	return &dnsFailure{code: model.DNSFailureTransport, msg: err.Error()}
+	return &dnsFailure{code: model.DNSFailureTransport, msg: cutUTF8(err.Error(), dnsDetailMax)}
+}
+
+// dnsCertNamesShown is how many of a certificate's names a failure lists.
+const dnsCertNamesShown = 3
+
+// dnsTLSFailure names a refused handshake. A certificate's names are the
+// resolver's to choose, so a few are listed, each cut short.
+func dnsTLSFailure(err error) *dnsFailure {
+	var hostErr x509.HostnameError
+	var authErr x509.UnknownAuthorityError
+	var msg string
+	switch {
+	case errors.As(err, &hostErr) && hostErr.Certificate != nil:
+		msg = fmt.Sprintf("the certificate does not cover %s (it names %s)", hostErr.Host, dnsCertNames(hostErr.Certificate))
+	case errors.As(err, &authErr):
+		msg = "the certificate is signed by an unknown authority"
+	default:
+		msg = cutUTF8(strings.TrimPrefix(err.Error(), "tls: "), dnsDetailMax)
+	}
+	return &dnsFailure{code: model.DNSFailureTransport, msg: "tls: " + msg}
+}
+
+func dnsCertNames(c *x509.Certificate) string {
+	if len(c.DNSNames) == 0 {
+		return "no DNS names"
+	}
+	shown := make([]string, 0, dnsCertNamesShown)
+	for _, name := range c.DNSNames[:min(len(c.DNSNames), dnsCertNamesShown)] {
+		shown = append(shown, cutUTF8(name, dnsQuotedMax))
+	}
+	out := strings.Join(shown, ", ")
+	if more := len(c.DNSNames) - len(shown); more > 0 {
+		out += fmt.Sprintf(" and %d more", more)
+	}
+	return out
 }
 
 func isTimeout(err error) bool {
@@ -120,6 +179,7 @@ type dnsAnswer struct {
 }
 
 func (p *prober) probeDNS(ctx context.Context, m model.Monitor, timeout time.Duration, res *model.MonitorResult) {
+	defer func() { res.Error = cutUTF8(res.Error, dnsErrorMax) }()
 	resolver, err := model.ParseDNSResolver(m.Target)
 	if err != nil {
 		res.Error = err.Error()
@@ -237,15 +297,7 @@ func dnsReported(values []string) []string {
 	}
 	out := make([]string, 0, min(len(values), model.MonitorDNSAnswersMax))
 	for _, v := range values[:min(len(values), model.MonitorDNSAnswersMax)] {
-		v = strings.ToValidUTF8(v, "")
-		if len(v) > model.MonitorDNSValueMax {
-			cut := model.MonitorDNSValueMax
-			for cut > 0 && !utf8.RuneStart(v[cut]) {
-				cut--
-			}
-			v = v[:cut]
-		}
-		out = append(out, v)
+		out = append(out, cutUTF8(v, model.MonitorDNSValueMax))
 	}
 	return out
 }
@@ -457,7 +509,7 @@ func (p *prober) exchangeDoT(ctx context.Context, r model.DNSResolver, addrs []n
 		if ctx.Err() != nil || isTimeout(err) {
 			return nil, err
 		}
-		return nil, &dnsFailure{code: model.DNSFailureTransport, msg: "tls: " + strings.TrimPrefix(err.Error(), "tls: ")}
+		return nil, dnsTLSFailure(err)
 	}
 	recordCert(conn.ConnectionState().PeerCertificates, res)
 	return dnsStreamExchange(conn, query)
@@ -505,7 +557,7 @@ func (p *prober) exchangeDoH(ctx context.Context, r model.DNSResolver, addrs []n
 		}
 		var cert *tls.CertificateVerificationError
 		if errors.As(err, &cert) {
-			return nil, &dnsFailure{code: model.DNSFailureTransport, msg: "tls: " + cert.Err.Error()}
+			return nil, dnsTLSFailure(cert)
 		}
 		return nil, unwrapURLError(err)
 	}
@@ -516,8 +568,18 @@ func (p *prober) exchangeDoH(ctx context.Context, r model.DNSResolver, addrs []n
 	if resp.StatusCode != http.StatusOK {
 		return nil, &dnsFailure{code: model.DNSFailureTransport, msg: fmt.Sprintf("http status %d", resp.StatusCode)}
 	}
-	if media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); media != dnsMediaType {
-		return nil, &dnsFailure{code: model.DNSFailureTransport, msg: fmt.Sprintf("http 200 with content type %q, not %s", resp.Header.Get("Content-Type"), dnsMediaType)}
+	// Only the parsed media type is named, cut short: the header is the
+	// resolver's text, up to the transport's 64 KiB header bound.
+	header := resp.Header.Get("Content-Type")
+	if media, _, _ := mime.ParseMediaType(header); media != dnsMediaType {
+		got := "no content type"
+		switch {
+		case media != "":
+			got = fmt.Sprintf("content type %q", cutUTF8(media, dnsQuotedMax))
+		case header != "":
+			got = "a content type that does not parse"
+		}
+		return nil, &dnsFailure{code: model.DNSFailureTransport, msg: fmt.Sprintf("http 200 with %s, not %s", got, dnsMediaType)}
 	}
 	tooLarge := &dnsFailure{code: model.DNSFailureTransport, msg: fmt.Sprintf("the response is over %d KiB", model.MonitorDNSResponseMax>>10)}
 	if resp.ContentLength > model.MonitorDNSResponseMax {
