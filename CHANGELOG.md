@@ -24,20 +24,27 @@ What changes on a node:
   https:// posts application/dns-message (RFC 8484), tls:// frames the message
   behind a two-byte length inside TLS (RFC 7858, port 853 by default), and
   udp:// and tcp:// are plain DNS (port 53). A truncated UDP answer is asked
-  again once over TCP.
+  again once over TCP, of the address that sent it.
 - The resolver's host is resolved once and every address judged by the rule
   http and tcp checks follow, so a resolver that resolves to a loopback,
   link-local, metadata, multicast or private address is refused with
   destination_refused before anything is sent. A DoH request goes only to the
   judged addresses, through no proxy, and follows no redirect.
-- One query per run, with recursion desired and EDNS(0) at 1232 bytes. The
+- One query per run, with recursion desired and EDNS(0) at 1232 bytes, to the
+  first of the resolver's addresses that answers: over every transport, an
+  address that cannot be reached or stays silent passes the question to the
+  next within the timeout, and an answer, right or wrong, ends the run. The
   check's timeout bounds the whole exchange, a DoH body over 64 KiB is refused
-  unread, and latency runs from the dial to the decoded answer.
+  unread, latency runs from the dial to the decoded answer, and a run
+  cancelled at shutdown ends at once rather than at its timeout.
 - DoH and DoT verify the resolver's certificate against its host name and
   report its expiry, which the control plane lists under Upcoming.
 - A failed run's error starts with dns_rcode, dns_mismatch, dns_no_answer or
   dns_transport, and the result carries the response code and at most 16
-  answers of at most 255 bytes.
+  answers of at most 255 bytes. The error is at most 512 bytes and quotes the
+  resolver's own text only in short pieces: a content type of at most 64
+  bytes, at most three certificate names of 64 bytes each, a transport error
+  of at most 160 bytes.
 
 ## 0.3.10-alpha.9 (2026-10-24)
 
