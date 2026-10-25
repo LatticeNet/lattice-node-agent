@@ -5,6 +5,40 @@ is the constant in `cmd/lattice-agent/main.go`, prepared for the next tag but
 not yet tagged; the release workflow injects the tag at build time and must
 match it.
 
+## 0.3.10-alpha.10 (unreleased)
+
+Design 32 S5a: the agent runs dns checks, which ask one resolver one question
+from each source and judge the answer. This is the acceptance probe for an
+encrypted resolver: one check definition from several vantage points, every
+five minutes, judged on the answer and timed per source. Pins the lattice-sdk
+commit that models the method (lattice-sdk #45); between the alpha.9 pin and
+it the SDK adds types the agent does not read and omits zero times from task
+records it sends, which every server reads as before. No compatibility floor
+moves: a server before S5a drops dns from the agent's probe methods and never
+hands it a dns check, and a source on alpha.9 or older reads agent_too_old for
+a dns check until it updates through its own approval.
+
+What changes on a node:
+
+- dns appears in probe_methods. The check's target scheme picks the transport:
+  https:// posts application/dns-message (RFC 8484), tls:// frames the message
+  behind a two-byte length inside TLS (RFC 7858, port 853 by default), and
+  udp:// and tcp:// are plain DNS (port 53). A truncated UDP answer is asked
+  again once over TCP.
+- The resolver's host is resolved once and every address judged by the rule
+  http and tcp checks follow, so a resolver that resolves to a loopback,
+  link-local, metadata, multicast or private address is refused with
+  destination_refused before anything is sent. A DoH request goes only to the
+  judged addresses, through no proxy, and follows no redirect.
+- One query per run, with recursion desired and EDNS(0) at 1232 bytes. The
+  check's timeout bounds the whole exchange, a DoH body over 64 KiB is refused
+  unread, and latency runs from the dial to the decoded answer.
+- DoH and DoT verify the resolver's certificate against its host name and
+  report its expiry, which the control plane lists under Upcoming.
+- A failed run's error starts with dns_rcode, dns_mismatch, dns_no_answer or
+  dns_transport, and the result carries the response code and at most 16
+  answers of at most 255 bytes.
+
 ## 0.3.10-alpha.9 (2026-10-24)
 
 Security hardening found when CI's gosec step, which had been scanning no
