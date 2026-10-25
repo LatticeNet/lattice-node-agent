@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -867,4 +868,110 @@ func TestDNSResolverTextInErrorsIsBounded(t *testing.T) {
 			t.Fatalf("%s: error of %d bytes carries the resolver's text unbounded: %.300q", name, len(res.Error), res.Error)
 		}
 	}
+}
+
+// testFirstAddr is the address twoAddrProber gives a resolver ahead of
+// testPublicAddr.
+const testFirstAddr = "203.0.113.81"
+
+// twoAddrProber resolves testHost to testFirstAddr, then testPublicAddr,
+// and carries a dial to each to its stub's socket of the same network. A
+// nil stub refuses the dial, as a host without a route to that address's
+// family does. dialed lists "network address" per dial, in order.
+func twoAddrProber(t *testing.T, first, second *dnsStub) (p *prober, dialed func() []string) {
+	t.Helper()
+	real := &net.Dialer{}
+	stubs := map[string]*dnsStub{testFirstAddr: first, testPublicAddr: second}
+	var mu sync.Mutex
+	var log []string
+	p = newProber()
+	p.resolver = &fakeResolver{answers: map[string][]string{testHost: {testFirstAddr, testPublicAddr}}}
+	p.dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		stub, ok := stubs[host]
+		if err != nil || !ok {
+			return nil, fmt.Errorf("test dialer: unexpected address %s", address)
+		}
+		mu.Lock()
+		log = append(log, network+" "+host)
+		mu.Unlock()
+		switch {
+		case stub == nil:
+			return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("network is unreachable")}
+		case network == "udp":
+			return real.DialContext(ctx, network, stub.udp.LocalAddr().String())
+		}
+		return real.DialContext(ctx, network, stub.tcp.Addr().String())
+	}
+	return p, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(log)
+	}
+}
+
+// UDP asks the resolver's next address when one cannot be reached or stays
+// silent, within the run's timeout, as TCP, DoT and DoH do. An answer, even
+// a wrong one, ends the run at that address, and a truncated answer is
+// asked again over TCP of the address that sent it.
+func TestDNSUDPTriesTheNextAddress(t *testing.T) {
+	good := newDNSStub(t, nil, answerA("192.0.2.1"))
+	silent := newDNSStub(t, nil, func(string, dnsmessage.Message) []byte { return nil })
+	t.Run("unreachable", func(t *testing.T) {
+		p, dialed := twoAddrProber(t, nil, good)
+		res := p.probe(context.Background(), dnsMonitor("udp://"+testHost))
+		if !res.Success {
+			t.Fatalf("first address unreachable: %+v", res)
+		}
+		if got, want := dialed(), []string{"udp " + testFirstAddr, "udp " + testPublicAddr}; !slices.Equal(got, want) {
+			t.Fatalf("dialed %v, want %v", got, want)
+		}
+	})
+	t.Run("silent", func(t *testing.T) {
+		p, _ := twoAddrProber(t, silent, good)
+		m := dnsMonitor("udp://" + testHost)
+		m.TimeoutSec = 4
+		before := silent.queries.Load()
+		start := time.Now()
+		res := p.probe(context.Background(), m)
+		if took := time.Since(start); !res.Success || took > 4*time.Second {
+			t.Fatalf("first address silent: %+v after %s", res, took)
+		}
+		if silent.queries.Load() == before {
+			t.Fatal("the first address was never asked")
+		}
+	})
+	t.Run("wrong answer", func(t *testing.T) {
+		wrong := newDNSStub(t, nil, answerA("192.0.2.9"))
+		second := newDNSStub(t, nil, answerA("192.0.2.1"))
+		p, _ := twoAddrProber(t, wrong, second)
+		m := dnsMonitor("udp://" + testHost)
+		m.DNSExpect = []string{"192.0.2.1"}
+		res := p.probe(context.Background(), m)
+		if res.Success || failureCode(res) != model.DNSFailureMismatch {
+			t.Fatalf("a wrong answer from the first address: %+v", res)
+		}
+		if n := second.queries.Load(); n != 0 {
+			t.Fatalf("a wrong answer passed the question on; the second address was asked %d times", n)
+		}
+	})
+	t.Run("truncated", func(t *testing.T) {
+		truncating := newDNSStub(t, nil, func(network string, q dnsmessage.Message) []byte {
+			if network == "udp" {
+				return dnsReply(q, dnsmessage.RCodeSuccess, true)
+			}
+			return answerA("192.0.2.1")(network, q)
+		})
+		p, dialed := twoAddrProber(t, silent, truncating)
+		m := dnsMonitor("udp://" + testHost)
+		m.TimeoutSec = 4
+		res := p.probe(context.Background(), m)
+		if !res.Success {
+			t.Fatalf("truncated answer from the second address: %+v", res)
+		}
+		got := dialed()
+		if !slices.Contains(got, "tcp "+testPublicAddr) || slices.Contains(got, "tcp "+testFirstAddr) {
+			t.Fatalf("the TCP retry did not go to the address that answered: %v", got)
+		}
+	})
 }

@@ -29,9 +29,11 @@ import (
 // 8484, a POST of application/dns-message), DoT (RFC 7858, the message
 // behind a two-byte length over TLS), or plain DNS over UDP or TCP. A run
 // resolves the resolver's host once and judges every address as every
-// other kind does, sends one query, asks once more over TCP only when a
-// UDP answer comes back truncated, and judges the answer against the
-// check's expectation. The timeout bounds the whole exchange.
+// other kind does, sends the query to the first address that answers (one
+// that cannot be reached or stays silent passes it to the next), asks once
+// more over TCP only when a UDP answer comes back truncated, and judges the
+// answer against the check's expectation. The timeout bounds the whole
+// exchange.
 
 // dnsUDPPayload is the EDNS(0) payload size a query advertises, the size
 // DNS Flag Day 2020 settled on to avoid fragmented UDP answers.
@@ -211,6 +213,7 @@ func (p *prober) probeDNS(ctx context.Context, m model.Monitor, timeout time.Dur
 	}
 	start := time.Now()
 	var raw []byte
+	var answeredBy netip.Addr
 	switch resolver.Transport {
 	case model.DNSTransportDoH:
 		raw, err = p.exchangeDoH(ctx, resolver, addrs, query, res)
@@ -219,7 +222,7 @@ func (p *prober) probeDNS(ctx context.Context, m model.Monitor, timeout time.Dur
 	case model.DNSTransportTCP:
 		raw, err = p.exchangeTCP(ctx, addrs, strconv.Itoa(resolver.Port), query)
 	default:
-		raw, err = p.exchangeUDP(ctx, addrs, strconv.Itoa(resolver.Port), query, id)
+		raw, answeredBy, err = p.exchangeUDP(ctx, addrs, strconv.Itoa(resolver.Port), query, id)
 	}
 	// A DoH answer is bound to its request by HTTP, and its ID is 0.
 	checkID := resolver.Transport != model.DNSTransportDoH
@@ -231,7 +234,7 @@ func (p *prober) probeDNS(ctx context.Context, m model.Monitor, timeout time.Dur
 		// The one retry a run makes: the same question over TCP to the
 		// address the UDP answer came from, as a stub resolver does with a
 		// truncated answer.
-		raw, err = p.exchangeTCP(ctx, addrs[:1], strconv.Itoa(resolver.Port), query)
+		raw, err = p.exchangeTCP(ctx, []netip.Addr{answeredBy}, strconv.Itoa(resolver.Port), query)
 		if err == nil {
 			answer, err = dnsDecode(raw, id, checkID, q)
 		}
@@ -458,11 +461,34 @@ func dnsRcodeName(code dnsmessage.RCode) string {
 	return "RCODE" + strconv.Itoa(int(code))
 }
 
-// exchangeUDP sends the query to the first judged address and reads
-// datagrams until one answers it. A connected socket takes datagrams from
-// that address only; one that does not echo id is ignored.
-func (p *prober) exchangeUDP(ctx context.Context, addrs []netip.Addr, port string, query []byte, id uint16) ([]byte, error) {
-	conn, err := p.dialJudged(ctx, "udp", addrs[:1], port)
+// exchangeUDP asks the judged addresses in turn, each for its share of the
+// run's time (addrContext), and returns the first answer and the address
+// that sent it. An address that cannot be reached or stays silent passes
+// the question to the next; an answer, right or wrong, ends the exchange.
+func (p *prober) exchangeUDP(ctx context.Context, addrs []netip.Addr, port string, query []byte, id uint16) ([]byte, netip.Addr, error) {
+	var firstErr error
+	for i, addr := range addrs {
+		actx, cancel := addrContext(ctx, len(addrs)-i)
+		raw, err := p.askUDP(actx, addr, port, query, id)
+		cancel()
+		if err == nil {
+			return raw, addr, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, netip.Addr{}, firstErr
+}
+
+// askUDP sends the query to addr and reads datagrams until one answers it.
+// A connected socket takes datagrams from that address only; one that does
+// not echo id is ignored.
+func (p *prober) askUDP(ctx context.Context, addr netip.Addr, port string, query []byte, id uint16) ([]byte, error) {
+	conn, err := p.dialJudged(ctx, "udp", []netip.Addr{addr}, port)
 	if err != nil {
 		return nil, err
 	}
