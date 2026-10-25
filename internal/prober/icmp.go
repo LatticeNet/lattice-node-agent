@@ -326,7 +326,7 @@ func (c *capabilities) facts() ([]string, map[string]string) {
 	if c.checkedAt.IsZero() || c.now().Sub(c.checkedAt) >= capabilityRecheck {
 		c.checkICMPLocked()
 	}
-	methods := []string{model.MonitorTypeHTTP, model.MonitorTypeTCP}
+	methods := []string{model.MonitorTypeDNS, model.MonitorTypeHTTP, model.MonitorTypeTCP}
 	refusals := map[string]string{}
 	if c.icmpRefusal == "" {
 		methods = append(methods, model.MonitorTypeICMP)

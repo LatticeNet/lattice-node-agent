@@ -43,7 +43,7 @@ func TestHelloAndHeartbeatCarryProbeFacts(t *testing.T) {
 		if err := json.Unmarshal(data, &got); err != nil {
 			t.Fatal(err)
 		}
-		for _, kind := range []string{model.MonitorTypeTCP, model.MonitorTypeHTTP} {
+		for _, kind := range []string{model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeDNS, model.MonitorTypeBeacon} {
 			if !slices.Contains(got.ProbeMethods, kind) {
 				t.Fatalf("%s probe_methods %v lacks %s", name, got.ProbeMethods, kind)
 			}
@@ -70,8 +70,12 @@ func TestMonitorChangedCoversProbeFields(t *testing.T) {
 		"header value": func(m *model.Monitor) {
 			m.Headers = []model.MonitorHeader{{Name: "X-Api-Key", Value: "two", Secret: true}}
 		},
-		"header removed": func(m *model.Monitor) { m.Headers = nil },
-		"secrets_origin": func(m *model.Monitor) { m.SecretsOrigin = "https://b.example:443" },
+		"header removed":   func(m *model.Monitor) { m.Headers = nil },
+		"secrets_origin":   func(m *model.Monitor) { m.SecretsOrigin = "https://b.example:443" },
+		"dns_name":         func(m *model.Monitor) { m.DNSName = "example.net" },
+		"dns_type":         func(m *model.Monitor) { m.DNSType = model.DNSTypeAAAA },
+		"dns_expect":       func(m *model.Monitor) { m.DNSExpect = []string{"192.0.2.1"} },
+		"dns_expect_rcode": func(m *model.Monitor) { m.DNSExpectRcode = model.DNSRcodeNXDomain },
 	} {
 		changed := base
 		changed.Headers = slices.Clone(base.Headers)

@@ -4,7 +4,7 @@ go 1.26.0
 
 toolchain go1.26.10
 
-require github.com/LatticeNet/lattice-sdk v0.2.24-0.20261017194014-a3de5f71b589
+require github.com/LatticeNet/lattice-sdk v0.2.24-0.20261025003326-6485e4abe7b9
 
 require github.com/creack/pty v1.1.24
 

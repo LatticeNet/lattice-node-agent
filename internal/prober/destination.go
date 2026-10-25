@@ -83,11 +83,11 @@ func asciiHost(host string) (string, error) {
 // net.Dialer gives each address of a serial fallback.
 const minDialSlice = 2 * time.Second
 
-// dialJudged connects to the first of addrs that answers on port, in the
-// order the resolver gave them, sharing the time left between the
-// addresses not yet tried as net.Dialer does. addrs are IP literals, so the
-// dial makes no lookup.
-func (p *prober) dialJudged(ctx context.Context, addrs []netip.Addr, port string) (net.Conn, error) {
+// dialJudged connects over network (tcp or udp) to the first of addrs that
+// answers on port, in the order the resolver gave them, sharing the time
+// left between the addresses not yet tried as net.Dialer does. addrs are
+// IP literals, so the dial makes no lookup.
+func (p *prober) dialJudged(ctx context.Context, network string, addrs []netip.Addr, port string) (net.Conn, error) {
 	if len(addrs) == 0 {
 		return nil, errors.New("no address to dial")
 	}
@@ -103,7 +103,7 @@ func (p *prober) dialJudged(ctx context.Context, addrs []netip.Addr, port string
 				dctx, cancel = context.WithTimeout(ctx, slice)
 			}
 		}
-		conn, err := p.dial(dctx, "tcp", net.JoinHostPort(addr.String(), port))
+		conn, err := p.dial(dctx, network, net.JoinHostPort(addr.String(), port))
 		cancel()
 		if err == nil {
 			return conn, nil
