@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"golang.org/x/net/dns/dnsmessage"
@@ -632,4 +633,60 @@ func dohServer(t *testing.T, cert tls.Certificate, handle func(http.ResponseWrit
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// A truncated answer that cannot be asked again (TCP, DoT, DoH, or the TCP
+// retry itself) is a transport failure, never a response code.
+func TestDNSTruncatedWithoutRetryIsTransport(t *testing.T) {
+	stub := newDNSStub(t, nil, func(_ string, q dnsmessage.Message) []byte {
+		return dnsReply(q, dnsmessage.RCodeSuccess, true)
+	})
+	p := dnsProber(t, stub.udp.LocalAddr(), stub.tcp.Addr(), nil)
+	for _, target := range []string{"tcp://" + testHost, "udp://" + testHost} {
+		m := dnsMonitor(target)
+		m.DNSExpectRcode = model.DNSRcodeNXDomain
+		res := p.probe(context.Background(), m)
+		if res.Success || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, "truncated") || res.DNSRcode != "" {
+			t.Fatalf("%s: a truncated answer = %+v", target, res)
+		}
+	}
+}
+
+// A response that echoes the ID but answers another question is refused.
+func TestDNSAnswerToAnotherQuestionIsRefused(t *testing.T) {
+	stub := newDNSStub(t, nil, func(network string, q dnsmessage.Message) []byte {
+		q.Questions[0].Name = dnsmessage.MustNewName("other.example.")
+		return answerA("192.0.2.1")(network, q)
+	})
+	p := dnsProber(t, stub.udp.LocalAddr(), stub.tcp.Addr(), nil)
+	res := p.probe(context.Background(), dnsMonitor("tcp://"+testHost))
+	if res.Success || failureCode(res) != model.DNSFailureTransport {
+		t.Fatalf("an answer to another question was taken: %+v", res)
+	}
+}
+
+// A DoH response is bound to its request by HTTP, so its ID is not judged.
+func TestDNSDoHAcceptsAnyResponseID(t *testing.T) {
+	cert, roots, _ := testCert(t, testHost)
+	doh := dohServer(t, cert, func(w http.ResponseWriter, q dnsmessage.Message) {
+		q.ID = 4242
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(answerA("192.0.2.1")("tcp", q))
+	})
+	p := dnsProber(t, nil, doh.Listener.Addr(), roots)
+	if res := p.probe(context.Background(), dnsMonitor("https://"+testHost+"/dns-query")); !res.Success {
+		t.Fatalf("a DoH answer with another ID = %+v", res)
+	}
+}
+
+// A reported value is cut at a character boundary and never grows past the bound.
+func TestDNSReportedValuesKeepTheirBound(t *testing.T) {
+	v := strings.Repeat("a", model.MonitorDNSValueMax-1) + "é"
+	got := dnsReported([]string{v, "ok\xff"})
+	if len(got[0]) > model.MonitorDNSValueMax || !utf8.ValidString(got[0]) || got[0] != strings.Repeat("a", model.MonitorDNSValueMax-1) {
+		t.Fatalf("cut value = %q (%d bytes)", got[0], len(got[0]))
+	}
+	if got[1] != "ok" {
+		t.Fatalf("invalid bytes = %q", got[1])
+	}
 }

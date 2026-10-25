@@ -161,17 +161,25 @@ func (p *prober) probeDNS(ctx context.Context, m model.Monitor, timeout time.Dur
 	default:
 		raw, err = p.exchangeUDP(ctx, addrs, strconv.Itoa(resolver.Port), query, id)
 	}
+	// A DoH answer is bound to its request by HTTP, and its ID is 0.
+	checkID := resolver.Transport != model.DNSTransportDoH
 	var answer dnsAnswer
 	if err == nil {
-		answer, err = dnsDecode(raw, id, q)
+		answer, err = dnsDecode(raw, id, checkID, q)
 	}
 	if err == nil && answer.truncated && resolver.Transport == model.DNSTransportUDP {
 		// The one retry a run makes: the same question over TCP to the
-		// same resolver, as a stub resolver does with a truncated answer.
-		raw, err = p.exchangeTCP(ctx, addrs, strconv.Itoa(resolver.Port), query)
+		// address the UDP answer came from, as a stub resolver does with a
+		// truncated answer.
+		raw, err = p.exchangeTCP(ctx, addrs[:1], strconv.Itoa(resolver.Port), query)
 		if err == nil {
-			answer, err = dnsDecode(raw, id, q)
+			answer, err = dnsDecode(raw, id, checkID, q)
 		}
+	}
+	if err == nil && answer.truncated {
+		// Nothing is asked again: a truncated answer over TCP, DoT or DoH,
+		// or a second one after the retry, is not an answer to judge.
+		err = &dnsFailure{code: model.DNSFailureTransport, msg: "the response is truncated"}
 	}
 	res.LatencyMs = elapsedMs(time.Since(start))
 	if err != nil {
@@ -222,17 +230,22 @@ func (q dnsQuestion) judge(a dnsAnswer) *dnsFailure {
 
 // dnsReported is what a result carries of the answer: at most
 // model.MonitorDNSAnswersMax values of at most model.MonitorDNSValueMax
-// bytes each, cut at a character boundary.
+// bytes each, invalid UTF-8 dropped and cut at a character boundary.
 func dnsReported(values []string) []string {
 	if len(values) == 0 {
 		return nil
 	}
 	out := make([]string, 0, min(len(values), model.MonitorDNSAnswersMax))
 	for _, v := range values[:min(len(values), model.MonitorDNSAnswersMax)] {
+		v = strings.ToValidUTF8(v, "")
 		if len(v) > model.MonitorDNSValueMax {
-			v = v[:model.MonitorDNSValueMax]
+			cut := model.MonitorDNSValueMax
+			for cut > 0 && !utf8.RuneStart(v[cut]) {
+				cut--
+			}
+			v = v[:cut]
 		}
-		out = append(out, strings.ToValidUTF8(v, string(utf8.RuneError)))
+		out = append(out, v)
 	}
 	return out
 }
@@ -274,17 +287,19 @@ func dnsQuery(q dnsQuestion, doh bool) ([]byte, uint16, error) {
 	return msg, id, err
 }
 
-// dnsDecode reads a response to the query with id: its response code,
-// extended by an EDNS(0) record when there is one, and the values of
-// answers of the asked type and class.
-func dnsDecode(raw []byte, id uint16, q dnsQuestion) (dnsAnswer, error) {
+// dnsDecode reads a response to the query with id (judged when checkID):
+// its response code, extended by an EDNS(0) record when there is one, and
+// the values of answers of the asked type and class. A response that
+// echoes a question must echo the one asked.
+func dnsDecode(raw []byte, id uint16, checkID bool, q dnsQuestion) (dnsAnswer, error) {
 	var parser dnsmessage.Parser
 	h, err := parser.Start(raw)
 	if err != nil {
 		return dnsAnswer{}, &dnsFailure{code: model.DNSFailureTransport, msg: "the response is not a DNS message: " + err.Error()}
 	}
-	if !h.Response || h.ID != id {
-		return dnsAnswer{}, &dnsFailure{code: model.DNSFailureTransport, msg: "the response does not answer the query"}
+	notOurs := &dnsFailure{code: model.DNSFailureTransport, msg: "the response does not answer the query"}
+	if !h.Response || (checkID && h.ID != id) {
+		return dnsAnswer{}, notOurs
 	}
 	a := dnsAnswer{truncated: h.Truncated}
 	if a.truncated {
@@ -293,8 +308,17 @@ func dnsDecode(raw []byte, id uint16, q dnsQuestion) (dnsAnswer, error) {
 	malformed := func(err error) error {
 		return &dnsFailure{code: model.DNSFailureTransport, msg: "the response is malformed: " + err.Error()}
 	}
-	if err := parser.SkipAllQuestions(); err != nil {
-		return dnsAnswer{}, malformed(err)
+	for {
+		question, err := parser.Question()
+		if errors.Is(err, dnsmessage.ErrSectionDone) {
+			break
+		}
+		if err != nil {
+			return dnsAnswer{}, malformed(err)
+		}
+		if dnsName(question.Name) != q.name || question.Type != q.qtype || question.Class != dnsmessage.ClassINET {
+			return dnsAnswer{}, notOurs
+		}
 	}
 	for {
 		ah, err := parser.AnswerHeader()
