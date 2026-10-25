@@ -126,7 +126,10 @@ func dnsTransportError(err error) *dnsFailure {
 	if errors.As(err, &failure) {
 		return failure
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || isTimeout(err) {
+	if errors.Is(err, context.Canceled) {
+		return &dnsFailure{code: model.DNSFailureTransport, msg: "the run was cancelled before an answer"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 		return &dnsFailure{code: model.DNSFailureTransport, msg: "no answer before the check's timeout"}
 	}
 	return &dnsFailure{code: model.DNSFailureTransport, msg: cutUTF8(err.Error(), dnsDetailMax)}
@@ -252,6 +255,11 @@ func (p *prober) probeDNS(ctx context.Context, m model.Monitor, timeout time.Dur
 			res.Reason = model.PathReasonDestinationRefused
 			res.Error = refused.Error()
 			return
+		}
+		// A read the run's cancellation woke fails on its closed
+		// connection; the result says what ended it.
+		if errors.Is(ctx.Err(), context.Canceled) {
+			err = ctx.Err()
 		}
 		res.Error = dnsTransportError(err).Error()
 		return
@@ -493,7 +501,7 @@ func (p *prober) askUDP(ctx context.Context, addr netip.Addr, port string, query
 		return nil, err
 	}
 	defer conn.Close()
-	setDeadline(ctx, conn)
+	defer bindConn(ctx, conn)()
 	if _, err := conn.Write(query); err != nil {
 		return nil, err
 	}
@@ -517,7 +525,7 @@ func (p *prober) exchangeTCP(ctx context.Context, addrs []netip.Addr, port strin
 		return nil, err
 	}
 	defer conn.Close()
-	setDeadline(ctx, conn)
+	defer bindConn(ctx, conn)()
 	return dnsStreamExchange(conn, query)
 }
 
@@ -529,7 +537,7 @@ func (p *prober) exchangeDoT(ctx context.Context, r model.DNSResolver, addrs []n
 		return nil, err
 	}
 	defer raw.Close()
-	setDeadline(ctx, raw)
+	defer bindConn(ctx, raw)()
 	conn := tls.Client(raw, &tls.Config{ServerName: r.Host, RootCAs: p.rootCAs, MinVersion: tls.VersionTLS12})
 	if err := conn.HandshakeContext(ctx); err != nil {
 		if ctx.Err() != nil || isTimeout(err) {
@@ -647,9 +655,18 @@ func recordCert(chain []*x509.Certificate, res *model.MonitorResult) {
 	}
 }
 
-// setDeadline bounds every read and write on conn by ctx's deadline.
-func setDeadline(ctx context.Context, conn net.Conn) {
+// bindConn bounds every read and write on conn by ctx: by its deadline,
+// and by its cancellation, which closes conn so a read in progress wakes
+// rather than waiting out the deadline. A deadline that passes is left to
+// the connection's own timeout, so a slow resolver still reads as a
+// timeout. The returned func releases ctx's hold on conn.
+func bindConn(ctx context.Context, conn net.Conn) (stop func() bool) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
+	return context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			_ = conn.Close()
+		}
+	})
 }

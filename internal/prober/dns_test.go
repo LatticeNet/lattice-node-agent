@@ -975,3 +975,45 @@ func TestDNSUDPTriesTheNextAddress(t *testing.T) {
 		}
 	})
 }
+
+// Cancelling a run wakes a read in progress over UDP, TCP, DoT and DoH, so
+// a shutdown does not wait out the check's timeout, and the result says
+// the run was cancelled rather than timed out.
+func TestDNSCancelEndsTheRun(t *testing.T) {
+	release := make(chan struct{})
+	hold := func(string, dnsmessage.Message) []byte {
+		<-release
+		return nil
+	}
+	plain := newDNSStub(t, nil, hold)
+	cert, roots, _ := testCert(t, testHost)
+	dot := newDNSStub(t, &tls.Config{Certificates: []tls.Certificate{cert}}, hold)
+	doh := dohServer(t, cert, func(http.ResponseWriter, dnsmessage.Message) { <-release })
+	// Registered after the servers, so it runs before they wait for their
+	// handlers to return.
+	t.Cleanup(func() { close(release) })
+	for name, tc := range map[string]struct {
+		p      *prober
+		target string
+	}{
+		"udp": {dnsProber(t, plain.udp.LocalAddr(), plain.tcp.Addr(), nil), "udp://" + testHost},
+		"tcp": {dnsProber(t, plain.udp.LocalAddr(), plain.tcp.Addr(), nil), "tcp://" + testHost},
+		"dot": {dnsProber(t, nil, dot.tcp.Addr(), roots), "tls://" + testHost},
+		"doh": {dnsProber(t, nil, doh.Listener.Addr(), roots), "https://" + testHost + "/dns-query"},
+	} {
+		m := dnsMonitor(tc.target)
+		m.TimeoutSec = 20
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(200*time.Millisecond, cancel)
+		start := time.Now()
+		res := tc.p.probe(ctx, m)
+		took := time.Since(start)
+		cancel()
+		if took > 2*time.Second {
+			t.Fatalf("%s: a run cancelled after 200 ms took %s", name, took)
+		}
+		if res.Success || failureCode(res) != model.DNSFailureTransport || !strings.Contains(res.Error, "cancelled") {
+			t.Fatalf("%s: cancelled run: %+v", name, res)
+		}
+	}
+}
